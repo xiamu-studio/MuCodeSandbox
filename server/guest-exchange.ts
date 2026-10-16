@@ -1,15 +1,20 @@
 import {z} from 'zod';
 import {AppError} from './errors.ts';
+import {DEEPSEEK_TRANSLATE_PYTHON,TRANSLATE_BOOTSTRAP,TRANSLATION_PROMPT,translationResult,translationError} from './deepseek-translation.ts';
+import {TRANSLATION_INPUT_LIMIT,TRANSLATION_RESPONSE_BYTES,TRANSLATION_TIMEOUT_SECONDS,TRANSLATION_MODEL,translationTarget,type TranslationDirection} from '../shared/translation.ts';
+import type {TranslationSettings} from './translation-settings.ts';
 import type {Environment} from '../shared/types.ts';
 import type {LimaRuntime} from './runtime.ts';
 import {TRANSFER_MAX_BYTES,CLIPBOARD_MAX_BYTES,type TransferFile,type TransferFilePage} from '../shared/guest-exchange.ts';
 export const transferZone=z.enum(['incoming','outgoing','downloads']);
 export const transferName=z.string().min(1).max(180).refine(name=>!/[\\/\x00-\x1f\x7f]/.test(name)&&!['.','..'].includes(name)&&Buffer.byteLength(name)<=180,'文件名不能包含路径或控制字符');
+export const transferPath=z.string().max(2048).refine(value=>value===''||(value.split('/').length<=16&&value.split('/').every(part=>transferName.safeParse(part).success)),'文件夹路径无效');
+export const transferRevision=z.string().regex(/^[a-f0-9]{64}$/);
 export const clipboardText=z.string().max(CLIPBOARD_MAX_BYTES).refine(text=>!text.includes('\0')&&Buffer.byteLength(text)<=CLIPBOARD_MAX_BYTES,'只支持最多64 KiB的普通文本');
 
 // Anchored descriptors reject parent symlinks, leaf symlinks, hardlinks and
 // special files. The ordinary guest user can only exchange these three folders.
-export const FILE_EXCHANGE_PYTHON=String.raw`import os,sys,json,stat,base64,datetime,uuid,heapq
+export const FILE_EXCHANGE_PYTHON=String.raw`import os,sys,json,stat,base64,datetime,uuid,heapq,hashlib
 request=json.load(sys.stdin)
 limit=26214400
 def directory(parent,name):
@@ -31,8 +36,49 @@ try:
   if not isinstance(value,str) or not value or value in ['.','..'] or len(value.encode())>180 or '/' in value or '\\' in value or any(ord(c)<32 or ord(c)==127 for c in value):raise ValueError('Invalid filename')
   return value
  def regular(st):return stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_size<=limit and st.st_uid==os.getuid()
+ def relative(value):
+  if not isinstance(value,str) or len(value)>2048 or (value and len(value.split('/'))>16):raise ValueError('Invalid folder')
+  return [name(part) for part in value.split('/')] if value else []
+ def nested(zone,value):
+  fd,path=folder(zone)
+  try:
+   device=os.fstat(fd).st_dev
+   for part in relative(value):
+    nxt=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=fd)
+    st=os.fstat(nxt)
+    if st.st_uid!=os.getuid() or st.st_dev!=device:os.close(nxt);raise ValueError('Invalid folder owner or mount')
+    os.close(fd);fd=nxt;path+='/'+part
+   return fd,path
+  except BaseException:os.close(fd);raise
+ def revision(st):return hashlib.sha256((':'.join(str(x) for x in [st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns])).encode()).hexdigest()
  action=request['action']
- if action=='list':
+ if action=='browse':
+  zone=request['zone'];rel=request.get('path','');fd,path=nested(zone,rel);cursor=request.get('cursor');total=0
+  after=(int(cursor[2]),int(cursor[3]),cursor[4]) if cursor else None
+  if cursor and (cursor[0]!=zone or cursor[1]!=rel):raise ValueError('Cursor belongs to another folder')
+  try:
+   def browse_entries():
+    global total
+    with os.scandir(fd) as items:
+     for entry in items:
+      try:
+       item=name(entry.name)
+       if item.startswith('.') or item.endswith(('.crdownload','.part','.tmp')):continue
+       st=os.stat(item,dir_fd=fd,follow_symlinks=False)
+       directory=stat.S_ISDIR(st.st_mode) and st.st_uid==os.getuid() and st.st_dev==os.fstat(fd).st_dev
+       if not directory and not regular(st):continue
+       total+=1;key=(1 if directory else 0,st.st_mtime_ns,item)
+       if after is not None and key>=after:continue
+       row={'zone':zone,'name':item,'bytes':0 if directory else st.st_size,'modifiedAt':datetime.datetime.fromtimestamp(st.st_mtime,datetime.timezone.utc).isoformat(),'path':path+'/'+item,'kind':'directory' if directory else 'file','relativePath':rel+'/'+item if rel else item}
+       if not directory:row['revision']=revision(st)
+       yield key,row
+      except (OSError,ValueError):continue
+   selected=heapq.nlargest(51,browse_entries(),key=lambda item:item[0]);shown=selected[:50];next_cursor=None
+   if len(selected)>50:
+    key=shown[-1][0];next_cursor=json.dumps([zone,rel,key[0],str(key[1]),key[2]],separators=(',',':'))
+   print(json.dumps({'files':[row for key,row in shown],'total':total,'nextCursor':next_cursor}))
+  finally:os.close(fd)
+ elif action=='list':
   paged=request.get('paged',False);cursor=request.get('cursor');total=0
   after=(int(cursor[0]),cursor[1],cursor[2]) if cursor else None
   def entries():
@@ -94,13 +140,17 @@ try:
     finally:os.close(staging)
    os.close(fd)
  elif action=='download':
-  item=name(request['name']);fd,path=folder(request['zone'])
+  item=name(request['name']);fd,path=nested(request['zone'],request.get('path',''))
   try:
    leaf=os.open(item,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
    with os.fdopen(leaf,'rb') as f:
-    if not regular(os.fstat(f.fileno())):raise ValueError('Only private regular files may be exported')
+    before=os.fstat(f.fileno())
+    if not regular(before):raise ValueError('Only private regular files may be exported')
+    expected=request.get('revision')
+    if expected is not None and expected!=revision(before):raise ValueError('MU_TRANSFER_FILE_CHANGED')
     data=f.read(limit+1)
     if len(data)>limit:raise ValueError('File too large')
+    if revision(os.fstat(f.fileno()))!=revision(before):raise ValueError('MU_TRANSFER_FILE_CHANGED')
    print(json.dumps({'data':base64.b64encode(data).decode()}))
   finally:os.close(fd)
  else:raise ValueError('Invalid action')
@@ -135,58 +185,13 @@ with os.fdopen(fd,'wb') as f:
  if not stat.S_ISREG(st.st_mode) or st.st_nlink!=1 or st.st_uid!=os.getuid():raise ValueError('Invalid clipboard file')
  os.ftruncate(f.fileno(),0);f.write(value)
 `;
-// Text stays in stdin, never shell syntax, argv, files or application logs.
-// Google public web-translation compatibility endpoint; not the paid Cloud API.
-export const INLINE_TRANSLATE_PYTHON=String.raw`import sys,json,subprocess,urllib.parse
-def fail(reason,status=0):
- print(json.dumps({'error':reason,'httpStatus':status}));sys.exit(0)
-status=0
-try:
- text=json.load(sys.stdin)['text']
- if not isinstance(text,str) or not text.strip() or len(text)>2000 or '\0' in text:raise ValueError()
- url='https://translate.googleapis.com/translate_a/single?'+urllib.parse.urlencode({'client':'gtx','sl':'auto','tl':'en','dt':'t','q':text})
- result=subprocess.run(['/usr/bin/curl','--disable','--ipv4','--silent','--fail','--proto','=https','--connect-timeout','6','--max-time','18','--max-filesize','131072','--write-out','\n%{http_code}','--config','-'],input='url = '+json.dumps(url)+'\n',text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=20)
- body,separator,status_text=result.stdout.rpartition('\n')
- status=int(status_text) if separator and status_text.isdigit() and len(status_text)==3 else 0
- if status==429:fail('rate_limited',status)
- if status in (401,403):fail('refused',status)
- if 300<=status<400 or status>=400:fail('http_failed',status)
- if result.returncode==28:fail('timeout',status)
- if result.returncode in (5,6):fail('dns_failed',status)
- if result.returncode==7:fail('connect_failed',status)
- if result.returncode in (35,51,58,60,77,80,82,83,90,91):fail('tls_failed',status)
- if result.returncode==63 or len(result.stdout)>131076:fail('response_too_large',status)
- if result.returncode:fail('transport_failed',status)
- if status!=200:fail('response_invalid',status)
- data=json.loads(body)
- if not isinstance(data,list) or not isinstance(data[0],list):raise ValueError()
- parts=[]
- for row in data[0]:
-  if not isinstance(row,list) or not row or not isinstance(row[0],str):raise ValueError()
-  parts.append(row[0])
- translated=''.join(parts)
- if not translated.strip() or len(translated)>16000:raise ValueError()
- print(json.dumps({'text':translated,'provider':'Google'}))
-except subprocess.TimeoutExpired:fail('timeout')
-except Exception:
- fail('response_invalid',status)
-`;
-export const inlineTranslationText=z.string().min(1).max(2000).refine(text=>!!text.trim()&&!text.includes('\0'),'请输入最多 2000 字的普通文本');
-export const INLINE_TRANSLATE_BOOTSTRAP='import sys,json; exec(compile(json.loads(sys.stdin.readline()), "<mu-translation>", "exec"))';
-const translationFailure=z.enum(['rate_limited','refused','http_failed','timeout','dns_failed','connect_failed','tls_failed','response_too_large','transport_failed','response_invalid']);
-const translationResult=z.union([
-  z.object({text:z.string().min(1).max(16000),provider:z.literal('Google')}).strict(),
-  z.object({error:translationFailure,httpStatus:z.number().int().min(0).max(599)}).strict(),
-]);
-function translationError(reason:z.infer<typeof translationFailure>,status=0){
-  const messages={rate_limited:'Google 翻译请求过多（429），请稍后再试。',refused:`Google 翻译拒绝了这次请求（${status}）。`,http_failed:`Google 翻译服务返回错误（${status}）。`,timeout:'连接 Google 翻译超时，请稍后重试。',dns_failed:'沙箱未能解析 Google 翻译的地址，请稍后重试。',connect_failed:'沙箱未能连接 Google 翻译，请稍后重试。',tls_failed:'与 Google 翻译建立安全连接失败，请稍后重试。',response_too_large:'Google 翻译返回的内容过大，请缩短原文后重试。',transport_failed:'Google 翻译连接中断，请稍后重试。',response_invalid:'Google 翻译返回了无法识别的内容，请稍后重试。'};
-  return new AppError(`${messages[reason]}原文已保留。`,502,`TRANSLATION_${reason.toUpperCase()}`);
-}
+export const inlineTranslationText=z.string().min(1).max(TRANSLATION_INPUT_LIMIT).refine(text=>text.length<=TRANSLATION_INPUT_LIMIT&&!!text.trim()&&!text.includes('\0'),`请输入最多 ${TRANSLATION_INPUT_LIMIT} 字的普通文本`);
 
 export class GuestExchange {
   runtime:LimaRuntime;authorize:(id:string)=>Promise<Environment>;
   busy=new Set<string>();
-  constructor(runtime:LimaRuntime,authorize:(id:string)=>Promise<Environment>){this.runtime=runtime;this.authorize=authorize;}
+  private translationSettings?:Pick<TranslationSettings,'credential'|'revision'>;
+  constructor(runtime:LimaRuntime,authorize:(id:string)=>Promise<Environment>,translationSettings?:Pick<TranslationSettings,'credential'|'revision'>){this.runtime=runtime;this.authorize=authorize;this.translationSettings=translationSettings;}
   private async operation<T>(id:string,work:(e:Environment)=>Promise<T>){
     if(this.busy.has(id))throw new AppError('当前环境正在传输，请稍后重试',409,'TRANSFER_BUSY');
     this.busy.add(id);
@@ -200,7 +205,7 @@ export class GuestExchange {
     // the guest task supervisor, user identity and network guard are unchanged.
     const bootstrap='import sys,json; exec(compile(json.loads(sys.stdin.readline()), "<mu-file-transfer>", "exec"))';
     try{return JSON.parse(await this.runtime.guest(e,['python3','-c',bootstrap],{input:JSON.stringify(FILE_EXCHANGE_PYTHON)+'\n'+JSON.stringify(input),timeoutMs:30000,maxBytes:TRANSFER_MAX_BYTES*2,onOutput:undefined}));}
-    catch{throw new AppError('文件传输未完成：请检查文件大小、目录权限或重试',409,'FILE_TRANSFER_FAILED');}
+    catch(error){if(String(error).includes('MU_TRANSFER_FILE_CHANGED'))throw new AppError('文件已更新，请刷新列表后重新下载。',409,'TRANSFER_FILE_CHANGED');throw new AppError('文件传输未完成：文件夹可能已移动，或文件大小/权限不符合要求，请刷新重试。',409,'FILE_TRANSFER_FAILED');}
   }
   list(id:string):Promise<TransferFile[]>{return this.operation(id,e=>this.files(e,{action:'list'}));}
   listPage(id:string,cursor?:string):Promise<TransferFilePage>{
@@ -211,18 +216,26 @@ export class GuestExchange {
     }
     return this.operation(id,e=>this.files(e,{action:'list',paged:true,cursor:after}));
   }
+  listDirectory(id:string,zone:string,relativePath='',cursor?:string):Promise<TransferFilePage>{
+    transferZone.parse(zone);transferPath.parse(relativePath);let after:unknown=null;
+    if(cursor!==undefined){try{const value=z.tuple([transferZone,transferPath,z.union([z.literal(0),z.literal(1)]),z.string().regex(/^-?\d{1,25}$/),transferName]).parse(JSON.parse(z.string().max(4096).parse(cursor)));if(value[0]!==zone||value[1]!==relativePath)throw Error();after=value;}catch{throw new AppError('文件夹位置已变化，请刷新文件后重试',400,'INVALID_TRANSFER_CURSOR');}}
+    return this.operation(id,e=>this.files(e,{action:'browse',zone,path:relativePath,cursor:after}));
+  }
   upload(id:string,name:string,data:Buffer){transferName.parse(name);if(data.length>TRANSFER_MAX_BYTES)throw new AppError('单个文件最多25 MiB',413);return this.operation(id,e=>this.files(e,{action:'upload',name,data:data.toString('base64')}));}
-  download(id:string,zone:string,name:string){transferZone.parse(zone);transferName.parse(name);return this.operation(id,async e=>Buffer.from((await this.files(e,{action:'download',zone,name})).data,'base64'));}
-  translate(id:string,text:string){inlineTranslationText.parse(text);return this.operation(id,async e=>{
+  download(id:string,zone:string,name:string,relativePath='',revision?:string){transferZone.parse(zone);transferName.parse(name);transferPath.parse(relativePath);if(revision!==undefined)transferRevision.parse(revision);return this.operation(id,async e=>Buffer.from((await this.files(e,{action:'download',zone,name,path:relativePath,revision})).data,'base64'));}
+  translate(id:string,text:string,direction:TranslationDirection='auto'){inlineTranslationText.parse(text);return this.operation(id,async e=>{
+    if(!this.translationSettings)throw new AppError('请先在翻译设置中填写 DeepSeek API Key。',409,'TRANSLATION_KEY_REQUIRED');
+    const credential=this.translationSettings.credential(),target=translationTarget(text,direction);
     let result:z.infer<typeof translationResult>;
     try{
       // Keep the SSH command short; program and private text both travel on stdin.
-      const raw=await this.runtime.guest(e,['python3','-c',INLINE_TRANSLATE_BOOTSTRAP],{input:JSON.stringify(INLINE_TRANSLATE_PYTHON)+'\n'+JSON.stringify({text}),timeoutMs:24000,maxBytes:131072,onOutput:undefined});
+      const raw=await this.runtime.guest(e,['python3','-c',TRANSLATE_BOOTSTRAP],{input:JSON.stringify(DEEPSEEK_TRANSLATE_PYTHON)+'\n'+JSON.stringify({text,apiKey:credential.apiKey,target,model:TRANSLATION_MODEL,prompt:TRANSLATION_PROMPT}),timeoutMs:(TRANSLATION_TIMEOUT_SECONDS+6)*1000,maxBytes:TRANSLATION_RESPONSE_BYTES,onOutput:undefined});
       result=translationResult.parse(JSON.parse(raw));
     }catch(error){
       if(error instanceof AppError&&error.code==='TIMEOUT')throw translationError('timeout');
       throw new AppError('沙箱翻译调用未完成，请重试。原文已保留。',502,'TRANSLATION_UNAVAILABLE');
     }
+    if(credential.revision!==this.translationSettings.revision)throw new AppError('翻译密钥已更改，请重新翻译。原文已保留。',409,'TRANSLATION_SETTINGS_CHANGED');
     if('error' in result)throw translationError(result.error,result.httpStatus);
     return result;
   });}

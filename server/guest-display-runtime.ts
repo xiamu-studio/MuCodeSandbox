@@ -1,3 +1,4 @@
+import { ENSURE_FILE_MANAGER } from './guest-file-manager.ts';
 import type { Environment } from '../shared/types.ts';
 import { AppError } from './errors.ts';
 import { shellQuote } from './network-guard.ts';
@@ -7,7 +8,7 @@ import { ensureGuestAudio, GUEST_AUDIO_LAUNCHER_START } from './guest-audio.ts';
 import { ensureDisplayEncoder, DISPLAY_ENCODER_EXECUTABLE, DISPLAY_ENCODER_BINARY_SHA256 } from './guest-display-encoder.ts';
 
 export const GUEST_DISPLAY_SERVICE = 'mucodesandbox-display.service';
-export const ENSURE_DISPLAY_COMPONENTS = `set -eu
+export const ENSURE_DISPLAY_COMPONENTS = ENSURE_FILE_MANAGER + `set -eu
 if ! command -v Xtigervnc >/dev/null || ! command -v xsettingsd >/dev/null || ! command -v xauth >/dev/null || ! command -v x11vnc >/dev/null || ! command -v xdpyinfo >/dev/null || ! command -v openbox >/dev/null || ! command -v wmctrl >/dev/null || ! command -v xclip >/dev/null; then
   sudo apt-get update -qq
   sudo env DEBIAN_FRONTEND=noninteractive SYSTEMD_OFFLINE=1 NEEDRESTART_MODE=l apt-get install -y -qq --no-install-recommends tigervnc-standalone-server xsettingsd xauth x11vnc x11-utils openbox wmctrl xclip

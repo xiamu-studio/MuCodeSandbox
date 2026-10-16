@@ -28,8 +28,10 @@ import { backupPasswordSchema, backupPathSchema } from './backups.ts';
 import { diskCapacitySchema } from './disk-recovery.ts';
 import { HostNetworkMonitor } from './host-network.ts';
 import { desktopAppSchema } from './guest-desktop.ts';
-import {GuestExchange,inlineTranslationText,clipboardText,transferName,transferZone} from './guest-exchange.ts';
+import {GuestExchange,inlineTranslationText,clipboardText,transferName,transferZone,transferPath,transferRevision} from './guest-exchange.ts';
 import {TRANSFER_MAX_BYTES} from '../shared/guest-exchange.ts';
+import {TranslationSettings,translationApiKey} from './translation-settings.ts';
+import {translationDirection} from './deepseek-translation.ts';
 
 export interface ServiceOptions { dataDir?: string; port?: number; rootDir: string; dev?: boolean; browser?: BrowserHost; picker?: () => Promise<string | null>; backupPicker?: (mode: 'open' | 'save') => Promise<string | null> }
 
@@ -56,7 +58,8 @@ export async function createService(options: ServiceOptions) {
   manager.browser=guestBrowser;
   guestBrowser.authorize=(e,allowBusy)=>manager.assertAccess(e.id,allowBusy);
   const guestLinks=new GuestLinks(manager.runtime,id=>{try{return manager.store.get(id);}catch{return undefined;}},id=>manager.active.has(id),async(e,link)=>{await manager.openExternalLink(e.id,link.url);});
-  const guestExchange=new GuestExchange(manager.runtime,async id=>{await manager.assertAccess(id);return manager.store.get(id);});
+  const translationSettings=new TranslationSettings(manager.store);
+  const guestExchange=new GuestExchange(manager.runtime,async id=>{await manager.assertAccess(id);return manager.store.get(id);},translationSettings);
   guestBrowser.prepareLinks=(e,runOptions)=>guestLinks.prepare(e,runOptions);
   const guestAudio=new GuestAudioHost({
     getSession:id=>guestBrowser.entries.get(id),
@@ -221,7 +224,8 @@ export async function createService(options: ServiceOptions) {
   });
   app.get('/api/environments/:id/transfer-files',async(req,res)=>{
     const id=z.uuid().parse(req.params.id);
-    if(req.query.paged==='1')res.json(await guestExchange.listPage(id,z.string().optional().parse(req.query.cursor)));
+    if(req.query.directory==='1')res.json(await guestExchange.listDirectory(id,transferZone.parse(req.query.zone),transferPath.parse(req.query.path??''),z.string().optional().parse(req.query.cursor)));
+    else if(req.query.paged==='1')res.json(await guestExchange.listPage(id,z.string().optional().parse(req.query.cursor)));
     else res.json(await guestExchange.list(id));
   });
   app.post('/api/environments/:id/transfer-files',async(req,_res,next)=>{await manager.assertAccess(z.uuid().parse(req.params.id));next();},express.raw({type:'application/octet-stream',limit:TRANSFER_MAX_BYTES}),async(req,res)=>{
@@ -229,14 +233,20 @@ export async function createService(options: ServiceOptions) {
     res.json(await guestExchange.upload(z.uuid().parse(req.params.id),name,req.body));
   });
   app.post('/api/environments/:id/transfer-download',async(req,res)=>{
-    const input=z.object({zone:transferZone,name:transferName}).strict().parse(req.body);
-    const data=await guestExchange.download(z.uuid().parse(req.params.id),input.zone,input.name);
+    const input=z.object({zone:transferZone,name:transferName,path:transferPath.optional(),revision:transferRevision.optional()}).strict().parse(req.body);
+    const data=await guestExchange.download(z.uuid().parse(req.params.id),input.zone,input.name,input.path,input.revision);
     res.setHeader('Content-Disposition',`attachment; filename*=UTF-8''${encodeURIComponent(input.name)}`);res.type('application/octet-stream').send(data);
   });
+  app.get('/api/translation-settings',(_req,res)=>res.json(translationSettings.status()));
+  app.post('/api/translation-settings',(req,res)=>{
+    const input=z.object({apiKey:translationApiKey}).strict().parse(req.body);
+    res.json(translationSettings.save(input.apiKey));
+  });
+  app.delete('/api/translation-settings',(_req,res)=>res.json(translationSettings.clear()));
   app.post('/api/environments/:id/translate-text',async(req,res)=>{
     const id=z.uuid().parse(req.params.id);manager.ensureIdle(id);
-    const input=z.object({text:inlineTranslationText}).strict().parse(req.body);
-    res.json(await guestExchange.translate(id,input.text));
+    const input=z.object({text:inlineTranslationText,direction:translationDirection.optional()}).strict().parse(req.body);
+    res.json(await guestExchange.translate(id,input.text,input.direction));
   });
   app.post('/api/environments/:id/clipboard/read',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(await guestExchange.readClipboard(z.uuid().parse(req.params.id)));});
   app.post('/api/environments/:id/clipboard/write',async(req,res)=>{const input=z.object({text:clipboardText}).strict().parse(req.body);res.json(await guestExchange.writeClipboard(z.uuid().parse(req.params.id),input.text));});

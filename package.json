@@ -1,7 +1,7 @@
 {
   "name": "mucodesandbox",
   "productName": "MuCodeSandbox",
-  "version": "0.4.49",
+  "version": "0.4.53",
   "private": true,
   "type": "module",
   "description": "Local development environments and independent browser sessions for AI tools.",

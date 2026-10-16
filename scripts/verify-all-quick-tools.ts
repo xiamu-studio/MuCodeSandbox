@@ -29,7 +29,7 @@ await page.route('**/api/**',route=>{
  const id=url.pathname.split('/')[3];
  if(url.pathname.endsWith('/terminal-ticket'))return route.fulfill({json:{ticket:id+'-'+request.postDataJSON().command}});
  if(url.pathname.endsWith('/transfer-files')){if(request.method()==='POST'){const name=url.searchParams.get('name');return route.fulfill({json:{name,path:'/home/dev/Transfers/Incoming/'+name,bytes:10}});}return route.fulfill({json:{files:[{name:"file's 中文.txt",path:"/home/dev/Transfers/Incoming/file's 中文.txt",zone:'incoming',bytes:10,modifiedAt:new Date().toISOString()}],total:1,nextCursor:null}});}
- if(url.pathname.endsWith('/translate-text'))return route.fulfill({json:{text:'Local English result',provider:'Google'}});
+ if(url.pathname.endsWith('/translate-text'))return route.fulfill({json:{text:'Local English result',provider:'DeepSeek'}});
  if(url.pathname.endsWith('/desktop-apps'))return route.fulfill({json:{supported:true,displaySharedWithBrowser:true,accountTested:false,apps:[{id:'grok-bot',installed:true,installedVersion:'fixture',running:true,rendererProtected:true},{id:'claude-desktop',installed:true,installedVersion:'fixture',running:false}]}});
  if(url.pathname.endsWith('/guest-focus'))return route.fulfill({json:{focused:true}});
  if(url.pathname.endsWith('/guest-browser'))return route.fulfill({json:{running:true,ready:true,browserRunning:true,width:3200,height:2000,display:{cssWidth:1600,cssHeight:1000,width:3200,height:2000,scaleFactor:2,browserScaleFactor:2,mode:'fixed',matched:true}}});
@@ -65,9 +65,9 @@ try{
  const blocked=inputs.length;await pane().getByRole('button',{name:'粘贴原文',exact:true}).click();await expect(pane().getByText(/不支持安全的多行粘贴/)).toBeVisible();assert.equal(inputs.length,blocked);await expect(input()).toHaveValue('第一行\n第二行');
  sockets.get('environment-a-shell')!.send(JSON.stringify({type:'data',data:'\x1b[?2004h'}));await page.waitForTimeout(100);await pane().getByRole('button',{name:'粘贴原文',exact:true}).click();await expect.poll(()=>inputs.length).toBe(blocked+1);
  assert.equal(inputs.at(-1)!.data,'\x1b[200~第一行\r第二行\x1b[201~');
- await openInput();await input().fill('本地合成中文');await pane().getByRole('button',{name:'翻译成英文',exact:true}).click();await expect(pane().getByRole('textbox',{name:'英文译文',exact:true})).toHaveValue('Local English result');
+ await openInput();await input().fill('本地合成中文');await pane().getByRole('button',{name:'翻译成英文',exact:true}).click();await expect(pane().getByRole('textbox',{name:'译文',exact:true})).toHaveValue('Local English result');
  await pane().getByRole('button',{name:'粘贴译文',exact:true}).click();await expect.poll(()=>inputs.at(-1)?.data).toBe('\x1b[200~Local English result\x1b[201~');
- await pane().getByRole('button',{name:'文件与粘贴',exact:true}).click();const dialog=page.getByRole('dialog',{name:'文件与复制粘贴'});await dialog.getByText("file's 中文.txt",{exact:true}).waitFor();
+ await pane().getByRole('button',{name:'文件与粘贴',exact:true}).click();const dialog=page.getByRole('dialog',{name:'文件与复制粘贴'});await dialog.getByRole('button',{name:'刷新文件',exact:true}).click();await dialog.getByText("file's 中文.txt",{exact:true}).waitFor();
  await dialog.getByRole('button',{name:'粘贴路径到终端',exact:true}).click();await expect.poll(()=>inputs.at(-1)?.data).toBe("\x1b[200~'/home/dev/Transfers/Incoming/file'\\''s 中文.txt'\x1b[201~");
  await dialog.getByRole('button',{name:'文字复制粘贴',exact:true}).click();await dialog.getByLabel('要发送到沙箱的文字').fill('CLI file-panel text');await dialog.getByRole('button',{name:'粘贴到当前终端',exact:true}).click();await expect.poll(()=>inputs.at(-1)?.data).toBe('\x1b[200~CLI file-panel text\x1b[201~');
  const reads=calls.filter(path=>path.endsWith('/clipboard/read')).length;await dialog.getByRole('button',{name:'取回终端选中文字',exact:true}).click();await expect(dialog.getByText('当前终端尚未选中文字。',{exact:true})).toBeVisible();assert.equal(calls.filter(path=>path.endsWith('/clipboard/read')).length,reads);

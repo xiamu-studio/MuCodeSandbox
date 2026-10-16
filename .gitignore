@@ -15,6 +15,8 @@ build-info.json
 !.env.example
 !.env.sample
 credentials.json
+translation-provider.json
+.translation-*.tmp
 service-info.json
 known_hosts
 authorized_keys

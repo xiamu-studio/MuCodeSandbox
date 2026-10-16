@@ -290,6 +290,13 @@ input::placeholder, textarea::placeholder { color: #b0bab3; }.field input:disabl
 .guest-text-input textarea {width:100%;height:72px;min-height:60px;max-height:160px;resize:vertical;font:inherit;font-size:14px;line-height:1.5;padding:8px;border-radius:8px;}
 .guest-input-actions {display:flex;flex-wrap:wrap;gap:6px;}
 .guest-input-actions .button {padding:7px 9px;font-size:12px;min-height:32px;}
+.guest-translation-direction {width:auto;max-width:100%;font-size:12px;padding:5px 7px;min-height:32px;}
+.guest-translation-settings {font-size:11px;color:#627b85;}
+.guest-translation-settings summary {cursor:pointer;}
+.guest-translation-settings-body {display:grid;gap:8px;margin-top:8px;}
+.guest-translation-settings-body label {display:grid;gap:5px;}
+.guest-translation-settings-body input {font-size:12px;padding:7px;width:100%;min-width:0;box-sizing:border-box;}
+.guest-translation-settings-body p {margin:0;line-height:1.6;}
 .guest-input-more summary {cursor:pointer;color:#627b85;font-size:11px;}
 .guest-input-more summary span {float:right;}
 .guest-input-more p {margin:8px 0;line-height:1.6;color:#627b85;}
@@ -321,3 +328,57 @@ input::placeholder, textarea::placeholder { color: #b0bab3; }.field input:disabl
 
 .protection-event-meta strong{font-weight:700;white-space:nowrap;}
 .protection-event-meta .protection-event-summary{font-size:inherit;line-height:inherit;margin:0;}
+
+/* Expanded translation is a reader only; system and guest typography stay intact. */
+.guest-input-expand {margin-left:auto;border:0;background:transparent;color:#23685f;cursor:pointer;font:inherit;font-size:11px;padding:4px 2px;white-space:nowrap;}
+.guest-input-heading .guest-input-close {margin-left:0;flex-shrink:0;}
+.guest-text-tools .guest-receive-translate {font-weight:600;color:#176b63;white-space:nowrap;}
+.guest-original-editor {display:flex;flex-direction:column;gap:8px;min-width:0;}
+.guest-translation-editors {display:flex;flex-direction:column;gap:8px;min-width:0;}
+.guest-text-input textarea {white-space:pre-wrap;tab-size:4;overflow-wrap:anywhere;}
+.guest-translation-expanded .modal {width:min(1100px,100%);height:min(800px,calc(100dvh - 64px));display:flex;flex-direction:column;}
+.guest-translation-expanded .modal-header {padding:16px 20px;flex-shrink:0;}
+.guest-translation-expanded .modal-header h2 {font-size:18px;}
+.guest-translation-expanded .modal-header p {margin-top:4px;font-size:12px;}
+.guest-text-input-expanded {padding:16px 20px;overflow:auto;flex:1;min-height:0;}
+.guest-reader-toolbar {display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;color:#527079;}
+.guest-reader-toolbar>div {display:flex;align-items:center;gap:8px;}
+.guest-reader-toolbar .button {padding:6px 9px;font-size:12px;min-height:32px;}
+.guest-text-input-expanded .guest-translation-editors {flex:1;min-height:280px;display:grid;grid-template-columns:minmax(0,1fr);gap:16px;}
+.guest-text-input-expanded .guest-translation-editors.has-translation {grid-template-columns:repeat(2,minmax(0,1fr));}
+.guest-text-input-expanded .guest-original-editor,.guest-text-input-expanded .guest-translation-result {display:flex;flex-direction:column;min-width:0;min-height:0;gap:8px;}
+.guest-text-input-expanded .guest-translation-result {border-top:0;border-left:1px solid #d6e4e1;padding:0 0 0 16px;}
+.guest-text-input-expanded textarea {height:auto;min-height:200px;max-height:none;flex:1;resize:none;font-size:var(--translation-font-size,16px);line-height:1.7;}
+.guest-text-input-expanded .guest-translation-result>.button {min-height:32px;}
+@media(max-width:700px) {
+ .guest-translation-expanded .modal {height:calc(100dvh - 24px);}
+ .guest-text-input-expanded {padding:12px;}
+ .guest-text-input-expanded .guest-translation-editors {display:flex;flex:none;min-height:0;}
+ .guest-text-input-expanded .guest-original-editor,.guest-text-input-expanded .guest-translation-result {flex:none;min-height:auto;}
+ .guest-text-input-expanded .guest-translation-result {border-left:0;border-top:1px solid #d6e4e1;padding:12px 0 0;}
+ .guest-text-input-expanded textarea {height:280px;min-height:220px;flex:none;}
+}
+
+.guest-folder-tabs {display:flex;gap:8px;flex-wrap:wrap;}
+.guest-folder-tabs .button {padding:8px 14px;}
+.guest-folder-tabs .selected {background:#dceee8;border-color:#8bb5a9;color:#205f54;}
+.guest-folder-breadcrumb {display:flex;align-items:center;flex-wrap:wrap;gap:2px;margin-top:12px;}
+.guest-folder-breadcrumb .button {border:0;background:transparent;box-shadow:none;padding:5px 7px;min-height:30px;font-size:12px;overflow-wrap:anywhere;}
+.guest-folder-path {display:block;font-size:11px;color:#627b85;overflow-wrap:anywhere;margin:4px 0 12px;user-select:text;}
+.guest-folder-entry.button {justify-content:flex-start;background:transparent;border:0;box-shadow:none;padding:0;min-height:30px;font-weight:600;text-align:left;overflow-wrap:anywhere;}
+.guest-file-change {font-size:10px;padding:3px 5px;border-radius:4px;background:#e1f2e7;color:#205f43;margin-left:8px;white-space:nowrap;}
+.guest-transfer-more {font-size:12px;line-height:1.7;margin-top:12px;}
+.guest-transfer-more summary {cursor:pointer;color:#627b85;}
+.guest-transfer-more .button-row {margin-top:8px;}
+.guest-transfer-list time {font-variant-numeric:tabular-nums;}
+.guest-exchange-body .guest-transfer-drop {padding:12px;gap:8px;}
+.guest-exchange-body .guest-transfer-drop>svg {display:none;}
+.guest-exchange-body .guest-transfer-drop strong {font-size:13px;}
+.guest-file-browser {display:flex;flex-direction:column;gap:8px;}
+.guest-file-browser .section-heading,.guest-file-browser p,.guest-file-browser .guest-folder-path,.guest-file-browser .guest-folder-breadcrumb {margin:0;}
+.guest-file-browser .section-heading {margin-bottom:2px;}
+.guest-exchange-body .guest-transfer-drop {display:flex;flex-direction:row;align-items:center;justify-content:space-between;text-align:left;}
+.guest-transfer-drop>div {display:flex;flex-direction:column;gap:4px;}
+.guest-transfer-drop>div span {font-size:11px;}
+.guest-exchange-body>.notice {position:sticky;top:0;z-index:2;flex-shrink:0;}
+@media(max-width:480px){.guest-exchange-body .guest-transfer-drop {flex-wrap:wrap;}.guest-transfer-drop>.button{width:100%;}}

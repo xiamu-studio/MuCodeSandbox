@@ -160,7 +160,7 @@ unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 mkdir -p /home/dev/.local/share/mucodesandbox/browser
 chmod 0700 /home/dev/.local/share/mucodesandbox /home/dev/.local/share/mucodesandbox/browser
 export PULSE_SERVER=${shellQuote(GUEST_AUDIO_ENV.PULSE_SERVER)} PULSE_COOKIE=${shellQuote(GUEST_AUDIO_ENV.PULSE_COOKIE)} PULSE_SINK=mu_browser
-exec ${command.map(shellQuote).join(' ')}
+exec /usr/bin/dbus-run-session -- ${command.map(shellQuote).join(' ')}
 `;
   const unit = `[Unit]
 Description=MuCodeSandbox Linux browser

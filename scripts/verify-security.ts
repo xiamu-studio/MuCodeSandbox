@@ -1,0 +1,150 @@
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, rm, writeFile, readFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path from 'node:path';
+import { createServer, request as httpRequest } from 'node:http';
+import { connect, type Socket } from 'node:net';
+import { Manager } from '../server/manager.ts';
+import { LimaRuntime } from '../server/runtime.ts';
+import type { Job } from '../shared/types.ts';
+
+const root = path.resolve(import.meta.dirname, '..');
+const temporary = await mkdtemp(path.join(homedir(), '.mu-network-verification-'));
+process.env.MU_LIMA_PATH ??= path.join(homedir(), '.mucodesandbox/tools/lima/bin/limactl');
+const manager = new Manager(temporary, undefined, new LimaRuntime(temporary));
+const report: Record<string, unknown> = { passed: false, startedAt: new Date().toISOString() };
+let directHits = 0;
+let proxyHits = 0;
+const sockets = new Set<Socket>();
+const upstream = createServer((_req, res) => { directHits++; res.end('MU_NETWORK_FIXTURE_OK'); });
+await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
+const upstreamPort = (upstream.address() as { port: number }).port;
+const proxy = createServer((req, res) => {
+  if (req.headers['proxy-authorization'] !== `Basic ${Buffer.from('mu:verification').toString('base64')}`) { res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="Mu verification"' }); res.end(); return; }
+  proxyHits++;
+  const url = new URL(req.url!);
+  const headers = { ...req.headers }; delete headers['proxy-authorization'];
+  const outgoing = httpRequest(url.hostname === 'guard-fixture.invalid' ? `http://127.0.0.1:${upstreamPort}/` : url, { method: req.method, headers }, response => { res.writeHead(response.statusCode!, response.headers); response.pipe(res); });
+  outgoing.on('error', () => { res.writeHead(502); res.end(); }); req.pipe(outgoing);
+});
+proxy.on('connect', (req, client, head) => {
+  if (req.headers['proxy-authorization'] !== `Basic ${Buffer.from('mu:verification').toString('base64')}`) { client.end('HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="Mu verification"\r\n\r\n'); return; }
+  const destination = new URL(`https://${req.url}`);
+  const remote = connect(Number(destination.port) || 443, destination.hostname, () => { client.write('HTTP/1.1 200 Connection Established\r\n\r\n'); if (head.length) remote.write(head); client.pipe(remote); remote.pipe(client); });
+  sockets.add(remote); remote.on('close', () => sockets.delete(remote));
+  remote.on('error', () => client.destroy()); client.on('error', () => remote.destroy()); client.on('close', () => remote.destroy());
+});
+proxy.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+await new Promise<void>(resolve => proxy.listen(0, '127.0.0.1', resolve));
+const proxyPort = (proxy.address() as { port: number }).port;
+const e = await manager.create({ name: '网络防护实机验证', cpus: 2, memoryGiB: 2, diskGiB: 10, identity: { timezone: 'America/New_York', locale: 'en-US' } });
+const ids = [e.id];
+async function finish(job: Job) {
+  await manager.tasks.get(job.id)?.promise;
+  const done = manager.store.jobs().find(j => j.id === job.id)!;
+  if (done.status !== 'succeeded') { report.failedAction = job.action; report.logs = manager.store.logs(job.environmentId ?? e.id).slice(-20); }
+  assert.equal(done.status, 'succeeded', done.message);
+}
+const guest = (command: string[]) => manager.runtime.guest(manager.store.get(e.id), command, { timeoutMs: 30_000 });
+const management = (command: string[]) => manager.runtime.management(manager.store.get(e.id), command, { timeoutMs: 30_000 });
+async function denied(command: string[]) {
+  await assert.rejects(guest(command));
+}
+try {
+  console.log('Starting a disposable VM and preparing the firewall.');
+  await finish(await manager.lifecycle(e.id, 'start'));
+  console.log('VM started; installing and arming protection.');
+  await assert.rejects(manager.update(e.id, {}), /停止/);
+  await finish(await manager.lifecycle(e.id, 'prepare-network'));
+  const old = manager.store.get(e.id);
+  const config = { name: old.name, cpus: old.cpus, memoryGiB: old.memoryGiB, diskGiB: old.diskGiB, identity: old.identity, network: { mode: 'http', host: '127.0.0.1', port: proxyPort, username: 'mu', password: 'verification', noProxy: '', strict: true } };
+  await manager.update(e.id, config);
+  console.log('Boot protection prepared; starting strict mode.');
+  await finish(await manager.lifecycle(e.id, 'start'));
+  let status = await manager.runtime.networkProtection(manager.store.get(e.id));
+  assert.equal((await guest(['whoami'])).trim(), 'dev');
+  await denied(['sudo', '-n', 'true']);
+  await denied(['sudo', '-n', 'nft', 'flush', 'ruleset']);
+  await denied(['ip', 'link', 'add', 'mu-unapproved', 'type', 'dummy']);
+  await denied(['cat', '/home/mu/.ssh/authorized_keys']);
+  await denied(['mu-install', 'git;printf unsafe']);
+  report.developerCannotElevateChangeNetworkOrReadControlKeys = true;
+  assert.ok(status.active && status.bootArmed); report.protection = status;
+  const gateway = (await guest(['ip', '-4', 'route', 'show', 'default'])).match(/default via (\S+)/)![1];
+  assert.equal((await guest(['curl', '--fail', '--silent', '--max-time', '8', 'http://guard-fixture.invalid/'])).trim(), 'MU_NETWORK_FIXTURE_OK');
+  assert.ok(proxyHits > 0); report.authenticatedProxyWorks = true;
+  assert.equal((await guest(['bash', '-lc', 'curl --fail --silent --max-time 8 http://guard-fixture.invalid/'])).trim(), 'MU_NETWORK_FIXTURE_OK');
+  report.loginShellUsesPinnedProxy = true;
+  const hits = directHits;
+  console.log('Testing direct TCP, DNS, IPv6 and proxy failure.');
+  await denied(['curl', '--fail', '--silent', '--max-time', '3', '--proxy', '', '--noproxy', '*', `http://${gateway}:${upstreamPort}/`]);
+  assert.equal(directHits, hits); report.directTcpBlocked = true;
+  const before = (await manager.runtime.networkProtection(manager.store.get(e.id))).blockedPackets;
+  await guest(['python3', '-c', "import socket\ns=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(1)\ntry:\n s.sendto(b'\\x00'*20,('8.8.8.8',53));s.recv(1024);raise RuntimeError('Unexpected DNS response')\nexcept (socket.timeout,PermissionError): pass"]);
+  assert.ok((await manager.runtime.networkProtection(manager.store.get(e.id))).blockedPackets > before); report.directDnsBlocked = true;
+  const ipv6Before = (await manager.runtime.networkProtection(manager.store.get(e.id))).blockedPackets;
+  await manager.runtime.management(manager.store.get(e.id), ['bash', '-s'], { input: `set -eu\nsudo ip link add mu6test type dummy\ntrap 'sudo ip link del mu6test' EXIT\nsudo ip link set mu6test up\nsudo ip -6 addr add fd77::1/64 dev mu6test\npython3 - <<'PY'\nimport socket\ns=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM)\ntry: s.sendto(b'blocked',('fd77::2',53))\nexcept PermissionError: pass\nPY\n`, timeoutMs: 30_000 });
+  assert.ok((await manager.runtime.networkProtection(manager.store.get(e.id))).blockedPackets > ipv6Before); report.ipv6BlockedWithRoute = true;
+  assert.equal((await guest(['bash', '-c', 'printf "%s|%s|" "$TZ" "$LC_ALL"; cat /etc/timezone'])).trim(), 'America/New_York|en_US.UTF-8|America/New_York'); report.guestIdentityApplied = true;
+  console.log('Testing first creation directly in strict mode.');
+  const fresh = await manager.create({ ...config, name: '新建严格环境验证', identity: { timezone: 'Europe/Berlin', locale: 'de-DE' } });
+  ids.push(fresh.id);
+  await finish(await manager.lifecycle(fresh.id, 'start'));
+  assert.ok((await manager.runtime.networkProtection(manager.store.get(fresh.id))).active);
+  const bootCapture = await manager.runtime.management(manager.store.get(fresh.id), ['sudo', 'tcpdump', '-n', '-r', '/var/log/mucodesandbox/boot-network.pcap']);
+  const physical = bootCapture.split('\n').filter(line => /\s(?!lo\b)\S+\s+Out\s+IP/.test(line));
+  const outgoing = physical.filter(line => / IP /.test(line));
+  assert.ok(outgoing.length > 0, 'First boot capture must have a positive control');
+  assert.ok(outgoing.every(line => /\.22 > /.test(line) || line.includes(`.${proxyPort}:`) || /\.68 > [0-9.]+\.67:/.test(line)), bootCapture);
+  assert.ok(physical.every(line => !/ IP6 /.test(line)));
+  report.firstUserBootCapturedWithoutUnapprovedIpEgress = true;
+  report.baseBuildHasNoAccountsOrShares = true;
+  assert.ok((await manager.runtime.metrics(manager.store.get(fresh.id))).memoryTotalMiB > 0);
+  report.metricsUseLocaleIndependentNumbers = true;
+  assert.equal((await manager.runtime.guest(manager.store.get(fresh.id), ['curl', '--fail', '--silent', '--max-time', '8', 'http://guard-fixture.invalid/'])).trim(), 'MU_NETWORK_FIXTURE_OK');
+  await finish(await manager.lifecycle(fresh.id, 'stop')); report.newStrictEnvironmentWorks = true;
+  const hitsAfterFresh = directHits;
+  await manager.runtime.management(manager.store.get(e.id), ['bash', '-s'], { input: `set -eu\nsudo tee /etc/systemd/system/mu-leak-probe.service >/dev/null <<'UNIT'\n[Unit]\nAfter=network.target\n[Service]\nType=oneshot\nExecStart=/usr/bin/curl --proxy '' --noproxy '*' --max-time 3 http://${gateway}:${upstreamPort}/boot-probe\n[Install]\nWantedBy=multi-user.target\nUNIT\nsudo systemctl daemon-reload\nsudo systemctl enable mu-leak-probe.service\n`, timeoutMs: 30_000 });
+  for (const socket of sockets) socket.destroy();
+  await new Promise<void>(resolve => proxy.close(() => resolve()));
+  await denied(['curl', '--fail', '--silent', '--max-time', '3', 'http://guard-fixture.invalid/']);
+  await denied(['curl', '--fail', '--silent', '--max-time', '3', '--proxy', '', '--noproxy', '*', `http://${gateway}:${upstreamPort}/`]);
+  assert.equal(directHits, hitsAfterFresh); report.proxyFailureDoesNotFallBack = true;
+  await finish(await manager.lifecycle(e.id, 'restart'));
+  status = await manager.runtime.networkProtection(manager.store.get(e.id)); assert.ok(status.active && status.bootArmed);
+  assert.equal(directHits, hitsAfterFresh); report.restartProtected = true;
+  assert.equal((await guest(['systemctl', 'show', 'systemd-networkd.service', '-p', 'Requires'])).includes('mucodesandbox-egress.service'), true);
+  report.networkServiceRequiresGuard = true;
+  const probe = await guest(['systemctl', 'show', 'mu-leak-probe.service', '-p', 'Result']);
+  assert.match(probe, /exit-code/); report.bootDirectConnectionBlocked = true;
+  report.finalProtection = status;
+  await finish(await manager.lifecycle(e.id, 'stop'));
+  const marker = JSON.parse(await readFile(path.join(temporary, 'security', `${e.instanceName}.json`), 'utf8'));
+  assert.equal(marker.conservative, true); report.stopClosesOldProxyEndpoints = true;
+  await manager.update(e.id, { ...config, identity: { timezone: 'UTC', locale: 'en-US' } });
+  report.strictConfigurationCanChangeAfterSafeStop = true;
+  console.log('Testing rule tampering detection and automatic quarantine.');
+  await finish(await manager.lifecycle(e.id, 'start'));
+  let revoked = false;manager.onQuarantine = id => {if(id===e.id)revoked=true;};
+  await management(['sudo','nft','insert','rule','inet','mu_egress','output','tcp','dport','1','accept']);
+  const modified = await manager.runtime.networkProtection(manager.store.get(e.id));
+  assert.equal(modified.firewallActive,true);assert.equal(modified.integrity,'changed');assert.equal(modified.active,false);
+  await manager.monitorProtection();
+  assert.equal(revoked,true);assert.equal(manager.store.get(e.id).state,'error');
+  assert.equal((await manager.runtime.list()).find(i=>i.name===e.instanceName)?.status,'Stopped');
+  report.addedAllowRuleDetectedAndQuarantined = true;
+  report.passed = true;
+} catch (error) { report.error = error instanceof Error ? error.message : String(error); process.exitCode = 1; }
+finally {
+  if (!report.passed && process.env.MU_KEEP_FAILED_SECURITY) report.cleanupError = 'Retained for diagnosis';
+  else for (const id of ids) await manager.lifecycle(id, 'delete').then(finish).catch(error => { report.cleanupError = String(error); });
+  await manager.close();
+  for (const socket of sockets) socket.destroy();
+  if (proxy.listening) await new Promise<void>(resolve => proxy.close(() => resolve()));
+  await new Promise<void>(resolve => upstream.close(() => resolve()));
+  if (!report.cleanupError) await rm(temporary, { recursive: true, force: true });
+  else report.retainedDataDir = temporary;
+  await mkdir(path.join(root, 'test-results'), { recursive: true });
+  await writeFile(path.join(root, 'test-results/network-security.json'), JSON.stringify(report, null, 2));
+  console.log(JSON.stringify(report, null, 2));
+}

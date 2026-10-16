@@ -1,0 +1,27 @@
+{
+  "generatedAtTaipei": "2026-10-12T22:19:57+08:00",
+  "projectRoot": "/Users/staff/Documents/AIbox/AI/AIbeng/MuCodeSandbox",
+  "fileCount": 486,
+  "directoryCounts": {
+    "(root)": 12,
+    "assets": 1,
+    "desktop": 5,
+    "docs": 124,
+    "examples": 1,
+    "native": 7,
+    "scripts": 183,
+    "server": 61,
+    "shared": 13,
+    "src": 26,
+    "tests": 53
+  },
+  "logicalBytesExcludingGeneratedIndexAndStats": 4432753,
+  "excluded": [
+    "Git internals",
+    "dependencies",
+    "compiled outputs",
+    "test-results",
+    "native binaries",
+    "VM runtime data"
+  ]
+}

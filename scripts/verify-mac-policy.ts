@@ -1,0 +1,43 @@
+import assert from 'node:assert/strict';
+import { createServer, request } from 'node:http';
+import { createSocket } from 'node:dgram';
+import { mkdtemp, rm, mkdir, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path from 'node:path';
+import { runManagedMac } from '../server/mac-policy.ts';
+import { run } from '../server/process.ts';
+const root = path.resolve(import.meta.dirname, '..');
+const temporary = await mkdtemp(path.join(homedir(), '.mu-mac-guard-'));
+const report: Record<string, unknown> = { passed: false, experimental: true, accountFree: true, scope: 'only launched process and inherited children; not browser or system extension acceptance' };
+let hits = 0, ipv6Hits = 0, udpHits = 0;
+const target = createServer((_req,res)=>{hits++;res.end('MAC_CONTROL_OK')});
+await new Promise<void>(resolve=>target.listen(0,'127.0.0.1',resolve));
+const targetPort=(target.address() as {port:number}).port;
+const proxy=createServer((req,res)=>{const outgoing=request(`http://127.0.0.1:${targetPort}/`,response=>{response.pipe(res)});outgoing.on('error',()=>res.end());req.pipe(outgoing)});
+await new Promise<void>(resolve=>proxy.listen(0,'127.0.0.1',resolve));
+const proxyPort=(proxy.address() as {port:number}).port;
+const v6=createServer((_req,res)=>{ipv6Hits++;res.end('IPV6_CONTROL_OK')});await new Promise<void>(resolve=>v6.listen(0,'::1',resolve));
+const v6Port=(v6.address() as {port:number}).port;
+const udp=createSocket('udp4');udp.on('message',()=>{udpHits++});await new Promise<void>(resolve=>udp.bind(0,'127.0.0.1',resolve));
+const udpPort=udp.address().port;
+const managed=(file:string,args:string[])=>runManagedMac([{address:'127.0.0.1',port:proxyPort}],file,args,{timeoutMs:10_000});
+try{
+ assert.equal((await run('/usr/bin/curl',['--silent','--fail','--noproxy','*',`http://127.0.0.1:${targetPort}/`])).trim(),'MAC_CONTROL_OK');
+ assert.equal((await run('/usr/bin/curl',['--silent','--fail','--noproxy','*',`http://[::1]:${v6Port}/`])).trim(),'IPV6_CONTROL_OK');
+ report.tcpAndIpv6PositiveControls=true;
+ assert.equal((await managed('/usr/bin/curl',['--silent','--fail','--noproxy','','--proxy',`http://127.0.0.1:${proxyPort}`,'http://synthetic.test/'])).trim(),'MAC_CONTROL_OK');
+ report.approvedProxyWorks=true;
+ const before=hits;
+ await assert.rejects(managed('/usr/bin/curl',['--silent','--fail','--noproxy','*',`http://127.0.0.1:${targetPort}/`]));
+ await assert.rejects(managed('/usr/bin/curl',['--silent','--fail','--noproxy','*',`http://[::1]:${v6Port}/`]));
+ assert.equal(hits,before);assert.equal(ipv6Hits,1);report.directTcpAndIpv6Blocked=true;
+ const sendCode=`const s=require('node:dgram').createSocket('udp4');s.send(Buffer.from('MU_CONTROL'),${udpPort},'127.0.0.1',e=>{s.close();if(e)process.exitCode=1});`;
+ await run(process.execPath,['-e',sendCode]);await new Promise(resolve=>setTimeout(resolve,100));assert.equal(udpHits,1);
+ await assert.rejects(managed(process.execPath,['-e',sendCode]));assert.equal(udpHits,1);report.udpPositiveControlAndBlock=true;
+ const childCode=`require('node:child_process').execFile('/usr/bin/curl',['--silent','--fail','--noproxy','*','http://127.0.0.1:${targetPort}/'],e=>{if(!e)process.exitCode=1;else console.log('CHILD_BLOCKED')});`;
+ assert.match(await managed(process.execPath,['-e',childCode]),/CHILD_BLOCKED/);assert.equal(hits,before);report.childInheritsPolicy=true;
+ await new Promise<void>(resolve=>proxy.close(()=>resolve()));
+ await assert.rejects(managed('/usr/bin/curl',['--silent','--fail','--noproxy','','--proxy',`http://127.0.0.1:${proxyPort}`,'http://synthetic.test/']));
+ assert.equal(hits,before);report.proxyFailureHasNoDirectFallback=true;report.passed=true;
+}catch(error){report.error=(error as Error).message;process.exitCode=1;}
+finally{target.closeAllConnections();v6.closeAllConnections();proxy.closeAllConnections();await new Promise<void>(resolve=>target.close(()=>resolve()));await new Promise<void>(resolve=>v6.close(()=>resolve()));if(proxy.listening)await new Promise<void>(resolve=>proxy.close(()=>resolve()));await new Promise<void>(resolve=>udp.close(()=>resolve()));await rm(temporary,{recursive:true,force:true});await mkdir(path.join(root,'test-results'),{recursive:true});await writeFile(path.join(root,'test-results/mac-policy.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report,null,2));}

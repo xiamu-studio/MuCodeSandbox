@@ -9,10 +9,11 @@ import {HyperVRuntime,fileHash} from '../server/platform/windows/runtime.ts';
 import {windowsConfigSchema,PROBE_PORT,windowsPaths,type WindowsConfig} from '../server/platform/windows/config.ts';
 import type {WindowsNetworkSession} from '../server/platform/windows/session.ts';
 import {localFixtures,LAB_EXIT} from './windows/local-fixtures.ts';
+import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 
 async function main(){
  const [image,imageSha256]=process.argv.slice(2);if(!image||!imageSha256)throw Error('Usage: windows-isolation-lab <protected base> <SHA-256>');
- const root=process.env.MU_WINDOWS_DATA_DIR??path.join(process.env.LOCALAPPDATA!,'MuCodeSandbox-WindowsPreview');
+ const root=windowsRuntimeDirectory();
  const directory=path.join(root,`isolation-${randomUUID()}`);await mkdir(directory,{recursive:true});
  const runtime=new HyperVRuntime(root),openssl=process.env.MU_OPENSSL_PATH??'C:\\Program Files\\Git\\usr\\bin\\openssl.exe';
  const aFixture=await localFixtures(path.join(directory,'a'),openssl),bFixture=await localFixtures(path.join(directory,'b'),openssl,'203.0.113.20');

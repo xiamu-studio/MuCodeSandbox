@@ -7,7 +7,7 @@ import type {ProtectionEvent} from '../shared/protection-events.ts';
 
 declare global {
   interface Window {
-    __MU_CONFIG__: { token: string; version: string; platform?: 'win32'; capabilities?:{terminal:boolean;files:boolean} };
+    __MU_CONFIG__: { token: string; version: string; platform?: 'win32'; capabilities?:{terminal:boolean;files:boolean;browser?:boolean} };
     muDesktop?: { readClipboardImage?:()=>Promise<import('../shared/clipboard-image.ts').ClipboardImage>; onGuestApplication?:(callback:(value:{id:string;target:'browser'|'desktop';application?:string})=>void)=>()=>void; browserAction(input: { id: string; action: string; url?: string }): Promise<void>; onBrowserState(callback: (state: BrowserState) => void): () => void };
   }
 }

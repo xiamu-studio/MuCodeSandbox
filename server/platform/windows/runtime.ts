@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import {Duplex} from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { lstat, mkdir, readFile, writeFile, access, rename, rm } from 'node:fs/promises';
@@ -51,6 +52,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   private transportFailures=new Map<string,()=>void>();
   private vmIds=new Map<string,string>();
   private channels=new Map<string,{child:ChildProcessWithoutNullStreams;port:number}>();
+  private serviceStreams=new Map<string,Set<Duplex>>();
   readonly root:string;
   readonly runner:Runner;
   constructor(root:string,runner:Runner=run) {this.root=root;this.runner=runner;}
@@ -102,7 +104,21 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
       this.channels.set(id,{child,port});return port;
     }catch(error){child.kill();throw error;}
   }
-  private closeChannel(id:string){const channel=this.channels.get(id);this.channels.delete(id);if(channel){channel.child.stdin.end();channel.child.kill();}}
+  private closeChannel(id:string){for(const stream of this.serviceStreams.get(id)??[])stream.destroy();this.serviceStreams.delete(id);const channel=this.channels.get(id);this.channels.delete(id);if(channel){channel.child.stdin.end();channel.child.kill();}}
+  async serviceStreamFactory(c:WindowsConfig,service:'vnc'|'cdp'){
+    const target=service==='vnc'?5900:service==='cdp'?9222:0;if(!target)throw Error('Unknown guest service');
+    const args=await this.ssh(c),destination=args.pop()!,file=path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe');
+    return ()=>{
+      const total=[...this.serviceStreams.values()].reduce((n,set)=>n+set.size,0),set=this.serviceStreams.get(c.id)??new Set<Duplex>();
+      if(total>=32||set.size>=8)throw Error('Guest service connection limit reached');
+      const child=spawn(file,[...args,'-o','ClearAllForwardings=yes','-o','IdentityAgent=none','-W',`127.0.0.1:${target}`,destination],{stdio:['pipe','pipe','pipe'],windowsHide:true});
+      const stream=Duplex.from({writable:child.stdin,readable:child.stdout});set.add(stream);this.serviceStreams.set(c.id,set);child.stderr.resume();
+      let force:ReturnType<typeof setTimeout>|undefined;
+      child.once('error',()=>stream.destroy(Error('Guest service transport could not start')));child.once('close',()=>{clearTimeout(force);stream.destroy();});stream.on('error',()=>{});
+      stream.once('close',()=>{set.delete(stream);if(!set.size&&this.serviceStreams.get(c.id)===set)this.serviceStreams.delete(c.id);if(child.exitCode===null&&child.signalCode===null){child.kill();force=setTimeout(()=>child.kill('SIGKILL'),2000);force.unref();}});
+      return stream;
+    };
+  }
   async management(c:WindowsConfig,command:string[],options:RunOptions={}) {
     return this.runner(path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe'),
       [...await this.ssh(c),command.map(shellQuote).join(' ')],options);

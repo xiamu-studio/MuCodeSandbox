@@ -1,5 +1,6 @@
 import { createConnection, type Socket } from 'node:net';
 import { createCipheriv } from 'node:crypto';
+import type {Duplex} from 'node:stream';
 
 export function vncChallenge(password:string,challenge:Buffer) {
   if(!/^[A-Za-z0-9_-]{8}$/.test(password)||challenge.length!==16)throw new Error('Invalid VNC authentication');
@@ -10,8 +11,8 @@ export function vncChallenge(password:string,challenge:Buffer) {
 }
 class Reader {
   buffer=Buffer.alloc(0); pending?:{size:number;resolve:(b:Buffer)=>void;reject:(e:Error)=>void};failure?:Error;
-  socket:Socket;
-  constructor(socket:Socket){this.socket=socket;socket.on('data',chunk=>{if(this.buffer.length+chunk.length>1_000_000){this.fail(new Error('VNC response too large'));socket.destroy();return;}this.buffer=Buffer.concat([this.buffer,chunk]);this.flush();});socket.on('error',e=>this.fail(e));socket.on('close',()=>this.fail(new Error('VNC connection closed')));}
+  socket:Duplex;
+  constructor(socket:Duplex){this.socket=socket;socket.on('data',chunk=>{if(this.buffer.length+chunk.length>1_000_000){this.fail(new Error('VNC response too large'));socket.destroy();return;}this.buffer=Buffer.concat([this.buffer,chunk]);this.flush();});socket.on('error',e=>this.fail(e));socket.on('close',()=>this.fail(new Error('VNC connection closed')));}
   fail(e:Error){this.failure=e;this.pending?.reject(e);this.pending=undefined;}
   flush(){if(this.pending&&this.buffer.length>=this.pending.size){const p=this.pending;this.pending=undefined;const b=this.buffer.subarray(0,p.size);this.buffer=this.buffer.subarray(p.size);p.resolve(b);}}
   read(size:number):Promise<Buffer>{if(this.failure)return Promise.reject(this.failure);if(size<0||size>1_000_000||this.pending)return Promise.reject(new Error('Invalid VNC response'));return new Promise((resolve,reject)=>{this.pending={size,resolve,reject};this.flush();});}
@@ -19,7 +20,11 @@ class Reader {
 function desktopRequest(width:number,height:number,screenId:number,flags:number){const b=Buffer.alloc(24);b[0]=251;b.writeUInt16BE(width,2);b.writeUInt16BE(height,4);b[6]=1;b.writeUInt32BE(screenId,8);b.writeUInt16BE(width,16);b.writeUInt16BE(height,18);b.writeUInt32BE(flags,20);return b;}
 export async function resizeVncDisplay(socketPath:string,password:string,width:number,height:number) {
   if(!Number.isInteger(width)||!Number.isInteger(height)||width<320||height<240||width>8192||height>8192||width*height>16_000_000)throw new Error('Invalid display dimensions');
-  const socket=createConnection({path:socketPath}),reader=new Reader(socket);
+  return resizeVncDisplayStream(createConnection({path:socketPath}),password,width,height);
+}
+export async function resizeVncDisplayStream(socket:Duplex,password:string,width:number,height:number) {
+  if(!Number.isInteger(width)||!Number.isInteger(height)||width<320||height<240||width>8192||height>8192||width*height>16_000_000)throw new Error('Invalid display dimensions');
+  const reader=new Reader(socket);
   const timer=setTimeout(()=>{reader.fail(new Error('Display resize timeout'));socket.destroy();},6000);
   try {
     const version=(await reader.read(12)).toString();if(version!=='RFB 003.008\n')throw new Error('Unsupported VNC version');socket.write(version);

@@ -9,12 +9,13 @@ import {HyperVRuntime,fileHash} from '../server/platform/windows/runtime.ts';
 import {PROBE_PORT,type WindowsConfig} from '../server/platform/windows/config.ts';
 import type {RunOptions} from '../server/process.ts';
 import {localFixtures,LAB_EXIT} from './windows/local-fixtures.ts';
+import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 
 // End-to-end HTTP/lifecycle acceptance against a new empty Hyper-V guest.
 // Every destination accepted by the upstream fixture is local and synthetic.
 async function main(){
  const [image,imageSha256]=process.argv.slice(2);if(!image||!imageSha256)throw Error('Usage: windows-service-lab <protected base> <SHA-256>');
- const root=process.env.MU_WINDOWS_DATA_DIR??path.join(process.env.LOCALAPPDATA!,'MuCodeSandbox-WindowsPreview');
+ const root=windowsRuntimeDirectory();
  const directory=path.join(root,'service-lab-'+randomUUID());await mkdir(directory,{recursive:true});
  const fixtures=await localFixtures(path.join(directory,'fixtures'),process.env.MU_OPENSSL_PATH??'C:\\Program Files\\Git\\usr\\bin\\openssl.exe');
  class LocalLabRuntime extends HyperVRuntime{

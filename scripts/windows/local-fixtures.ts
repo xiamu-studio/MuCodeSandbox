@@ -1,4 +1,4 @@
-import { createServer as httpServer } from 'node:http';
+import { createServer as httpServer,type IncomingMessage,type ServerResponse } from 'node:http';
 import { createServer as httpsServer } from 'node:https';
 import { connect, type AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
@@ -14,7 +14,7 @@ export const LAB_PROBE_HOSTS=['receiver-a.mu.test','receiver-b.mu.test'] as cons
 
 // Every possible destination is mapped to loopback or rejected. The fixture
 // proxy never opens an Internet connection, including DNS or model services.
-export async function localFixtures(directory:string,openssl:string,exitIp=LAB_EXIT) {
+export async function localFixtures(directory:string,openssl:string,exitIp=LAB_EXIT,content?:(request:IncomingMessage,response:ServerResponse)=>boolean,trace?:(value:object)=>void) {
   await mkdir(directory,{recursive:true});
   const key=path.join(directory,'fixture-key.pem'),cert=path.join(directory,'fixture-cert.pem');
   await run(openssl,['req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=Mu local test only',
@@ -23,6 +23,7 @@ export async function localFixtures(directory:string,openssl:string,exitIp=LAB_E
   const sockets=new Set<Duplex>();let receipts=0,denied=0,stopped=false,dnsRequests=0,available=true,conflict=false,dnsAvailable=true;
   const tunnels=new Set<Duplex>();
   const receivers=LAB_RECEIVERS.map((_,index)=>httpsServer(material,(req,res)=>{
+    if(content?.(req,res))return;
     if(req.url==='/stream'){
       res.writeHead(200,{'content-type':'text/plain','cache-control':'no-store'});let sequence=0;
       const interval=setInterval(()=>res.write(String(++sequence)+'\n'),100);res.on('close',()=>clearInterval(interval));return;
@@ -38,8 +39,8 @@ export async function localFixtures(directory:string,openssl:string,exitIp=LAB_E
       const question=dns.Packet.parse(data),answer=dns.Packet.createResponseFromRequest(question);dnsRequests++;
       const names:Record<string,string>={'receiver.mu.test':LAB_EXIT,'receiver-a.mu.test':LAB_RECEIVERS[0],'receiver-b.mu.test':LAB_RECEIVERS[1]};
       for(const q of question.questions)if(names[q.name]&&q.type===dns.Packet.TYPE.A)answer.answers.push(new dns.Packet.Resource({name:q.name,type:dns.Packet.TYPE.A,class:dns.Packet.CLASS.IN,ttl:0,address:names[q.name]}));
-      res.writeHead(200,{'content-type':'application/dns-message'});res.end(answer.toBuffer());
-    }catch{res.writeHead(400).end();}
+      trace?.({event:'dns',questions:question.questions.map(q=>({name:q.name,type:q.type})),answers:answer.answers.length});res.writeHead(200,{'content-type':'application/dns-message'});res.end(answer.toBuffer());
+    }catch(error){trace?.({event:'dns-error',message:error instanceof Error?error.message:'parse failure'});res.writeHead(400).end();}
   })();});
   receivers.push(resolver);
   for(const server of receivers){server.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));});
@@ -48,7 +49,8 @@ export async function localFixtures(directory:string,openssl:string,exitIp=LAB_E
   proxy.on('connection',socket=>{sockets.add(socket);socket.on('close',()=>sockets.delete(socket));});
   proxy.on('connect',(req,socket,head)=>{
     const targets=[...LAB_RECEIVERS,LAB_DNS.address];const index=targets.findIndex(ip=>req.url===`${ip}:443`);
-    if(index<0||stopped||!available){denied++;socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');return;}
+    if(index<0||stopped||!available){trace?.({event:'proxy-denied',target:req.url,stopped,available});denied++;socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');return;}
+    trace?.({event:'proxy-connect',target:req.url});
     const target=connect((receivers[index].address() as AddressInfo).port,'127.0.0.1');
     sockets.add(target);tunnels.add(target);target.on('close',()=>{sockets.delete(target);tunnels.delete(target);});
     target.on('connect',()=>{socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');if(head.length)target.write(head);socket.pipe(target);target.pipe(socket);});

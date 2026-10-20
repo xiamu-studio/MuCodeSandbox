@@ -1,7 +1,6 @@
 import {randomBytes,timingSafeEqual} from 'node:crypto';
 import {createServer} from 'node:http';
 import {readFile} from 'node:fs/promises';
-import {homedir} from 'node:os';
 import path from 'node:path';
 import express from 'express';
 import {z} from 'zod';
@@ -17,27 +16,31 @@ import {WindowsHostMonitor} from './monitor.ts';
 import {WindowsTerminalServer,type PtyFactory} from './terminal.ts';
 import {GuestExchange,transferZone,transferName,transferPath,transferRevision} from '../../guest-exchange.ts';
 import {TRANSFER_MAX_BYTES} from '../../../shared/guest-exchange.ts';
+import {WindowsBrowser} from './browser.ts';
+import {displayRequestSchema} from '../../../shared/guest-display.ts';
+import {clipboardText} from '../../guest-exchange.ts';
+import {windowsAppDirectory,windowsRuntimeDirectory} from './paths.ts';
 
 export interface WindowsServiceOptions {
  rootDir:string;dataDir?:string;runtimeRoot?:string;port?:number;base?:WindowsBase;
- runtime?:WindowsBackend&Pick<HyperVRuntime,'fingerprint'>&Partial<Pick<HyperVRuntime,'terminalLaunch'|'guest'|'management'>>;
+ runtime?:WindowsBackend&Pick<HyperVRuntime,'fingerprint'>&Partial<Pick<HyperVRuntime,'terminalLaunch'|'guest'|'management'|'serviceStreamFactory'>>;
  probe?:WindowsManagerOptions['probe'];
  ptyFactory?:PtyFactory;
 }
 
 export async function createWindowsService(options:WindowsServiceOptions){
  if(process.platform!=='win32')throw new AppError('Windows 入口只能在 Windows 上运行',400,'WINDOWS_REQUIRED');
- const dataDir=path.resolve(options.dataDir??path.join(process.env.LOCALAPPDATA??homedir(),'MuCodeSandbox-WindowsPreview','app'));
- const runtimeRoot=path.resolve(options.runtimeRoot??path.join(dataDir,'hyperv'));
+ const dataDir=windowsAppDirectory(options.dataDir);
+ const runtimeRoot=windowsRuntimeDirectory(options.runtimeRoot,dataDir);
  await secureWindowsDirectory(dataDir);
  const unlock=await acquireWindowsServiceLock(dataDir);
- let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined;
+ let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined;
  try{
   await secureWindowsDirectory(runtimeRoot);
   const runtime=options.runtime??new HyperVRuntime(runtimeRoot);
   let base=options.base;
   if(!base){
-   try{base=z.object({image:z.string().refine(path.isAbsolute),imageSha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict().parse(JSON.parse(await readFile(path.join(runtimeRoot,'protected-base.json'),'utf8')));}
+   try{let source:string;try{source=await readFile(path.join(runtimeRoot,'protected-desktop-base.json'),'utf8');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;source=await readFile(path.join(runtimeRoot,'protected-base.json'),'utf8');}base=z.object({image:z.string().refine(path.isAbsolute),imageSha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict().parse(JSON.parse(source));}
    catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
   }
   manager=new WindowsManager(await openWindowsStore(dataDir),runtime,{runtimeRoot,base,probe:options.probe});
@@ -45,13 +48,15 @@ export async function createWindowsService(options:WindowsServiceOptions){
   terminal=runtime.terminalLaunch?new WindowsTerminalServer(controller,{terminalLaunch:runtime.terminalLaunch.bind(runtime)},options.ptyFactory):undefined;
   const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>();
   const guest=runtime.guest?.bind(runtime),management=runtime.management?.bind(runtime);
+  if(runtime.serviceStreamFactory&&management){browser=new WindowsBrowser(controller,{management,serviceStreamFactory:runtime.serviceStreamFactory.bind(runtime)});controller.browserRunning=id=>browser!.running(id);controller.browserAvailable=true;controller.inspectAdditionalProtection=id=>browser!.assertProtection(id);}
+  const guestBrowser=browser;
   const exchange=guest&&management?new GuestExchange({guest:async(e,command,runOptions={})=>{
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
    try{return await guest(await controller.profile(e),command,{...runOptions,signal:runOptions.signal?AbortSignal.any([abort.signal,runOptions.signal]):abort.signal});}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   },management:async(e,command,runOptions)=>{await controller.assertAccess(e.id);return management(await controller.profile(e),command,runOptions);}},id=>controller.assertAccess(id)):undefined;
-  controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
+  controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
   await controller.recover();
   monitor=new WindowsHostMonitor(()=>runtime.fingerprint(),()=>{void controller.hostUnavailable('宿主网络发生变化、监测中断或电脑从休眠恢复').catch(()=>{});});
   await monitor.start();
@@ -82,6 +87,14 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.get('/api/environments/:id/network/protection',async(req,res)=>res.json(await controller.protection(id(req))));
   app.get('/api/logs',(req,res)=>res.json(controller.store.logs(req.query.environmentId?z.uuid().parse(req.query.environmentId):null,z.coerce.number().int().min(0).parse(req.query.after??0))));
   app.post('/api/jobs/:id/cancel',(req,res)=>{controller.cancel(id(req));res.json({ok:true});});
+  const browserHost=()=>{if(!guestBrowser)throw new AppError('Windows 浏览器运行组件不可用',409,'FEATURE_UNAVAILABLE');return guestBrowser;};
+  app.get('/api/environments/:id/guest-browser',(req,res)=>res.json(browserHost().info(id(req))));
+  app.post('/api/environments/:id/browser/open',async(req,res)=>{z.object({}).strict().parse(req.body??{});const envId=id(req),host=browserHost();res.status(202).json(await controller.submit(envId,'open-browser',options=>host.open(envId,options)));});
+  app.post('/api/environments/:id/browser/close',async(req,res)=>{const envId=id(req),host=browserHost();res.status(202).json(await controller.submit(envId,'close-browser',()=>host.close(envId)));});
+  app.post('/api/environments/:id/browser/navigate',async(req,res)=>{const input=z.object({url:z.url().max(2048)}).strict().parse(req.body);const envId=id(req);res.status(202).json(await controller.submit(envId,'browser-navigate',()=>browserHost().navigate(envId,input.url)));});
+  app.get('/api/environments/:id/browser/inspect',async(req,res)=>{const envId=id(req);await controller.assertAccess(envId);res.json(await browserHost().inspect(envId));});
+  app.post('/api/environments/:id/guest-browser-ticket',async(req,res)=>{const envId=id(req);await controller.assertAccess(envId);res.json(browserHost().issue(envId));});
+  app.post('/api/environments/:id/guest-browser/display',async(req,res)=>{const envId=id(req),input=displayRequestSchema.parse(req.body);await controller.assertAccess(envId);res.json(await browserHost().resize(envId,input));});
   app.post('/api/environments/:id/terminal-ticket',async(req,res)=>{
    const input=z.object({command:z.literal('shell').default('shell'),cols:z.number().int().min(20).max(300).default(100),rows:z.number().int().min(5).max(100).default(28)}).strict().parse(req.body??{});
    if(!terminals)throw new AppError('Windows 终端组件不可用',409,'FEATURE_UNAVAILABLE');const envId=id(req);await controller.assertAccess(envId);res.json({ticket:terminals.issue(envId,input.cols,input.rows)});
@@ -109,9 +122,11 @@ export async function createWindowsService(options:WindowsServiceOptions){
    const bytes=await files().download(id(req),input.zone,input.name,input.path,input.revision);
    res.setHeader('Content-Disposition',`attachment; filename*=UTF-8''${encodeURIComponent(input.name)}`);res.type('application/octet-stream').send(bytes);
   });
+  app.post('/api/environments/:id/clipboard/write',async(req,res)=>{const input=z.object({text:clipboardText}).strict().parse(req.body);res.json(await files().writeClipboard(id(req),input.text));});
+  app.post('/api/environments/:id/clipboard/read',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(await files().readClipboard(id(req)));});
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));
@@ -126,16 +141,17 @@ export async function createWindowsService(options:WindowsServiceOptions){
    else res.status(500).json({error:redact(errorMessage(error)),code:'INTERNAL_ERROR'});
   });
   server.on('upgrade',(req,socket,head)=>{
-   if(!terminals||closing){socket.destroy();return;}
-   void terminals.upgrade(req,socket,head,request=>!!request.headers.host&&origins().some(origin=>new URL(origin).host===request.headers.host)&&!!request.headers.origin&&allowedOrigin(request.headers.origin)&&ui.isAuthorized(request as express.Request)).catch(()=>socket.destroy());
+   if(closing){socket.destroy();return;}const authorize=(request:import('node:http').IncomingMessage)=>!!request.headers.host&&origins().some(origin=>new URL(origin).host===request.headers.host)&&!!request.headers.origin&&allowedOrigin(request.headers.origin)&&ui.isAuthorized(request as express.Request);
+   if(new URL(req.url??'/','http://127.0.0.1').pathname==='/guest-browser'&&guestBrowser){void guestBrowser.upgrade(req,socket,head,authorize).catch(()=>socket.destroy());return;}
+   if(!terminals){socket.destroy();return;}void terminals.upgrade(req,socket,head,authorize).catch(()=>socket.destroy());
   });
   await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});
   const address=server.address();if(typeof address==='object'&&address)port=address.port;
   const url=`http://127.0.0.1:${port}`;
   const close=()=>closing??=(async()=>{
-   watcher.stop();terminals?.close();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
+   watcher.stop();terminals?.close();guestBrowser?.dispose();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
    try{await controller.close();}finally{await closed;await unlock();}
   })();
-  return {app,server,manager:controller,terminal:terminals,exchange,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};
- }catch(error){monitor?.stop();terminal?.close();try{await manager?.close();}finally{await unlock();}throw error;}
+  return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,exchange,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};
+ }catch(error){monitor?.stop();terminal?.close();browser?.dispose();try{await manager?.close();}finally{await unlock();}throw error;}
 }

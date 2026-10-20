@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { mkdtemp, rm, access } from 'node:fs/promises';
 import { connect } from 'node:net';
-import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import path from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
@@ -61,6 +61,21 @@ export class DevTools {
     const socket=new WebSocket(`ws://localhost:9222${endpoint.pathname}`,{createConnection:()=>connect(socketPath),maxPayload:2*1024*1024});
     await new Promise<void>((resolve,reject)=>{socket.once('open',resolve);socket.once('error',reject);});
     return new DevTools(socket);
+  }
+  // Windows carries CDP over authenticated SSH stdio. No unauthenticated CDP
+  // listener is exposed on the host, and the Mac Unix-socket path stays intact.
+  static async openStream(createConnection:()=>Duplex){
+    const open=()=>{const stream=createConnection();stream.on('error',()=>{});return stream;};
+    const agent=new HttpAgent({keepAlive:false});agent.createConnection=()=>open() as import('node:net').Socket;
+    const version=await new Promise<{webSocketDebuggerUrl:string}>((resolve,reject)=>{
+      const request=httpRequest({host:'localhost',port:9222,path:'/json/version',headers:{Host:'localhost:9222'},agent},response=>{
+        let body='';response.on('data',chunk=>{body+=chunk;if(body.length>65536)request.destroy(Error('Invalid DevTools response'));});response.on('end',()=>{try{resolve(JSON.parse(body));}catch(error){reject(error);}});
+      });const timer=setTimeout(()=>request.destroy(Error('DevTools timeout')),10000);request.once('close',()=>{clearTimeout(timer);agent.destroy();});request.on('error',error=>{clearTimeout(timer);reject(error);});request.end();
+    });
+    const endpoint=new URL(version.webSocketDebuggerUrl);
+    if(endpoint.protocol!=='ws:'||!['localhost','127.0.0.1'].includes(endpoint.hostname)||endpoint.port!=='9222'||!/^\/devtools\/browser\/[a-zA-Z0-9-]+$/.test(endpoint.pathname)||endpoint.search||endpoint.hash)throw Error('Invalid DevTools endpoint');
+    const socket=new WebSocket(`ws://localhost:9222${endpoint.pathname}`,{createConnection:open,maxPayload:2*1024*1024,handshakeTimeout:10000});
+    await new Promise<void>((resolve,reject)=>{socket.once('open',resolve);socket.once('error',reject);});return new DevTools(socket);
   }
   send(method:string,params:Record<string,unknown>={},sessionId?:string):Promise<any>{
     if(this.socket.readyState!==WebSocket.OPEN)return Promise.reject(new Error('浏览器连接已关闭'));

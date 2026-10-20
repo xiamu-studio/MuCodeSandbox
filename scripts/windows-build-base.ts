@@ -6,16 +6,21 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { HyperVRuntime, AMD64_TUNNEL, fileHash } from '../server/platform/windows/runtime.ts';
 import { windowsConfigSchema, vmIdentity } from '../server/platform/windows/config.ts';
 import { packageProxy } from './windows/package-proxy.ts';
+import {prepareDesktopAssets,installDesktopAssets,desktopDependenciesScript} from '../server/platform/windows/desktop-install.ts';
+import {VERIFY_WINDOWS_DESKTOP} from '../server/platform/windows/browser-guest.ts';
+import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 
 // Builds a new, empty lab base. It never reads an existing user environment,
 // imports accounts, opens a browser, or contacts a model service.
 async function main(){
   if(process.platform!=='win32')throw Error('Windows is required');
-  const [image,sha256,resumeFlag,resumePath]=process.argv.slice(2);
+  const desktop=process.argv.includes('--desktop');
+  const [image,sha256,resumeFlag,resumePath]=process.argv.slice(2).filter(value=>value!=='--desktop');
   if(!image||!sha256)throw Error('Usage: npm run windows:build-base -- <Canonical VHD> <SHA-256>');
-  const root=process.env.MU_WINDOWS_DATA_DIR??path.join(process.env.LOCALAPPDATA!,'MuCodeSandbox-WindowsPreview');
+  const root=windowsRuntimeDirectory();
   const runtime=new HyperVRuntime(root),doctor=await runtime.info();if(!doctor.available)throw Error(doctor.issues.join('; '));
   const archive=path.join(root,'sing-box-linux-amd64.tar.gz');if(await fileHash(archive)!==AMD64_TUNNEL.sha256)throw Error('Tunnel checksum mismatch');
+  const desktopAssets=path.join(root,'browser-assets');if(desktop)await prepareDesktopAssets(desktopAssets);
   const job=path.join(root,`builder-${randomUUID()}`);await mkdir(job,{recursive:true});
   let phase='starting';const record=async(status='running',extra:object={})=>writeFile(path.join(job,'state.json'),JSON.stringify({status,phase,pid:process.pid,time:new Date().toISOString(),...extra},null,2));
   const step=async(value:string)=>{phase=value;console.log(value);await record();};
@@ -47,9 +52,14 @@ async function main(){
     }})();
     await starting;await step('opening-approved-package-channel');await runtime.connectBootstrap(c);
     await step('installing-ubuntu-components');await runtime.bootstrap(c,archive);
+    if(desktop){
+      await step('installing-amd64-desktop-dependencies');await runtime.management(c,['bash','-s'],{input:desktopDependenciesScript(`http://127.0.0.1:17401`),timeoutMs:1200000});
+      await step('installing-verified-amd64-browser-and-display');await installDesktopAssets(runtime,c,desktopAssets);
+      await step('verifying-amd64-desktop-prerequisites');await runtime.management(c,['bash','-s'],{input:VERIFY_WINDOWS_DESKTOP,timeoutMs:60000});
+    }
     await step('installing-closed-network-guard');await runtime.configure(c);
     await step('exporting-empty-protected-base');const exported=await runtime.freezeBase(c);
-    await writeFile(path.join(root,'protected-base.json'),JSON.stringify({image:exported.file,imageSha256:exported.sha256},null,2));
+    await writeFile(path.join(root,desktop?'protected-desktop-base.json':'protected-base.json'),JSON.stringify({image:exported.file,imageSha256:exported.sha256},null,2));
     await record('completed',{packageRequests:proxy.counters(),sourceVerified:true});console.log('Protected empty Linux base created.');
   }catch(error){await record('failed',{error:error instanceof Error?error.message:String(error)});throw error;}
   finally{serialClosed=true;serial?.destroy();await serialWrites;try{await runtime.disconnect();if(created)await runtime.stop(c);}finally{await proxy.close();}}

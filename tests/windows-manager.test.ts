@@ -32,3 +32,11 @@ test('Shutdown drains an in-flight monitor before closing the store',async()=>{
   const monitoring=f.manager.monitor();let closed=false;const closing=f.manager.close().then(()=>{closed=true;});await new Promise(resolve=>setTimeout(resolve,20));assert.equal(closed,false);release();await monitoring;await closing;assert.equal(closed,true);
  }finally{release();await f.close();}
 });
+
+test('A long browser job keeps renewing protection and sandbox failure still quarantines it',async()=>{
+ const f=await fixture();let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve;});
+ try{const e=await f.manager.create(input()),start=await f.manager.action(e.id,'start');await f.manager.wait(start.id);let renewals=0;f.manager.sessions.get(e.id)!.driver.renew=async()=>{renewals++;};
+  const job=await f.manager.submit(e.id,'open-browser',async()=>gate);await f.manager.monitor();assert.equal(renewals,1);assert.equal(f.state(e.id).state,'Running');
+  f.manager.inspectAdditionalProtection=async()=>{throw Error('Browser sandbox changed');};await f.manager.monitor();assert.equal(f.state(e.id).state,'Off');assert.equal(f.store.get(e.id).state,'error');release();await f.manager.wait(job.id);
+ }finally{release();await f.close();}
+});

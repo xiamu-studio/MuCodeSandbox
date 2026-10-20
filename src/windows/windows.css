@@ -15,4 +15,7 @@
 .windows-terminal-input small{flex-basis:100%}.windows-terminal-input p{color:#a33}
 .windows-file-row{display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}
 .windows-file-row>span{flex:1;overflow-wrap:anywhere}
+.windows-browser{min-width:0}.windows-browser:fullscreen{background:#f2f5f4;padding:16px;overflow:auto}
+.windows-browser-canvas{height:650px;min-height:360px;background:#181d20;overflow:hidden;border-radius:12px}
+.windows-address{display:flex;gap:12px;margin:14px 0}.windows-address input{flex:1;min-width:0}
 @media(max-width:760px){.windows-preview .windows-environment-row>span:nth-child(2){display:none}.windows-preview .windows-job>time{display:none}}

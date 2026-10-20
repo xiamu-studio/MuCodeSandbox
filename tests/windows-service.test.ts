@@ -8,6 +8,7 @@ import {spawn} from 'node:child_process';
 import {once} from 'node:events';
 import {createWindowsService} from '../server/platform/windows/service.ts';
 import {acquireWindowsServiceLock} from '../server/platform/windows/service-lock.ts';
+import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 import type {WindowsBackend} from '../server/platform/windows/manager.ts';
 import type {HyperVRuntime} from '../server/platform/windows/runtime.ts';
 
@@ -67,4 +68,17 @@ test('Windows releases the workspace lock after its controller is killed',{skip:
   const exited=once(child,'exit');child.kill('SIGKILL');await exited;
   release=await acquireWindowsServiceLock(root);
  }finally{child.kill('SIGKILL');await release?.();await rm(root,{recursive:true,force:true});}
+});
+
+test('Default CLI and management paths share prepared bases and retain legacy runtime data',{skip:process.platform!=='win32'},async()=>{
+ const root=await mkdtemp(path.join(tmpdir(),'mu-windows-defaults-')),saved={local:process.env.LOCALAPPDATA,runtime:process.env.MU_WINDOWS_DATA_DIR,app:process.env.MU_WINDOWS_APP_DIR};
+ let service:Awaited<ReturnType<typeof createWindowsService>>|undefined;
+ try{
+  process.env.LOCALAPPDATA=root;delete process.env.MU_WINDOWS_DATA_DIR;delete process.env.MU_WINDOWS_APP_DIR;
+  const runtimeRoot=windowsRuntimeDirectory();await mkdir(runtimeRoot,{recursive:true});const base={image:path.join(root,'desktop.vhdx'),imageSha256:'a'.repeat(64)};await writeFile(path.join(runtimeRoot,'protected-desktop-base.json'),JSON.stringify(base));
+  const runtime={info:async()=>({available:true,issues:[]}),fingerprint:async()=>'fixture',state:async()=>({state:'Off'}),stop:async()=>{},create:async()=>{},start:async()=>{},session:async()=>{throw Error('not used');},connect:async()=>{},inspectGuard:async()=>{throw Error('not used');}};
+  service=await createWindowsService({rootDir:root,runtime});assert.equal(service.manager.options.runtimeRoot,runtimeRoot);assert.deepEqual(service.manager.options.base,base);const app=service.manager.store.dataDir;await service.close();service=undefined;
+  const legacy=path.join(app,'hyperv');await mkdir(legacy);await writeFile(path.join(legacy,'protected-base.json'),JSON.stringify(base));assert.equal(windowsRuntimeDirectory(),legacy);
+  service=await createWindowsService({rootDir:root,runtime});assert.equal(service.manager.options.runtimeRoot,legacy);assert.deepEqual(service.manager.options.base,base);
+ }finally{await service?.close();if(saved.local===undefined)delete process.env.LOCALAPPDATA;else process.env.LOCALAPPDATA=saved.local;if(saved.runtime===undefined)delete process.env.MU_WINDOWS_DATA_DIR;else process.env.MU_WINDOWS_DATA_DIR=saved.runtime;if(saved.app===undefined)delete process.env.MU_WINDOWS_APP_DIR;else process.env.MU_WINDOWS_APP_DIR=saved.app;await rm(root,{recursive:true,force:true});}
 });

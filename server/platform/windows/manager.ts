@@ -25,12 +25,16 @@ export class WindowsManager {
  readonly active=new Map<string,string>();readonly sessions=new Map<string,WindowsNetworkSession>();
  readonly profiles=new Map<string,WindowsConfig>();readonly tasks=new Map<string,{controller:AbortController;promise:Promise<void>}>();
  onAccessRevoked:((id:string)=>void)|undefined;
+ inspectAdditionalProtection:((id:string)=>Promise<void>)|undefined;
+ browserRunning:((id:string)=>boolean)|undefined;
+ browserAvailable=false;
+ private lifecycleIds=new Set<string>();
  private timer:ReturnType<typeof setInterval>;private monitorTask:Promise<void>|undefined;private closeTask:Promise<void>|undefined;private closing=false;private hostIssue:string|null=null;
  constructor(store:Store,runtime:WindowsBackend,options:WindowsManagerOptions){
   this.store=store;this.runtime=runtime;this.options=options;
   this.timer=setInterval(()=>{void this.monitor();},8000);this.timer.unref();
  }
- private view(e:Environment){return this.store.public({...e,browserRunning:false});}
+ private view(e:Environment){return this.store.public({...e,browserRunning:this.browserRunning?.(e.id)??false});}
  private validate(input:unknown){
   const e=environmentSchema.parse(input);
   if(e.kind!=='vm'||!e.network.strict||!e.network.transparent||!e.network.egressLock||!['http','https','socks5'].includes(e.network.mode))throw new AppError('Windows 环境需要启用严格透明代理并批准出口 IPv4',400,'WINDOWS_STRICT_REQUIRED');
@@ -71,14 +75,15 @@ export class WindowsManager {
  async snapshot():Promise<Snapshot>{
   const info=await this.runtime.info();
   return {environments:this.store.list().map(e=>this.view(e)),jobs:this.store.jobs(),system:{platform:'win32',arch:process.arch,hostname:hostname(),cpus:cpus().length,memoryGiB:Math.round(totalmem()/2**30),freeMemoryGiB:Math.round(freemem()/2**30),dataDir:this.store.dataDir,version:VERSION,
-   runtime:{available:info.available&&!!this.options.base,path:info.available?'Hyper-V':null,version:'Windows Hyper-V',error:info.issues.join('；')||(!this.options.base?'请先准备空白受保护基盘':null)},browser:{available:false,engine:'Linux 客体浏览器（适配中）',native:false},hostNetwork:{state:this.hostIssue?'failed':'ready',issue:this.hostIssue}}};
+   runtime:{available:info.available&&!!this.options.base,path:info.available?'Hyper-V':null,version:'Windows Hyper-V',error:info.issues.join('；')||(!this.options.base?'请先准备空白受保护基盘':null)},browser:{available:this.browserAvailable,engine:this.browserAvailable?'Linux AMD64 Chrome':'Linux 客体浏览器（组件待准备）',native:false},hostNetwork:{state:this.hostIssue?'failed':'ready',issue:this.hostIssue}}};
  }
  async action(id:string,action:'start'|'stop'|'restart'){
   if(this.closing)throw new AppError('应用正在退出',409,'CLOSING');if(action!=='stop'&&this.hostIssue)throw new AppError(this.hostIssue+'；请退出并重新打开 Windows 预览',409,'HOST_NETWORK_CHANGED');if(this.active.has(id))throw new AppError('环境正在执行其他操作',409,'ENVIRONMENT_BUSY');
   const e=this.store.get(id),job=this.store.newJob(id,action),controller=new AbortController();this.active.set(id,job.id);
+  this.lifecycleIds.add(id);
   const promise=this.lifecycle(e,action,controller.signal).then(()=>{this.store.finishJob(job.id,'succeeded','操作完成');},error=>{
    this.store.state(id,'error',redact(errorMessage(error)));this.store.finishJob(job.id,controller.signal.aborted?'cancelled':'failed',errorMessage(error));
-  }).finally(()=>{this.active.delete(id);this.tasks.delete(job.id);});
+  }).finally(()=>{this.active.delete(id);this.lifecycleIds.delete(id);this.tasks.delete(job.id);});
   this.tasks.set(job.id,{controller,promise});return job;
  }
  private async lifecycle(e:Environment,action:'start'|'stop'|'restart',signal:AbortSignal){
@@ -102,8 +107,8 @@ export class WindowsManager {
    const session=this.sessions.get(e.id);this.sessions.delete(e.id);try{if(session)await session.fail();else await this.runtime.stop(c);}catch(stopError){throw new AggregateError([error,stopError],'启动失败且停机未确认');}throw error;
   }
  }
- async assertAccess(id:string){
-  const e=this.store.get(id),session=this.sessions.get(id);if(e.state!=='running'||this.active.has(id)||session?.state!=='active')throw new AppError('环境防护尚未通过或已失效',409,'GUARD_FAILED');
+ async assertAccess(id:string,allowBusy=false){
+  const e=this.store.get(id),session=this.sessions.get(id);if(e.state!=='running'||(!allowBusy&&this.active.has(id))||session?.state!=='active')throw new AppError('环境防护尚未通过或已失效',409,'GUARD_FAILED');
   try{const guard=await this.runtime.inspectGuard(await this.profile(e));if(this.sessions.get(id)!==session||session.state!=='active'||!guard.leaseActive||guard.remainingMs<=0||guard.digest!==session.guardDigest)throw Error('联网许可或防护完整性已失效');}
   catch{await this.quarantine(id,'联网许可或防护完整性无法确认');throw new AppError('联网许可或防护完整性无法确认',409,'GUARD_FAILED');}return e;
  }
@@ -118,9 +123,17 @@ export class WindowsManager {
  }
  monitor(){
   if(this.monitorTask)return this.monitorTask;if(this.closing)return Promise.resolve();
-  return this.monitorTask=Promise.all([...this.sessions].map(async([id,session])=>{if(this.active.has(id))return;try{await session.tick();}catch(error){if(this.sessions.get(id)===session)await this.quarantine(id,redact(errorMessage(error)));}})).then(()=>{}).finally(()=>{this.monitorTask=undefined;});
+  return this.monitorTask=Promise.all([...this.sessions].map(async([id,session])=>{if(this.lifecycleIds.has(id))return;try{await session.tick();if(this.sessions.get(id)===session&&session.state==='active')await this.inspectAdditionalProtection?.(id);}catch(error){if(this.sessions.get(id)===session)await this.quarantine(id,redact(errorMessage(error)));}})).then(()=>{}).finally(()=>{this.monitorTask=undefined;});
+ }
+ async submit(id:string,action:string,work:(options:RunOptions)=>Promise<unknown>){
+  if(this.closing||this.active.has(id))throw new AppError('环境正在执行其他操作',409,'ENVIRONMENT_BUSY');
+  await this.assertAccess(id);if(this.active.has(id))throw new AppError('环境正在执行其他操作',409,'ENVIRONMENT_BUSY');
+  const job=this.store.newJob(id,action),controller=new AbortController();this.active.set(id,job.id);
+  const promise=Promise.resolve().then(()=>{controller.signal.throwIfAborted();return work({signal:controller.signal});}).then(()=>this.store.finishJob(job.id,'succeeded','操作完成'),error=>{this.store.finishJob(job.id,controller.signal.aborted?'cancelled':'failed',errorMessage(error));this.store.log(id,job.id,errorMessage(error),'error');}).finally(()=>{if(this.active.get(id)===job.id)this.active.delete(id);this.tasks.delete(job.id);});
+  this.tasks.set(job.id,{controller,promise});return job;
  }
  async hostUnavailable(reason:string){this.hostIssue=reason;for(const task of this.tasks.values())task.controller.abort();await Promise.all(this.store.list().filter(e=>['running','starting','creating'].includes(e.state)).map(e=>this.quarantine(e.id,reason)));}
+ failProtection(id:string,reason:string){return this.quarantine(id,reason);}
  cancel(jobId:string){this.tasks.get(jobId)?.controller.abort();}
  async wait(jobId:string){await this.tasks.get(jobId)?.promise;}
  close(){return this.closeTask??=(async()=>{this.closing=true;clearInterval(this.timer);for(const task of this.tasks.values())task.controller.abort();await Promise.allSettled([...this.tasks.values()].map(t=>t.promise));await this.hostUnavailable('应用已退出');await this.monitorTask;this.store.close();this.store.key.fill(0);})();}

@@ -43,14 +43,23 @@ export function cloudInit(c: WindowsConfig, publicKey: string, hostPrivate: stri
 
 // Package installation uses only the explicitly configured SSH-forwarded
 // upstream. There is no guest default route or host NAT as a fallback.
+export const BOOTSTRAP_IP_STACK=`# glibc AI_ADDRCONFIG excludes loopback when the isolated NIC has no address.
+# A host-scoped dummy address enables IPv4 resolution for the loopback-only
+# package proxy. It has no peer/default route and is removed before export.
+sudo ip link add mu-bootstrap type dummy
+trap 'sudo ip link del mu-bootstrap >/dev/null 2>&1 || true' EXIT
+sudo ip addr add 169.254.254.254/32 dev mu-bootstrap scope host noprefixroute
+sudo ip link set mu-bootstrap up
+`;
 export function bootstrapScript(c: WindowsConfig) {
   const url = new URL(`${c.proxy.mode==='socks5'?'socks5h':c.proxy.mode}://127.0.0.1:${RELAY_PORT}`);
   url.username=c.proxy.username;url.password=c.proxy.password;
   return `set -euo pipefail
 sudo cloud-init status --wait >/dev/null
 printf 'datasource_list: [NoCloud]\\n' | sudo tee /etc/cloud/cloud.cfg.d/99-mucodesandbox-datasource.cfg >/dev/null
-sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 update -qq
-sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 install -y --no-install-recommends nftables curl ca-certificates python3 iproute2 locales
+${BOOTSTRAP_IP_STACK}
+sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 update -qq
+sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 install -y --no-install-recommends nftables curl ca-certificates python3 iproute2 locales
 ${CONFIGURE_NETWORKD_SCRIPT}
 ${INSTALL_GUARD_SCRIPT}
 sudo install -d -m 0700 /etc/mucodesandbox

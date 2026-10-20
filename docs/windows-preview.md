@@ -46,7 +46,7 @@ npm run windows:build-base -- <本地原始VHD> <SHA-256>
 
 ## Windows 管理预览
 
-已提供独立的本机网页管理入口，支持新建、编辑、启动、停止、重启、操作记录和防护核验。运行环境中可打开 Linux 终端，或手动上传/下载文件并浏览交换目录。现有 Mac Electron 入口、Lima 管理器和打包命令保持独立；Windows 尚无桌面安装包。浏览器画面、共享、快照和备份仍在适配。
+已提供独立的本机网页管理入口，支持新建、编辑、启动、停止、重启、操作记录和防护核验。运行环境中可打开 Linux 终端，或手动上传/下载文件并浏览交换目录。使用图形基盘的新环境支持独立 Linux Chrome 画面、网址打开、画面尺寸和手动文本剪贴板。现有 Mac Electron 入口、Lima 管理器和打包命令保持独立；Windows 尚无桌面安装包。独立桌面客户端、音频、图片剪贴板、共享、快照和备份仍在适配。
 
 先准备受保护基盘，构建器会在运行数据根写入 `protected-base.json`。在管理员 PowerShell 中执行：
 
@@ -62,9 +62,32 @@ npm run windows:ui
 
 管理数据库与 Mac 数据库分开。Windows 的 32 字节主密钥使用当前用户 DPAPI 保存，代理密码仍使用 AES-GCM；不写入明文主密钥文件。目录 ACL 仅保留当前用户、SYSTEM 和管理员，命名管道锁在进程崩溃后由系统释放。当前预览仍整体要求管理员权限，最小权限宿主代理尚未完成。
 
+默认 CLI 与界面共用 `%LOCALAPPDATA%/MuCodeSandbox-WindowsPreview` 运行目录，管理数据库位于其中的 `app`。已有早期 `app/hyperv` 目录时沿用该目录；`MU_WINDOWS_DATA_DIR` 和 `MU_WINDOWS_APP_DIR` 可明确指定位置。图形基盘只供新建环境使用，已创建环境继续使用自己的磁盘。
+
 终端由 Windows ConPTY 驱动固定的 OpenSSH 客户端，通过原有 Hyper-V socket 通道进入客体 `dev` 用户，不能使用 sudo。已禁用 SSH 逃逸解释器、代理转发和本地命令，避免终端输入打开宿主 shell 或增加宿主转发。一次性连接凭证绑定当前防护会话，停止或重新启动后旧凭证失效。原生终端放在独立子进程中；关闭终端或失去控制进程的 IPC 后有界退出，避免 ConPTY 读取线程使主服务无法退出。
 
 中文输入框支持普通 Unicode 文字粘贴，不自动执行；多行粘贴要求客体终端支持括号粘贴。上传文件保存到 `/home/dev/Downloads`，单个文件最多 150 MiB，最多两个并发传输。下载、传入和导出目录只能通过客体文件描述符访问，拒绝符号链接、硬链接、跨挂载点及路径跳转；下载前检查文件版本。文件任务使用客体进程组监督器，取消时终止对应开发任务。没有持续共享宿主目录，也没有自动同步宿主剪贴板。
+
+## 图形基盘与浏览器
+
+```powershell
+npm run windows:build-base -- <本地原始VHD> <SHA-256> --desktop
+npm run windows:ui
+```
+
+构建器另外生成 `protected-desktop-base.json`，管理页优先使用它创建新环境。Windows 使用独立 AMD64 Chrome 155.0.8059.84 和 TurboVNC 3.3.1 目录；Mac ARM64 目录及版本目录保持独立。Chrome 摘要已对照 Google 的签名 Release/Packages 元数据核验，主签名指纹为 `EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796`；TurboVNC 同时核验官方归档摘要和提取后的服务端二进制摘要。只提取受核验的组件和许可，不执行厂商 DEB 安装脚本。
+
+安装阶段的软件源代理只允许读取 Ubuntu 官方来源。无地址的隔离网卡会让 glibc `AI_ADDRCONFIG` 排除回环地址，因此安装脚本临时创建带 host 作用域地址的 dummy 接口，使 APT 可以连接回环代理。该接口无对端、无默认路由，脚本退出时移除；实机已检查工作 VM 中不存在该接口。APT 刷新失败会停止构建，不继续使用旧索引冒充成功。导出前检查 XKB、字体相关依赖以及浏览器/显示组件。
+
+VNC 和 CDP 通过固定目标的 SSH stdio 流进入客体回环端口，Windows 上没有新增 VNC/CDP 监听端口。画面 WebSocket 同时核验本机会话、来源和一次性凭证，并绑定当前联网会话。Chrome 以 `dev` 运行，启动后检查渲染器与 GPU 的 seccomp、NoNewPrivileges、能力和命名空间，检查通过后才允许导航。每次启动使用空白页，语言、时区、屏幕和像素密度来自真实 Linux 进程及显示服务。浏览器操作期间继续续期和检查联网许可；子进程防护失败触发停机。
+
+图形验收命令为 `npm run windows:browser-lab -- --interactive`，会创建全新的空白 VM 并使用本地测试页。运行数据、测试 CA/NSS 数据库、截图和一次性启动链接均保存在受限的忽略目录中，不提交 Git。交互模式输出的本地查看信息位于 `.mu-data/windows-run/browser-lab-view.json`；完成画面和中文粘贴操作后，在其中 `marker` 指定的位置写入标记，脚本会核查实际客体文字，再执行故障与停机检查。
+
+当前已通过 41 项 Windows 本地测试、14 项共享显示/沙箱检查及 12 项真实浏览器验收：双本地出口、安装临时接口清理、导航前沙箱、原生语言/时区、受信任测试 CA 的 HTTPS、Canvas/Worker、真实画面尺寸、认证画面连接、浏览器上传/下载、手动中文剪贴板、故障撤销与确认停机。最终实机结果绑定 17 个源码文件，测试期间源码未变，控制进程正常退出。
+
+测试曾出现一次本地 DNS/代理探测中断并触发确认停机，该次原因尚未复现定位。故障诊断会先断开业务出口，再保存本地日志。长期稳定性仍需后续验收，不能用几分钟的实测代替。
+
+组件来源：[Google Linux 签名密钥说明](https://www.google.com/linuxrepositories/)、[Google stable Release](https://dl.google.com/linux/chrome/deb/dists/stable/Release)、[TurboVNC 3.3.1](https://github.com/TurboVNC/turbovnc/releases/tag/3.3.1)。
 
 ## 验证与剩余项
 

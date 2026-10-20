@@ -9,6 +9,7 @@ import { windowsConfigSchema, PROBE_PORT, vmIdentity } from '../server/platform/
 import { WindowsNetworkSession } from '../server/platform/windows/session.ts';
 import {run} from '../server/process.ts';
 import {powershellArgs,powershellPath} from '../server/platform/windows/runtime.ts';
+import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 
 // Explicit destructive-fault lab, operating only on a freshly allocated test
 // VM with no user files/accounts. It never opens a browser or an AI website.
@@ -16,7 +17,7 @@ async function main(){
   if(process.platform!=='win32')throw Error('Windows is required');
   const [image,imageSha256]=process.argv.slice(2);
   if(!image||!imageSha256)throw Error('Usage: npm run windows:lab -- <Canonical-VHD-path> <SHA-256>');
-  const root=process.env.MU_WINDOWS_DATA_DIR??path.join(process.env.LOCALAPPDATA!,'MuCodeSandbox-WindowsPreview');
+  const root=windowsRuntimeDirectory();
   const runtime=new HyperVRuntime(root);const doctor=await runtime.info();
   if(!doctor.available)throw Error(doctor.issues.join('; '));
   const id=randomUUID(),directory=path.join(root,`lab-${id}`);await mkdir(directory,{recursive:true});

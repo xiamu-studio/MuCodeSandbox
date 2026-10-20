@@ -7,9 +7,10 @@ import { windowsConfigSchema } from '../server/platform/windows/config.ts';
 import { run } from '../server/process.ts';
 import { WindowsHostMonitor } from '../server/platform/windows/monitor.ts';
 import { downloadVerifiedAsset } from '../server/platform/windows/download.ts';
+import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 
 // Separate entry point: never opens the Mac database, UI or Lima directory.
-const root=process.env.MU_WINDOWS_DATA_DIR??path.join(process.env.LOCALAPPDATA??process.cwd(),'MuCodeSandbox-WindowsPreview');
+const root=windowsRuntimeDirectory();
 const [action,configPath]=process.argv.slice(2);
 async function main() {
   if(process.platform!=='win32')throw Error('This preview requires Windows');

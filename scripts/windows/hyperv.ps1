@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','create','start','stop','status','inspect','fingerprint')][string]$Action)
+param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence')][string]$Action)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -50,7 +50,62 @@ function InspectVM {
   }
   [pscustomobject]@{ name=$v.Name; platformId=[string]$v.Id; state=[string]$v.State; isolated=$true; aclVerified=$true; automaticStart=$false } | ConvertTo-Json -Compress
 }
+function AllocationVM {
+  if(-not $c.brokerResourceLimit){throw 'Allocation recovery requires the protected broker'}
+  # Query the provider successfully before interpreting an empty result. A
+  # provider/RPC/permission error must never become evidence of VM absence.
+  $all=@(Get-VM -ErrorAction Stop)
+  $matches=@($all | Where-Object {$_.Name -eq $c.name})
+  if($matches.Count -gt 1){throw 'Allocation VM name is ambiguous'}
+  $v=if($matches.Count){$matches[0]}else{$null}
+  if(-not $v){
+    if($c.expectedPlatformId -and @($all | Where-Object {[string]$_.Id -eq [string]$c.expectedPlatformId}).Count){throw 'Registered VM was renamed'}
+    return $null
+  }
+  if($c.expectedPlatformId -and [string]$v.Id -ne [string]$c.expectedPlatformId){throw 'Allocation VM identity changed'}
+  if($v.Notes -ne $marker -and -not ($c.allowPartialAllocation -and -not $v.Notes)){throw 'Allocation ownership changed'}
+  $directory=[IO.Path]::GetFullPath($c.directory).TrimEnd('\')
+  $actual=[IO.Path]::GetFullPath($v.Path).TrimEnd('\')
+  if($actual -ne $directory -and -not $actual.StartsWith($directory+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Allocation storage changed'}
+  $disks=@(Get-VMHardDiskDrive -VM $v)
+  if($disks.Count -ne 1 -or [IO.Path]::GetFullPath($disks[0].Path) -ne [IO.Path]::GetFullPath($c.disk)){throw 'Allocation disk changed'}
+  return $v
+}
+function StopAllocation {
+  $v=AllocationVM
+  if($v -and $v.State -ne 'Off'){Stop-VM -VM $v -TurnOff -Force;$v=AllocationVM}
+  if($v -and $v.State -ne 'Off'){throw 'Allocation shutdown was not confirmed'}
+  return $v
+}
 switch ($Action) {
+  'allocation-absence' {
+    if(-not $c.brokerResourceLimit){throw 'Allocation absence checks require the protected broker'}
+    $matches=@(Get-VM -ErrorAction Stop | Where-Object {$_.Name -eq $c.name -or ($c.expectedPlatformId -and [string]$_.Id -eq [string]$c.expectedPlatformId)})
+    $switches=@(Get-VMSwitch -ErrorAction Stop | Where-Object {$_.Name -eq $c.name})
+    [pscustomobject]@{absent=($matches.Count -eq 0 -and $switches.Count -eq 0)} | ConvertTo-Json -Compress
+  }
+  'recover-allocation' {
+    $v=StopAllocation
+    $ready=$false
+    if($v){try{InspectVM | Out-Null;$ready=$true}catch{}}
+    [pscustomobject]@{name=$c.name;state='Off';present=[bool]$v;platformId=$(if($v){[string]$v.Id}else{$null});ready=$ready} | ConvertTo-Json -Compress
+  }
+  'delete-allocation' {
+    $v=StopAllocation
+    if($v){Remove-VM -VM $v -Force}
+    if(AllocationVM){throw 'VM removal was not confirmed'}
+    $switches=@(Get-VMSwitch -ErrorAction Stop | Where-Object {$_.Name -eq $c.name})
+    if($switches.Count -gt 1){throw 'Allocation switch name is ambiguous'}
+    $s=if($switches.Count){$switches[0]}else{$null}
+    if($s){
+      if($s.SwitchType -ne 'Private' -or $s.Notes -ne $marker){throw 'Allocation switch ownership changed'}
+      $attached=@(Get-VM -ErrorAction Stop | Get-VMNetworkAdapter -ErrorAction Stop | Where-Object { $_.SwitchId -eq $s.Id })
+      if($attached.Count){throw 'Allocation switch is used by another VM'}
+      Remove-VMSwitch -VMSwitch $s -Force
+    }
+    if(@(Get-VMSwitch -ErrorAction Stop | Where-Object {$_.Name -eq $c.name}).Count){throw 'Switch removal was not confirmed'}
+    [pscustomobject]@{name=$c.name;state='Off';vmAbsent=$true;switchAbsent=$true} | ConvertTo-Json -Compress
+  }
   'register-channel' {
     $servicePath='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\00009e4a-facb-11e6-bd58-64006a7986d3'
     $friendly='MuCodeSandbox host-initiated guest SSH'

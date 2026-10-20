@@ -14,6 +14,7 @@ export default function WindowsWorkspace(){
  const [snapshot,setSnapshot]=useState<Snapshot|null>(null),[selectedId,select]=useState<string|null>(null),[system,showSystem]=useState(false);
  const [error,setError]=useState(''),[connected,setConnected]=useState(true),[dialog,setDialog]=useState<'new'|Environment|null>(null);
  const [tool,setTool]=useState<'terminal'|'files'|'browser'|null>(null);
+ const [deleting,setDeleting]=useState<Environment|null>(null);
  useEffect(()=>{setTool(null);},[selectedId]);
  const [protection,setProtection]=useState<NetworkProtection|null>(null),[guardError,setGuardError]=useState(''),[logs,setLogs]=useState<LogEntry[]>([]);
  const live=useRef(false),pending=useRef<Promise<void>|null>(null);
@@ -67,6 +68,7 @@ export default function WindowsWorkspace(){
      {guardError&&<Notice kind="error">{guardError}</Notice>}
      <SectionHeading title="环境配置" action={<Button disabled={!!active||selected.state==='running'} onClick={()=>setDialog(selected)}>编辑配置</Button>}/>
      <dl className="facts"><div><dt>资源</dt><dd>{selected.cpus} 核心 · {selected.memoryGiB} GiB 内存 · {selected.diskGiB} GiB 磁盘</dd></div><div><dt>代理</dt><dd>{selected.network.mode.toUpperCase()} · {selected.network.host}:{selected.network.port}</dd></div><div><dt>批准的出口</dt><dd>{selected.network.egressLock?.expectedIp}</dd></div><div><dt>时区</dt><dd>{selected.identity.timezone}</dd></div><div><dt>凭据</dt><dd>{selected.network.passwordConfigured?'已加密保存':'未设置密码'}</dd></div></dl>
+     {window.__MU_CONFIG__.capabilities?.remove&&<div className="button-row"><Button disabled={!connected||!!active||['running','starting','creating'].includes(selected.state)} onClick={()=>setDeleting(selected)}>删除环境</Button></div>}
      <div className="button-row windows-tools">{window.__MU_CONFIG__.capabilities?.terminal&&<Button disabled={selected.state!=='running'||!!active} onClick={()=>setTool(tool==='terminal'?null:'terminal')} icon={<TerminalSquare size={15}/>}>Linux 终端</Button>}{window.__MU_CONFIG__.capabilities?.files&&<Button disabled={selected.state!=='running'||!!active} onClick={()=>setTool(tool==='files'?null:'files')}>文件传输</Button>}</div>
      {window.__MU_CONFIG__.capabilities?.browser&&<div className="button-row windows-tools"><Button disabled={selected.state!=='running'||!!active} onClick={()=>selected.browserRunning?setTool(tool==='browser'?null:'browser'):void browserAction('open')}>{selected.browserRunning?'浏览器画面':'打开浏览器'}</Button>{selected.browserRunning&&<Button disabled={!!active} onClick={()=>void browserAction('close')}>关闭浏览器</Button>}</div>}
      {selected.state==='running'&&!active&&tool==='terminal'&&<Suspense fallback={<p>加载终端…</p>}><TerminalPanel key={selected.id} environment={selected} quickTools="text"/></Suspense>}
@@ -79,17 +81,24 @@ export default function WindowsWorkspace(){
      <div className="env-table">{snapshot.environments.map(e=><button key={e.id} className="windows-environment-row" onClick={()=>select(e.id)}><span className="env-table-name"><ShieldCheck size={20}/><strong>{e.name}</strong></span><span>{e.cpus} 核心 · {e.memoryGiB} GiB</span><Status state={e.state}/></button>)}</div>
      {!snapshot.environments.length&&<div className="workspace-empty"><Box size={32}/><h2>创建第一个 Windows Linux 环境</h2></div>}
     </>}
-    {snapshot&&<><SectionHeading title="操作记录"/>{snapshot.jobs.filter(j=>!selectedId||j.environmentId===selectedId).slice(0,8).map(j=><div className="windows-job" key={j.id}><strong>{({start:'启动',stop:'停止',restart:'重启','open-browser':'打开浏览器','close-browser':'关闭浏览器','browser-navigate':'打开网页'} as Record<string,string>)[j.action]??j.action}</strong><span>{({running:'进行中',succeeded:'完成',failed:'失败',cancelled:'已取消'} as Record<string,string>)[j.status]} {displayIssue(j.message)}</span>{j.status==='running'&&<Button onClick={()=>void api.cancel(j.id).catch(e=>setError(e.message))}>取消</Button>}<time>{dateLabel(j.createdAt)}</time></div>)}
+    {snapshot&&<><SectionHeading title="操作记录"/>{snapshot.jobs.filter(j=>!selectedId||j.environmentId===selectedId).slice(0,8).map(j=><div className="windows-job" key={j.id}><strong>{({start:'启动',stop:'停止',restart:'重启',delete:'删除环境','open-browser':'打开浏览器','close-browser':'关闭浏览器','browser-navigate':'打开网页'} as Record<string,string>)[j.action]??j.action}</strong><span>{({running:'进行中',succeeded:'完成',failed:'失败',cancelled:'已取消'} as Record<string,string>)[j.status]} {displayIssue(j.message)}</span>{j.status==='running'&&j.action!=='delete'&&<Button onClick={()=>void api.cancel(j.id).catch(e=>setError(e.message))}>取消</Button>}<time>{dateLabel(j.createdAt)}</time></div>)}
      <SectionHeading title="本地日志"/><div className="log-surface">{logs.length?logs.map(row=><div className="log-entry" key={row.id}><time>{dateLabel(row.createdAt)}</time><span>{row.level}</span><p>{row.message}</p></div>):<p>暂无日志</p>}</div></>}
    </div>
   </main>
   {dialog&&snapshot&&<WindowsEnvironmentDialog environment={dialog==='new'?undefined:dialog} system={snapshot.system} onClose={()=>setDialog(null)} onSave={async id=>{setDialog(null);showSystem(false);select(id);await pending.current;await refresh();}}/>}
+  {deleting&&<WindowsDeleteDialog environment={deleting} onClose={()=>setDeleting(null)} onDeleted={async()=>{setDeleting(null);setTool(null);await pending.current;await refresh();}}/>}
  </div>;
+}
+
+function WindowsDeleteDialog({environment,onClose,onDeleted}:{environment:Environment;onClose:()=>void;onDeleted:()=>Promise<void>}){
+ const [name,setName]=useState(''),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ async function submit(event:React.SubmitEvent<HTMLFormElement>){event.preventDefault();if(name!==environment.name)return;setBusy(true);setError('');try{await request(`/environments/${environment.id}/actions/delete`,{method:'POST',body:JSON.stringify({confirmation:name})});await onDeleted();}catch(value){setError((value as Error).message);setBusy(false);}}
+ return <Modal title="删除 Windows 环境" subtitle={environment.name} narrow onClose={()=>{if(!busy)onClose();}}><form onSubmit={event=>void submit(event)}><div className="modal-body"><Notice kind="error">将永久删除此环境的虚拟磁盘、文件和管理密钥，无法撤销。</Notice><Field label="输入完整环境名称以确认"><input autoFocus autoComplete="off" value={name} onChange={event=>setName(event.target.value)} placeholder={environment.name}/></Field>{error&&<Notice kind="error">{error}</Notice>}</div><footer className="modal-footer"><Button disabled={busy} onClick={onClose}>取消</Button><Button type="submit" className="danger" loading={busy} disabled={name!==environment.name}>永久删除</Button></footer></form></Modal>;
 }
 
 type EnvironmentDraft=Omit<Environment,'id'|'instanceName'|'state'|'browserRunning'|'lastError'|'createdAt'|'updatedAt'>;
 function WindowsEnvironmentDialog({environment,system,onClose,onSave}:{environment?:Environment;system:Snapshot['system'];onClose:()=>void;onSave:(id:string)=>Promise<void>}){
- const [draft,setDraft]=useState<EnvironmentDraft>(()=>environment?editConfig(environment):{name:'',description:'',kind:'vm',color:'green',cpus:Math.min(2,system.cpus),memoryGiB:2,diskGiB:24,mounts:[],ports:[],identity:{timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,locale:'en-US'},network:{mode:'http',host:'127.0.0.1',port:7890,username:'',strict:true,transparent:true,noProxy:'localhost,127.0.0.1',egressLock:{expectedIp:''}},browserUrl:'https://example.org'});
+ const [draft,setDraft]=useState<EnvironmentDraft>(()=>environment?editConfig(environment):{name:'',description:'',kind:'vm',color:'green',cpus:Math.min(2,system.cpus),memoryGiB:2,diskGiB:32,mounts:[],ports:[],identity:{timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,locale:'en-US'},network:{mode:'http',host:'127.0.0.1',port:7890,username:'',strict:true,transparent:true,noProxy:'localhost,127.0.0.1',egressLock:{expectedIp:''}},browserUrl:'https://example.org'});
  const [password,setPassword]=useState(''),[passwordChanged,setPasswordChanged]=useState(false),[error,setError]=useState(''),[busy,setBusy]=useState(false);
  const resourcesLocked=!!environment&&environment.state!=='not_created';
  function network(patch:Partial<typeof draft.network>){setDraft(d=>({...d,network:{...d.network,...patch}}));}

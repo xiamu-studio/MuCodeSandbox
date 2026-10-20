@@ -15,7 +15,7 @@ import {windowsConfigSchema,windowsPaths,vmIdentity,type WindowsConfig} from './
 import type {WindowsNetworkSession} from './session.ts';
 
 export interface WindowsBase {image:string;imageSha256:string}
-export type WindowsBackend=Pick<HyperVRuntime,'info'|'create'|'start'|'stop'|'state'|'session'|'connect'|'inspectGuard'>;
+export type WindowsBackend=Pick<HyperVRuntime,'info'|'create'|'start'|'stop'|'state'|'session'|'connect'|'inspectGuard'>&Partial<Pick<HyperVRuntime,'remove'|'recoverCreation'|'deletionAvailable'>>;
 export interface WindowsManagerOptions {runtimeRoot:string;base?:WindowsBase;probe?:(config:WindowsConfig)=>()=>Promise<{receiver:string;ip:string}[]>}
 
 // Windows owns its lifecycle and storage integration. The shipping Mac
@@ -24,6 +24,7 @@ export class WindowsManager {
  readonly store:Store;readonly runtime:WindowsBackend;readonly options:WindowsManagerOptions;
  readonly active=new Map<string,string>();readonly sessions=new Map<string,WindowsNetworkSession>();
  readonly profiles=new Map<string,WindowsConfig>();readonly tasks=new Map<string,{controller:AbortController;promise:Promise<void>}>();
+ private readonly deletions=new Set<string>();
  onAccessRevoked:((id:string)=>void)|undefined;
  inspectAdditionalProtection:((id:string)=>Promise<void>)|undefined;
  browserRunning:((id:string)=>boolean)|undefined;
@@ -66,7 +67,10 @@ export class WindowsManager {
  }
  async recover(){
   for(const e of this.store.list()){
-   try{await access(windowsPaths(this.options.runtimeRoot,e.id).manifest);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'){if(e.state!=='not_created')this.store.state(e.id,'error','运行清单缺失，需检查未完成的创建任务');continue;}throw error;}
+   try{await access(windowsPaths(this.options.runtimeRoot,e.id).manifest);}catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT'){
+    try{if(await this.runtime.recoverCreation?.(await this.profile(e,false))){this.store.state(e.id,'stopped');this.store.log(e.id,null,'已核验原虚拟机并恢复运行清单，原磁盘保留');}else if(e.state!=='not_created')this.store.state(e.id,'error','创建未完成；文件已保留，可重试启动或删除环境');}
+    catch(recoveryError){this.store.state(e.id,'error','创建恢复失败，文件已保留：'+redact(errorMessage(recoveryError)));}continue;
+   }throw error;}
    const c=await this.profile(e,false);
    try{const state=await this.runtime.state(c);if(state.state!=='Off')await this.runtime.stop(c);this.store.state(e.id,'stopped');}
    catch(error){this.store.state(e.id,'error','恢复时无法确认环境停机：'+redact(errorMessage(error)));}
@@ -84,6 +88,17 @@ export class WindowsManager {
   const promise=this.lifecycle(e,action,controller.signal).then(()=>{this.store.finishJob(job.id,'succeeded','操作完成');},error=>{
    this.store.state(id,'error',redact(errorMessage(error)));this.store.finishJob(job.id,controller.signal.aborted?'cancelled':'failed',errorMessage(error));
   }).finally(()=>{this.active.delete(id);this.lifecycleIds.delete(id);this.tasks.delete(job.id);});
+  this.tasks.set(job.id,{controller,promise});return job;
+ }
+ async remove(id:string,confirmation:string){
+  if(this.closing)throw new AppError('应用正在退出',409,'CLOSING');
+  const e=this.store.get(id);if(confirmation!==e.name)throw new AppError('请输入完整环境名称以确认删除',400,'DELETE_CONFIRMATION_REQUIRED');
+  if(!this.runtime.deletionAvailable||!this.runtime.remove)throw new AppError('当前入口未启用环境删除，请使用普通用户权限代理入口',409,'FEATURE_UNAVAILABLE');
+  if(this.active.has(id)||this.sessions.has(id)||['running','starting','creating'].includes(e.state))throw new AppError('请先停止环境并等待当前操作完成',409,'ENVIRONMENT_BUSY');
+  const job=this.store.newJob(id,'delete'),controller=new AbortController();this.active.set(id,job.id);this.deletions.add(job.id);
+  const promise=Promise.resolve().then(async()=>{
+   this.onAccessRevoked?.(id);await this.runtime.remove!(await this.profile(e,false));this.store.remove(id);this.profiles.delete(id);this.store.finishJob(job.id,'succeeded','环境及专属虚拟磁盘已删除');
+  }).catch(error=>{this.store.state(id,'error','删除未完成，保留环境记录：'+redact(errorMessage(error)));this.store.finishJob(job.id,'failed',errorMessage(error));}).finally(()=>{this.active.delete(id);this.deletions.delete(job.id);this.tasks.delete(job.id);});
   this.tasks.set(job.id,{controller,promise});return job;
  }
  private async lifecycle(e:Environment,action:'start'|'stop'|'restart',signal:AbortSignal){
@@ -134,7 +149,7 @@ export class WindowsManager {
  }
  async hostUnavailable(reason:string){this.hostIssue=reason;for(const task of this.tasks.values())task.controller.abort();await Promise.all(this.store.list().filter(e=>['running','starting','creating'].includes(e.state)).map(e=>this.quarantine(e.id,reason)));}
  failProtection(id:string,reason:string){return this.quarantine(id,reason);}
- cancel(jobId:string){this.tasks.get(jobId)?.controller.abort();}
+ cancel(jobId:string){if(this.deletions.has(jobId))throw new AppError('删除已开始，请等待清理结果',409,'DELETE_IN_PROGRESS');this.tasks.get(jobId)?.controller.abort();}
  async wait(jobId:string){await this.tasks.get(jobId)?.promise;}
  close(){return this.closeTask??=(async()=>{this.closing=true;clearInterval(this.timer);for(const task of this.tasks.values())task.controller.abort();await Promise.allSettled([...this.tasks.values()].map(t=>t.promise));await this.hostUnavailable('应用已退出');await this.monitorTask;this.store.close();this.store.key.fill(0);})();}
 }

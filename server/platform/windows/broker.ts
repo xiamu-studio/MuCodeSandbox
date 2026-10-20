@@ -10,7 +10,7 @@ import {powershellPath,powershellArgs,fileHash} from './runtime.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../../scripts/windows');
 const reply=z.discriminatedUnion('ok',[z.object({ok:z.literal(true),result:z.unknown()}).strict(),z.object({ok:z.literal(false),code:z.string(),error:z.string()}).strict()]);
-export type BrokerAction='hello'|'doctor'|'fingerprint'|'disk'|'create'|'start'|'stop'|'status'|'inspect'|'channel'|'close-channel'|'shutdown';
+export type BrokerAction='hello'|'doctor'|'fingerprint'|'disk'|'create'|'start'|'stop'|'status'|'inspect'|'channel'|'close-channel'|'shutdown'|'allocation'|'recover'|'prepare'|'delete'|'absence';
 
 export class HyperVBrokerClient{
  readonly pipe:string;

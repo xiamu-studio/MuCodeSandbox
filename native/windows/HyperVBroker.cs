@@ -53,14 +53,14 @@ public static class MuHyperVBroker {
         foreach(var sid in new[]{SystemSid,AdminSid})acl.AddAccessRule(new FileSystemAccessRule(sid,FileSystemRights.FullControl,InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit,PropagationFlags.None,AccessControlType.Allow));
         return acl;
     }
-    private static void PrivateDirectory(string path) {
+    private static void PrivateDirectory(string path,bool pin=true) {
         if(!Directory.Exists(path))Directory.CreateDirectory(path,PrivateAcl());
         if((File.GetAttributes(path)&FileAttributes.ReparsePoint)!=0)throw new UnauthorizedAccessException("Reparse directory rejected");
         var acl=Directory.GetAccessControl(path);var owner=(SecurityIdentifier)acl.GetOwner(typeof(SecurityIdentifier));
         if(!owner.Equals(AdminSid)&&!owner.Equals(SystemSid))throw new UnauthorizedAccessException("Storage owner rejected");
         foreach(FileSystemAccessRule rule in acl.GetAccessRules(true,true,typeof(SecurityIdentifier)))if(rule.AccessControlType==AccessControlType.Allow&&!rule.IdentityReference.Equals(AdminSid)&&!rule.IdentityReference.Equals(SystemSid))throw new UnauthorizedAccessException("Storage ACL rejected");
         var handle=CreateFile(path,0x80000000,3,IntPtr.Zero,3,0x02000000|0x00200000,IntPtr.Zero);
-        if(handle==new IntPtr(-1))throw new IOException("Cannot lock protected directory");lock(Gate)Held.Add(new HandleOwner(handle));
+        if(handle==new IntPtr(-1))throw new IOException("Cannot lock protected directory");if(pin){lock(Gate)Held.Add(new HandleOwner(handle));}else CloseHandle(handle);
     }
     private static void TrustedExecutable(string common){
         string file=System.Reflection.Assembly.GetExecutingAssembly().Location,expected=Path.Combine(common,"bin");
@@ -90,11 +90,12 @@ public static class MuHyperVBroker {
         int slot=((hash[0]<<8)|hash[1])%16384,third=slot>>6,fourth=(slot&63)*4;string dir=Path.Combine(UserRoot,"vms",id);
         var result=new Dictionary<string,object>{{"name",name},{"directory",dir},{"disk",Path.Combine(dir,"disk.vhdx")},{"seed",Path.Combine(dir,"seed.iso")},{"image",record["image"]},{"cpus",record["cpus"]},{"memoryGiB",record["memoryGiB"]},{"diskGiB",record["diskGiB"]},{"brokerResourceLimit",true},{"host","172.29."+third+"."+(fourth+1)},{"guest","172.29."+third+"."+(fourth+2)},{"mac","00155D"+BitConverter.ToString(hash,2,3).Replace("-","")}};
         if(record.ContainsKey("platformId"))result["expectedPlatformId"]=record["platformId"];
+        result["allowPartialAllocation"]=!record.ContainsKey("everReady")&&Convert.ToString(record["stage"])!="ready";
         if(Convert.ToString(record["imageSha256"])=="c74a7d3b3476ffb2715bfcaf9c216e9dd1d6c7e01bc6d0380b1744518dfae15c")result["imagePatch"]=new Dictionary<string,object>{{"offset",2495315968L},{"before",Convert.ToBase64String(Encoding.ASCII.GetBytes("# to update this file, run dpkg-reconfigure cloud-init\ndatasource_list: [ Azure ]\n"))},{"after",Convert.ToBase64String(Encoding.ASCII.GetBytes("# to update this file, run dpkg-reconfigure cloud-init\ndatasource_list: [NoCloud]\n"))}};
         return result;
     }
     private static string Invoke(string action,Dictionary<string,object> parameters,int timeout,CancellationToken cancellation) {
-        if(action!="stop"){cancellation.ThrowIfCancellationRequested();if(Stopping)throw new OperationCanceledException("Broker is closing");}
+        if(action!="stop"&&action!="recover-allocation"&&action!="delete-allocation"){cancellation.ThrowIfCancellationRequested();if(Stopping)throw new OperationCanceledException("Broker is closing");}
         string system=Environment.GetFolderPath(Environment.SpecialFolder.Windows),script="$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);try { & '"+ScriptFile.Replace("'","''")+"' -Action '"+action+"' } catch { [Console]::Error.WriteLine($_.Exception.ToString());[Console]::Error.WriteLine($_.ScriptStackTrace);exit 1 }";
         var info=new ProcessStartInfo(Path.Combine(system,"System32/WindowsPowerShell/v1.0/powershell.exe"),"-NoLogo -NoProfile -NonInteractive -EncodedCommand "+Convert.ToBase64String(Encoding.Unicode.GetBytes(script))){UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,WorkingDirectory=UserRoot,StandardOutputEncoding=Encoding.UTF8,StandardErrorEncoding=Encoding.UTF8};
         info.EnvironmentVariables.Clear();info.EnvironmentVariables["SystemRoot"]=system;info.EnvironmentVariables["WINDIR"]=system;info.EnvironmentVariables["SystemDrive"]=Path.GetPathRoot(system).TrimEnd('\\');info.EnvironmentVariables["COMPUTERNAME"]=Environment.MachineName;info.EnvironmentVariables["ProgramData"]=Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);info.EnvironmentVariables["ProgramFiles"]=Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);info.EnvironmentVariables["ComSpec"]=Path.Combine(system,"System32/cmd.exe");info.EnvironmentVariables["USERPROFILE"]=UserRoot;info.EnvironmentVariables["PATH"]=Path.Combine(system,"System32");info.EnvironmentVariables["PSModulePath"]=Path.Combine(system,"System32/WindowsPowerShell/v1.0/Modules");info.EnvironmentVariables["TEMP"]=UserRoot;info.EnvironmentVariables["TMP"]=UserRoot;
@@ -117,6 +118,40 @@ public static class MuHyperVBroker {
         }
     }
     private static void CloseChannel(string id){lock(Gate){Process child;ChannelPorts.Remove(id);if(!Channels.TryGetValue(id,out child))return;Channels.Remove(id);try{if(!child.HasExited)child.Kill();}catch{}child.Dispose();}}
+    private static bool EverReady(Dictionary<string,object> record){return record.ContainsKey("everReady")&&Convert.ToBoolean(record["everReady"])||Convert.ToString(record["stage"])=="ready";}
+    private static Dictionary<string,object> RecoverAllocation(Dictionary<string,object> record){
+        var value=Json().Deserialize<Dictionary<string,object>>(Invoke("recover-allocation",Parameters(record),30000,CancellationToken.None));
+        if(Convert.ToString(value["state"])!="Off")throw new IOException("Allocation shutdown was not confirmed");
+        lock(Gate){
+            if(EverReady(record))record["everReady"]=true;
+            if(Convert.ToBoolean(value["present"])){
+                string platform=Text(value,"platformId",36);Guid parsed;if(!Guid.TryParseExact(platform,"D",out parsed)||parsed==Guid.Empty)throw new IOException("Allocation identity missing");record["platformId"]=platform;
+                if(Convert.ToBoolean(value["ready"])){record["stage"]="ready";record["everReady"]=true;}else record["stage"]="create-failed";
+            }else if(record.ContainsKey("platformId"))record["stage"]="vm-missing";
+            Save();
+        }
+        return value;
+    }
+    private static void CheckRemovalTree(string directory){
+        if((File.GetAttributes(directory)&FileAttributes.ReparsePoint)!=0)throw new UnauthorizedAccessException("Reparse storage cannot be removed");
+        foreach(string entry in Directory.EnumerateFileSystemEntries(directory)){
+            var attributes=File.GetAttributes(entry);if((attributes&FileAttributes.ReparsePoint)!=0)throw new UnauthorizedAccessException("Reparse storage cannot be removed");
+            if((attributes&FileAttributes.Directory)!=0)CheckRemovalTree(entry);
+        }
+    }
+    private static void RemoveAllocationFiles(Dictionary<string,object> record){
+        string id=Convert.ToString(record["id"]),parent=Path.Combine(UserRoot,"vms"),directory=Path.GetFullPath(Path.Combine(parent,id));
+        Guid parsed;if(!Guid.TryParseExact(id,"D",out parsed)||parsed.ToString("D")!=id||Path.GetDirectoryName(directory)!=parent)throw new UnauthorizedAccessException("Allocation removal boundary changed");
+        // Parent directories remain pinned and deny user writes. No caller path
+        // participates in this recursive deletion, and reparse entries fail closed.
+        if(HasStorage(directory)){if(!Directory.Exists(directory))throw new IOException("Allocation directory was replaced by a file");CheckRemovalTree(directory);Directory.Delete(directory,true);}
+        if(HasStorage(directory))throw new IOException("Allocation storage removal was not confirmed");
+    }
+    private static bool HasStorage(string directory){try{File.GetAttributes(directory);return true;}catch(FileNotFoundException){return false;}catch(DirectoryNotFoundException){return false;}}
+    private static object Allocation(string id){
+        lock(Gate){Dictionary<string,object> record;if(!Records.TryGetValue(id,out record))return new {registered=false};
+            return new {registered=true,stage=record["stage"],everReady=EverReady(record),platformId=record.ContainsKey("platformId")?record["platformId"]:null,imageSha256=record["imageSha256"],cpus=record["cpus"],memoryGiB=record["memoryGiB"],diskGiB=record["diskGiB"]};}
+    }
     private static object Channel(string id) {
         lock(VmGate(id)){
         var record=Owned(id);if(!record.ContainsKey("platformId"))throw new InvalidOperationException("VM is not ready");lock(Gate){Process existing;if(Channels.TryGetValue(id,out existing)&&!existing.HasExited)return new {port=ChannelPorts[id]};}CloseChannel(id);
@@ -130,12 +165,45 @@ public static class MuHyperVBroker {
         if(action=="doctor"||action=="fingerprint"){ValidateKeys(request,"action");return Invoke(action,null,10000,cancellation);}
         if(action=="shutdown"){ValidateKeys(request,"action");return "";}
         string id=Id(request);
+        if(action=="absence"){
+            ValidateKeys(request,"action","id","platformId");var record=new Dictionary<string,object>{{"id",id},{"image",""},{"imageSha256",""},{"cpus",1},{"memoryGiB",2},{"diskGiB",16},{"stage","unregistered"}};var parameters=Parameters(record);
+            if(request.ContainsKey("platformId")){string platform=Text(request,"platformId",36);Guid parsed;if(!Guid.TryParseExact(platform,"D",out parsed)||parsed==Guid.Empty)throw new ArgumentException("VM identity required");parameters["expectedPlatformId"]=platform;}
+            var state=Json().Deserialize<Dictionary<string,object>>(Invoke("allocation-absence",parameters,15000,cancellation));return new {absent=Convert.ToBoolean(state["absent"])&&!HasStorage(Convert.ToString(parameters["directory"]))};
+        }
+        if(action=="allocation"){ValidateKeys(request,"action","id");return Allocation(id);}
+        if(action=="recover"||action=="prepare"||action=="delete"){
+            if(action=="prepare")ValidateKeys(request,"action","id","image");else ValidateKeys(request,"action","id");lock(VmGate(id)){
+                var record=Owned(id);CloseChannel(id);cancellation.ThrowIfCancellationRequested();var recovered=RecoverAllocation(record);
+                if(action=="recover")return recovered;
+                if(action=="prepare"&&Convert.ToBoolean(recovered["ready"]))return recovered;
+                if(action=="prepare"&&EverReady(record))throw new InvalidOperationException("An existing guest cannot be rebuilt");
+                lock(Gate){record["stage"]=action=="delete"?"deleting":"preparing";Save();}
+                var removed=Json().Deserialize<Dictionary<string,object>>(Invoke("delete-allocation",Parameters(record),30000,CancellationToken.None));
+                if(!Convert.ToBoolean(removed["vmAbsent"])||!Convert.ToBoolean(removed["switchAbsent"]))throw new IOException("Allocation removal was not confirmed");RemoveAllocationFiles(record);
+                if(action=="delete"){
+                    lock(Gate){Records.Remove(id);try{Save();}catch{Records.Add(id,record);throw;}}return new {deleted=true,vmAbsent=true,switchAbsent=true,storageAbsent=true};
+                }
+                lock(Gate){record.Remove("platformId");record["stage"]="allocated";Save();}PrivateDirectory(Convert.ToString(Parameters(record)["directory"]),false);
+                string image=Convert.ToString(record["image"]);if(!File.Exists(image)){
+                    lock(ImportGate){if(!File.Exists(image)){
+                        long remaining=64L*1024*1024*1024-Directory.GetFiles(Path.Combine(UserRoot,"images")).Sum(file=>new FileInfo(file).Length);if(remaining<1)throw new IOException("Image cache quota reached");
+                        string next=image+"."+Guid.NewGuid().ToString("N")+".next";try{CopyCaller(pipe,Text(request,"image",4096),next,Convert.ToString(record["imageSha256"]),remaining,cancellation);File.Move(next,image);}finally{if(File.Exists(next))File.Delete(next);}
+                    }}
+                }
+                if(HashFile(Convert.ToString(record["image"]))!=Convert.ToString(record["imageSha256"]))throw new UnauthorizedAccessException("Protected image changed");
+                Invoke("disk",Parameters(record),1200000,cancellation);lock(Gate){record["stage"]="disk-ready";Save();}return new {state="Off",present=false,ready=false};
+            }
+        }
         if(action=="disk") {
             ValidateKeys(request,"action","id","image","imageSha256","cpus","memoryGiB","diskGiB");string source=Text(request,"image",4096),digest=Digest(request,"imageSha256"),extension=Path.GetExtension(source).ToLowerInvariant();if(extension!=".vhd"&&extension!=".vhdx")throw new ArgumentException("Disk image required");
             int cpu=Number(request,"cpus",1,Math.Min(16,Environment.ProcessorCount)),memory=Number(request,"memoryGiB",2,32),disk=Number(request,"diskGiB",16,256);
             lock(VmGate(id)) {
-                lock(Gate){if(Records.ContainsKey(id)||Records.Count>=32)throw new InvalidOperationException("VM allocation refused");}
-                string dir=Path.Combine(UserRoot,"vms",id);PrivateDirectory(dir);string image=Path.Combine(UserRoot,"images",digest+extension);
+                string dir=Path.Combine(UserRoot,"vms",id),image=Path.Combine(UserRoot,"images",digest+extension);
+                var record=new Dictionary<string,object>{{"id",id},{"ownerSid",OwnerSid},{"image",image},{"imageSha256",digest},{"cpus",cpu},{"memoryGiB",memory},{"diskGiB",disk},{"stage","allocated"}};
+                // Persist ownership before creating any allocation files. Failed
+                // source reads and cancelled imports remain discoverable/removable.
+                lock(Gate){if(Records.ContainsKey(id)||Records.Count>=32)throw new InvalidOperationException("VM allocation refused");Records.Add(id,record);Save();}
+                PrivateDirectory(dir,false);
                 lock(ImportGate){if(!File.Exists(image)){
                     string importLock=Path.Combine(Directory.GetParent(Directory.GetParent(UserRoot).FullName).FullName,"import.lock");
                     using(var reservation=new FileStream(importLock,FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None)){
@@ -144,7 +212,6 @@ public static class MuHyperVBroker {
                     }
                 }
                 else if((File.GetAttributes(image)&FileAttributes.ReparsePoint)!=0||HashFile(image)!=digest)throw new UnauthorizedAccessException("Protected image changed");}
-                var record=new Dictionary<string,object>{{"id",id},{"ownerSid",OwnerSid},{"image",image},{"imageSha256",digest},{"cpus",cpu},{"memoryGiB",memory},{"diskGiB",disk},{"stage","allocated"}};lock(Gate){if(Records.Count>=32)throw new InvalidOperationException("VM allocation refused");Records.Add(id,record);Save();}
                 Invoke("disk",Parameters(record),1200000,cancellation);lock(Gate){record["stage"]="disk-ready";Save();}return "";
             }
         }
@@ -154,14 +221,17 @@ public static class MuHyperVBroker {
                 if(Convert.ToString(record["stage"])!="disk-ready")throw new InvalidOperationException("Disk is not ready");var parameters=Parameters(record);string seed=Convert.ToString(parameters["seed"]);
                 CopyCaller(pipe,Text(request,"seed",4096),seed,Digest(request,"seedSha256"),8*1024*1024,cancellation);
                 using(var input=File.OpenRead(seed)){input.Position=32769;var signature=new byte[5];if(input.Read(signature,0,5)!=5||Encoding.ASCII.GetString(signature)!="CD001")throw new ArgumentException("ISO seed required");}
-                Invoke("register-channel",parameters,15000,cancellation);string result=Invoke("create",parameters,60000,cancellation);var created=Json().Deserialize<Dictionary<string,object>>(result);string platform=Text(created,"platformId",36);Guid parsed;if(!Guid.TryParseExact(platform,"D",out parsed)||parsed==Guid.Empty)throw new IOException("VM identity was not returned");lock(Gate){record["platformId"]=platform;record["stage"]="ready";Save();}return result;
+                lock(Gate){record["stage"]="creating";Save();}
+                Invoke("register-channel",parameters,15000,cancellation);string result=Invoke("create",parameters,60000,cancellation);var created=Json().Deserialize<Dictionary<string,object>>(result);string platform=Text(created,"platformId",36);Guid parsed;if(!Guid.TryParseExact(platform,"D",out parsed)||parsed==Guid.Empty)throw new IOException("VM identity was not returned");lock(Gate){record["platformId"]=platform;record["stage"]="ready";record["everReady"]=true;Save();}return result;
             }
         }
         ValidateKeys(request,"action","id");var owned=Owned(id);
         if(action=="channel")return Channel(id);
         if(action=="close-channel"){CloseChannel(id);return "";}
         if(action=="start"||action=="stop"||action=="status"||action=="inspect"){
-            if(!owned.ContainsKey("platformId"))throw new InvalidOperationException("VM is not registered");lock(VmGate(id)){
+            lock(VmGate(id)){
+                if((action=="status"||action=="stop")&&(!owned.ContainsKey("platformId")||Convert.ToString(owned["stage"])!="ready"))return Json().Serialize(RecoverAllocation(owned));
+                if(!owned.ContainsKey("platformId")||action=="start"&&Convert.ToString(owned["stage"])!="ready")throw new InvalidOperationException("VM is not ready");
                 if(action=="stop")CloseChannel(id);try{return Invoke(action,Parameters(owned),30000,action=="stop"?CancellationToken.None:cancellation);}finally{if(action=="start"&&cancellation.IsCancellationRequested){CloseChannel(id);try{Invoke("stop",Parameters(owned),30000,CancellationToken.None);}catch{}}}
             }
         }
@@ -181,7 +251,7 @@ public static class MuHyperVBroker {
         finally{cancel.Cancel();pipe.Dispose();lock(Gate){Pipes.Remove(pipe);if(counted){ActiveRequests--;if(ActiveRequests==0)RequestsIdle.Set();}}}
     }
     private static void Shutdown(){bool producer=false;lock(Gate){if(!Stopping){Stopping=true;producer=true;foreach(var pipe in Pipes.ToArray())try{pipe.Dispose();}catch{}}}if(!producer){ShutdownComplete.WaitOne();return;}
-        try{RequestsIdle.WaitOne(30000);foreach(var record in RecordSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);if(record.ContainsKey("platformId"))try{Invoke("stop",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
+        try{RequestsIdle.WaitOne(30000);foreach(var record in RecordSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);try{Invoke(record.ContainsKey("platformId")?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
     }
     public static int Main(string[] args) {
         if(args.Length==1&&args[0]=="--self-test"){try{ValidateKeys(new Dictionary<string,object>{{"action","start"},{"command","bad"}},"action","id");return 1;}catch(ArgumentException){}Console.WriteLine("Broker request boundary verified");return 0;}
@@ -194,7 +264,7 @@ public static class MuHyperVBroker {
             var waiting=Stopwatch.StartNew();for(;;){if(Owner.HasExited)throw new OperationCanceledException("Application exited while waiting for storage");try{Held.Add(new FileStream(Path.Combine(UserRoot,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None));break;}catch(IOException){if(waiting.ElapsedMilliseconds>90000)throw;Thread.Sleep(100);}}
             Ledger=Path.Combine(UserRoot,"vms.json");if(File.Exists(Ledger)){var saved=Json().Deserialize<Dictionary<string,Dictionary<string,object>>>(File.ReadAllText(Ledger));foreach(var pair in saved)Records.Add(pair.Key,pair.Value);}
             byte[] scriptBytes=Convert.FromBase64String(HyperVScript);string scriptHash;using(var sha=SHA256.Create())scriptHash=BitConverter.ToString(sha.ComputeHash(scriptBytes)).Replace("-","").ToLowerInvariant();ScriptFile=Path.Combine(UserRoot,"hyperv-"+scriptHash+".ps1");if(File.Exists(ScriptFile)){if((File.GetAttributes(ScriptFile)&FileAttributes.ReparsePoint)!=0||HashFile(ScriptFile)!=scriptHash)throw new UnauthorizedAccessException("Protected script changed");}else{using(var scriptStream=new FileStream(ScriptFile,FileMode.CreateNew,FileAccess.Write,FileShare.None)){scriptStream.Write(scriptBytes,0,scriptBytes.Length);scriptStream.Flush(true);}}
-            foreach(var record in RecordSnapshot())if(record.ContainsKey("platformId"))try{Invoke("stop",Parameters(record),30000,CancellationToken.None);}catch{throw new IOException("Previous VM shutdown was not confirmed");}
+            foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
             var watcher=new Thread(()=>{try{Owner.WaitForExit();}catch{}Shutdown();});watcher.IsBackground=true;watcher.Start();
             var security=new PipeSecurity();security.SetAccessRuleProtection(true,false);security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(OwnerSid),PipeAccessRights.ReadWrite,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(SystemSid,PipeAccessRights.FullControl,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(AdminSid,PipeAccessRights.FullControl,AccessControlType.Allow));
             while(!Stopping){NamedPipeServerStream pipe=null;try{pipe=new NamedPipeServerStream("MuCodeSandbox-Broker-"+args[3],PipeDirection.InOut,16,PipeTransmissionMode.Byte,PipeOptions.Asynchronous,65536,65536,security);lock(Gate)Pipes.Add(pipe);pipe.WaitForConnection();ThreadPool.QueueUserWorkItem(_=>Serve(pipe));}catch{if(pipe!=null){pipe.Dispose();lock(Gate)Pipes.Remove(pipe);}if(!Stopping)Thread.Sleep(100);}}

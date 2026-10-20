@@ -22,6 +22,8 @@ import type {HyperVBrokerClient,BrokerAction} from './broker.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../..','scripts/windows');
 const inspection=z.object({digest:z.string().regex(/^[a-f0-9]{64}$/),leaseActive:z.boolean(),remainingMs:z.number().nonnegative().max(45000)}).strict();
+const allocationSchema=z.discriminatedUnion('registered',[z.object({registered:z.literal(false)}).strict(),z.object({registered:z.literal(true),stage:z.string(),everReady:z.boolean(),platformId:z.uuid().nullable(),imageSha256:z.string().regex(/^[a-f0-9]{64}$/),cpus:z.number().int(),memoryGiB:z.number().int(),diskGiB:z.number().int()}).strict()]);
+const recoverySchema=z.object({name:z.string(),state:z.literal('Off'),present:z.boolean(),platformId:z.uuid().nullable(),ready:z.boolean()}).strict();
 export const AMD64_TUNNEL={version:'1.14.3',sha256:'e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee',
   url:'https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz'};
 export const CANONICAL_IMAGE={sha256:'cde3ca6a5aabe89702456cc5af69e2336600ce13c18898aba27e7212e3474e3f',
@@ -58,6 +60,49 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   readonly runner:Runner;
   readonly broker:HyperVBrokerClient|undefined;
   constructor(root:string,runner:Runner=run,broker?:HyperVBrokerClient) {this.root=root;this.runner=runner;this.broker=broker;}
+  get deletionAvailable(){return !!this.broker;}
+  async allocation(c:WindowsConfig){if(!this.broker)throw new AppError('此入口未启用权限代理恢复',409,'FEATURE_UNAVAILABLE');return allocationSchema.parse(await this.broker.call('allocation',{id:c.id}));}
+  private async metadataMarker(c:WindowsConfig){
+    try{const file=path.join(windowsPaths(this.root,c.id).directory,'allocation.json');if(!(await lstat(file)).isFile())return false;return z.object({version:z.literal(1),id:z.literal(c.id),backend:z.literal('hyperv-broker')}).strict().parse(JSON.parse(await readFile(file,'utf8')))!==undefined;}
+    catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return false;throw error;}
+  }
+  private async cleanMetadata(c:WindowsConfig,reset:boolean,checkOnly=false){
+    const script=`& '${path.join(scripts,'clean-runtime-metadata.ps1').replaceAll("'","''")}'`;
+    await this.runner(powershellPath(),powershellArgs(script),{input:JSON.stringify({root:path.resolve(this.root),id:c.id,reset,checkOnly}),timeoutMs:30000});
+  }
+  private async confirmUnregisteredAbsence(c:WindowsConfig){
+    const request:Record<string,unknown>={id:c.id};
+    try{const manifest=JSON.parse(await readFile(windowsPaths(this.root,c.id).manifest,'utf8'));if(manifest.id!==c.id)throw new AppError('运行清单身份不一致，已保留文件',409,'RECOVERY_IDENTITY_MISMATCH');request.platformId=z.uuid().parse(manifest.platformId);}
+    catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+    const result=z.object({absent:z.boolean()}).strict().parse(await this.broker!.call('absence',request));if(!result.absent)throw new AppError('发现未由当前代理登记的资源，已保留文件，请先处理旧环境',409,'UNREGISTERED_RESOURCES');
+  }
+  private async publishManifest(c:WindowsConfig,platformId:string){
+    const p=windowsPaths(this.root,c.id);
+    for(const file of [p.key,p.hostKey,p.knownHosts]){const entry=await lstat(file);if(!entry.isFile()||entry.isSymbolicLink())throw new AppError('管理文件不完整，已保留虚拟磁盘',409,'RECOVERY_FILES_MISSING');}
+    const manifest={version:1,id:c.id,platformId,imageSha256:c.imageSha256,purpose:c.imageSha256===CANONICAL_NOCLOUD_PATCH.sourceSha256?'builder':'environment',createdAt:new Date().toISOString()};
+    try{const existing=JSON.parse(await readFile(p.manifest,'utf8'));if(existing.id!==c.id||existing.platformId!==platformId)throw new AppError('运行清单与已登记虚拟机不一致',409,'RECOVERY_IDENTITY_MISMATCH');}
+    catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;await writeFile(p.manifest,JSON.stringify(manifest),{flag:'wx'});}
+    this.vmIds.set(c.id,platformId);
+  }
+  async recoverCreation(c:WindowsConfig){
+    if(!this.broker)return false;const allocated=await this.allocation(c);if(!allocated.registered)return false;
+    const recovered=recoverySchema.parse(await this.broker.call('recover',{id:c.id},{timeoutMs:45000}));
+    if(!recovered.present||!recovered.ready)return false;
+    await this.publishManifest({...c,imageSha256:allocated.imageSha256},recovered.platformId!);return true;
+  }
+  async remove(c:WindowsConfig){
+    if(!this.broker)throw new AppError('请在普通用户权限代理入口删除环境',409,'FEATURE_UNAVAILABLE');
+    await this.disconnect(c.id);this.closeChannel(c.id);
+    await this.cleanMetadata(c,false,true);
+    const allocated=await this.allocation(c);
+    if(allocated.registered){
+      const marker=path.join(windowsPaths(this.root,c.id).directory,'allocation.json');try{await writeFile(marker,JSON.stringify({version:1,id:c.id,backend:'hyperv-broker'}),{flag:'wx'});}catch(error){if(!['ENOENT','EEXIST'].includes((error as NodeJS.ErrnoException).code??''))throw error;}
+      const result=z.object({deleted:z.literal(true),vmAbsent:z.literal(true),switchAbsent:z.literal(true),storageAbsent:z.literal(true)}).strict().parse(await this.broker.call('delete',{id:c.id},{timeoutMs:120000}));if(!result.deleted)throw Error('Removal was not confirmed');
+    }else{
+      await this.confirmUnregisteredAbsence(c);
+    }
+    await this.cleanMetadata(c,false);this.vmIds.delete(c.id);this.transportFailures.delete(c.id);
+  }
   private psScript(action:string) {return `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); try { & '${path.join(scripts,'hyperv.ps1').replaceAll("'","''")}' -Action '${action}' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }`;}
   async powershell(action:string,c?:WindowsConfig,options:RunOptions={}) {
     if(process.platform!=='win32')throw Error('Hyper-V backend requires Windows');
@@ -162,14 +207,28 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   }
   async create(input:WindowsConfig,options:RunOptions={}) {
     const c=windowsConfigSchema.parse(input),p=windowsPaths(this.root,c.id),n=vmIdentity(c.id);
+    let retry=false;
+    if(this.broker){
+      const allocated=await this.allocation(c);
+      if(allocated.registered){
+        if(await this.recoverCreation(c))return;
+        if(allocated.everReady)throw new AppError('已有环境的虚拟机或防护状态异常，已保留原磁盘',409,'EXISTING_GUEST_RETAINED');
+        if(allocated.imageSha256!==c.imageSha256||allocated.cpus!==c.cpus||allocated.memoryGiB!==c.memoryGiB||allocated.diskGiB!==c.diskGiB)throw new AppError('未完成创建的资源配置已变化，已保留原文件',409,'RECOVERY_CONFIG_CHANGED');
+        const prepared=await this.broker.call('prepare',{id:c.id,image:path.resolve(c.image)},{...options,timeoutMs:1200000}) as {ready:boolean};
+        if(prepared.ready){if(await this.recoverCreation(c))return;throw Error('Recovered allocation is incomplete');}retry=true;
+      }
+      try{await access(p.directory);if(!allocated.registered&&!await this.metadataMarker(c))throw new AppError('已有运行目录没有权限代理创建标记，已保留文件',409,'RECOVERY_FILES_RETAINED');await this.cleanMetadata(c,true);}
+      catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+    }
     const info=await this.info();if(!info.available)throw Error(info.issues.join('; '));
-    await this.channelHelper();await this.powershell('register-channel',c);
+    if(!this.broker)await this.channelHelper();await this.powershell('register-channel',c);
     if(await fileHash(c.image)!==c.imageSha256)throw Error('VM image checksum mismatch');
     if((await lstat(c.image)).isSymbolicLink())throw Error('VM image cannot be a symbolic link');
     await mkdir(this.root,{recursive:true});
     if((await lstat(this.root)).isSymbolicLink())throw Error('Data root cannot be a symbolic link');
-    await mkdir(p.directory); // Exclusive allocation; an old directory is never reused.
+    if(this.broker)await mkdir(p.directory,{recursive:true});else await mkdir(p.directory);
     await this.runner(powershellPath(),powershellArgs(`$ErrorActionPreference='Stop'; $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; & icacls.exe '${p.directory.replaceAll("'","''")}' /inheritance:r /grant:r "*\${sid}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null; if($LASTEXITCODE -ne 0){throw 'Unable to restrict data directory permissions'}`));
+    if(this.broker)await writeFile(path.join(p.directory,'allocation.json'),JSON.stringify({version:1,id:c.id,backend:'hyperv-broker'}),{flag:'wx'});
     const keygen=path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh-keygen.exe');
     for(const key of [p.key,p.hostKey])await this.runner(keygen,['-q','-t','ed25519','-N','','-C','mu-windows-preview','-f',key]);
     const files=cloudInit(c,await readFile(p.key+'.pub','utf8'),await readFile(p.hostKey,'utf8'),await readFile(p.hostKey+'.pub','utf8'));
@@ -177,10 +236,10 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     for(const [name,contents]of Object.entries(files))await writeFile(path.join(seedDirectory,name),contents,{flag:'wx'});
     await writeFile(p.knownHosts,`${n.name} ${(await readFile(p.hostKey+'.pub','utf8')).trim()}\n`,{flag:'wx'});
     await this.runner(powershellPath(),powershellArgs(`& '${path.join(scripts,'seed-iso.ps1').replaceAll("'","''")}' -Source '${seedDirectory.replaceAll("'","''")}' -Destination '${p.seed.replaceAll("'","''")}'`),{timeoutMs:30000});
-    await this.powershell('disk',c,{...options,timeoutMs:1200000});
+    if(!retry)await this.powershell('disk',c,{...options,timeoutMs:1200000});
     const created=JSON.parse(await this.powershell('create',c,options));
     const platformId=z.uuid().parse(created.platformId);this.vmIds.set(c.id,platformId);
-    await writeFile(p.manifest,JSON.stringify({version:1,id:c.id,platformId,imageSha256:c.imageSha256,purpose:c.imageSha256===CANONICAL_NOCLOUD_PATCH.sourceSha256?'builder':'environment',createdAt:new Date().toISOString()}),{flag:'wx'});
+    await this.publishManifest(c,platformId);
   }
   async start(c:WindowsConfig,options:RunOptions={}) {
     await access(windowsPaths(this.root,c.id).manifest);
@@ -200,6 +259,9 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     // A stuck SSH child must never prevent the independent hypervisor stop.
     try{await this.disconnect(c.id);}catch{/* Hyper-V state is checked below. */}
     try{
+      if(this.broker&&!(await this.allocation(c)).registered){
+        await this.confirmUnregisteredAbsence(c);return;
+      }
       let running=false;try{running=(await this.state(c)).state==='Running';}catch{/* Still attempt the independent stop. */}
       // Egress is already removed. Bound filesystem synchronization prevents
       // routine stops from dropping just-written files; it cannot block a

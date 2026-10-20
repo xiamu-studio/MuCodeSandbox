@@ -83,6 +83,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.get('/api/snapshot',async(_req,res)=>{const snapshot=await controller.snapshot();res.json({...snapshot,system:{...snapshot.system,application:{channel:'source-preview',buildId:'working-tree',builtAt:null}}});});
   app.post('/api/environments',async(req,res)=>res.status(201).json(await controller.create(req.body)));
   app.put('/api/environments/:id',async(req,res)=>res.json(await controller.update(id(req),req.body)));
+  app.post('/api/environments/:id/actions/delete',async(req,res)=>{const input=z.object({confirmation:z.string().min(1).max(60)}).strict().parse(req.body);res.status(202).json(await controller.remove(id(req),input.confirmation));});
   app.post('/api/environments/:id/actions/:action',async(req,res)=>res.status(202).json(await controller.action(id(req),z.enum(['start','stop','restart']).parse(req.params.action))));
   app.get('/api/environments/:id/network/protection',async(req,res)=>res.json(await controller.protection(id(req))));
   app.get('/api/logs',(req,res)=>res.json(controller.store.logs(req.query.environmentId?z.uuid().parse(req.query.environmentId):null,z.coerce.number().int().min(0).parse(req.query.after??0))));
@@ -126,7 +127,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.post('/api/environments/:id/clipboard/read',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(await files().readClipboard(id(req)));});
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,remove:!!runtime.deletionAvailable}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));

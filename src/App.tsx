@@ -21,6 +21,7 @@ import { LatencyBadge } from './AccessLatency.tsx';
 const TerminalPanel = lazy(() => import('./TerminalPanel.tsx'));
 const GuestBrowserView = lazy(() => import('./GuestBrowserView.tsx'));
 const DesktopPanel = lazy(() => import('./DesktopPanel.tsx'));
+const WindowsWorkspace = lazy(() => import('./windows/WindowsWorkspace.tsx'));
 
 type Tab = 'overview' | 'folders' | 'network' | 'browser' | 'desktop' | 'agent' | 'terminal' | 'logs' | 'settings' | 'snapshots' | 'bridge';
 const tabs = [
@@ -59,6 +60,7 @@ function WorkspaceHome({ snapshot, onCreate, onImport, onSelect, onSystem, onNet
 }
 
 export default function App() {
+  if(window.__MU_CONFIG__?.platform==='win32')return <Suspense fallback={<div className="loading-view"><LoaderCircle className="spin" size={28}/></div>}><WindowsWorkspace/></Suspense>;
   const guestBrowserId = new URLSearchParams(location.search).get('guestBrowser');
   if (guestBrowserId) return <Suspense fallback={<div className="loading-view"><LoaderCircle className="spin" size={28} /></div>}><GuestBrowserView id={guestBrowserId} /></Suspense>;
   const browserId = new URLSearchParams(location.search).get('browser');

@@ -12,13 +12,18 @@ export class Store {
   db: DatabaseSync;
   key: Buffer;
   dataDir: string;
-  constructor(dataDir: string) {
+  constructor(dataDir: string, credentialKey?: Buffer) {
     this.dataDir = dataDir;
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
     chmodSync(dataDir, 0o700);
-    const keyFile = path.join(dataDir, 'credentials.key');
-    if (!existsSync(keyFile)) writeFileSync(keyFile, randomBytes(32), { mode: 0o600, flag: 'wx' });
-    this.key = readFileSync(keyFile);
+    if(credentialKey){
+      if(credentialKey.length!==32)throw new AppError('凭据加密密钥无效',500,'INVALID_CREDENTIAL_KEY');
+      this.key=Buffer.from(credentialKey);
+    }else{
+      const keyFile = path.join(dataDir, 'credentials.key');
+      if (!existsSync(keyFile)) writeFileSync(keyFile, randomBytes(32), { mode: 0o600, flag: 'wx' });
+      this.key = readFileSync(keyFile);
+    }
     this.db = new DatabaseSync(path.join(dataDir, 'state.sqlite'));
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS environments (id TEXT PRIMARY KEY, config TEXT NOT NULL);

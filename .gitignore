@@ -4,6 +4,8 @@ dist-server/
 release/
 .mu-data/
 test-results/
+output/playwright/
+.playwright-cli/
 artifacts/tool-pages-*/
 artifacts/MuCodeSandbox-tools-*.zip
 *.log
@@ -17,6 +19,7 @@ build-info.json
 !.env.example
 !.env.sample
 credentials.json
+credentials.dpapi
 translation-provider.json
 .translation-*.tmp
 service-info.json

@@ -22,6 +22,7 @@ export class WindowsNetworkSession {
   private ticking=false;
   private failure:Promise<void>|undefined;
   cleanupWarnings:unknown[]=[];
+  get guardDigest(){return this.digest;}
   readonly driver:GuardDriver;
   readonly expectedIp:string;
   constructor(driver:GuardDriver,expectedIp:string) {

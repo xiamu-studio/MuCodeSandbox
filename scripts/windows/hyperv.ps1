@@ -31,6 +31,7 @@ $marker = 'MuCodeSandbox Windows preview ' + $c.name
 function OwnedVM {
   $v = Get-VM -Name $c.name -ErrorAction Stop
   if ($v.Notes -ne $marker) { throw 'Refusing to operate on a VM not owned by this preview' }
+  if ($c.expectedPlatformId -and [string]$v.Id -ne [string]$c.expectedPlatformId) { throw 'Owned VM platform identity changed' }
   return $v
 }
 function InspectVM {
@@ -68,6 +69,14 @@ switch ($Action) {
     if (Test-Path -LiteralPath $c.disk) { throw 'Refusing to overwrite an existing disk' }
     $source = Get-Item -LiteralPath $c.image
     if ($source.Extension -notin @('.vhd','.vhdx') -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Expected a regular VHD or VHDX image' }
+    if ($c.brokerResourceLimit) {
+      # A caller-readable differencing disk must not grant the elevated import
+      # access to a parent disk that the caller cannot read. The broker supplies
+      # this policy; no caller-selected output or policy fields reach this script.
+      $sourceDisk = Get-VHD -Path $source.FullName
+      if ($sourceDisk.VhdType -eq 'Differencing' -or $sourceDisk.ParentPath) { throw 'Broker imports require a standalone image without a parent disk' }
+      if ($sourceDisk.Size -gt ([int64]$c.diskGiB*1GB)) { throw 'Source virtual capacity exceeds the allocated disk size' }
+    }
     $inputDisk=$source.FullName
     $materialized=$null
     if(($source.Attributes -band [IO.FileAttributes]::SparseFile) -or $c.imagePatch) {

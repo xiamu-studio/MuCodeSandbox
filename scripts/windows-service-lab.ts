@@ -10,6 +10,7 @@ import {PROBE_PORT,type WindowsConfig} from '../server/platform/windows/config.t
 import type {RunOptions} from '../server/process.ts';
 import {localFixtures,LAB_EXIT} from './windows/local-fixtures.ts';
 import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
+import {startBroker,installedBrokerPath} from '../server/platform/windows/broker.ts';
 
 // End-to-end HTTP/lifecycle acceptance against a new empty Hyper-V guest.
 // Every destination accepted by the upstream fixture is local and synthetic.
@@ -25,9 +26,12 @@ async function main(){
    await this.management(c,['sudo','update-ca-certificates'],{timeoutMs:30000});
   }
  }
- const runtime=new LocalLabRuntime(root);
+ let broker:Awaited<ReturnType<typeof startBroker>>|undefined;
+ try{if(process.argv.includes('--broker'))broker=await startBroker(await installedBrokerPath());}catch(error){await fixtures.close();throw error;}
+ const runtime=new LocalLabRuntime(root,undefined,broker);
  const curl=(c:WindowsConfig,receiver:string,probe=false)=>runtime.management(c,['sudo','-n','-H','-u',probe?'mu-probe':'dev','--','env','-i','PATH=/usr/bin:/bin','curl','-q','--fail','--silent','--show-error','--max-time','4','--connect-timeout','2','--cacert','/etc/mucodesandbox/lab-ca.crt','--proxy',probe?`socks5h://127.0.0.1:${PROBE_PORT}`:'','--noproxy',probe?'':'*',`https://${receiver}/`],{timeoutMs:10000});
  const files=['scripts/windows-service-lab.ts','scripts/windows/local-fixtures.ts','scripts/windows/hyperv.ps1','native/windows/HyperVChannel.cs','server/store.ts','server/ui-session.ts','server/guest-exchange.ts','server/guest-task.ts','server/platform/windows/terminal.ts','server/platform/windows/terminal-process.ts','server/platform/windows/terminal-worker.ts','server/platform/windows/service.ts','server/platform/windows/service-lock.ts','server/platform/windows/credentials.ts','server/platform/windows/manager.ts','server/platform/windows/runtime.ts','server/platform/windows/session.ts','server/platform/windows/guest.ts','server/platform/windows/monitor.ts'];
+ if(broker)files.push('native/windows/HyperVBroker.cs','scripts/windows/build-broker.ps1','scripts/windows/install-broker.ps1','server/platform/windows/broker.ts');
  const hashes=()=>Promise.all(files.map(async file=>[file,await fileHash(file)]));
  const sourceHashes=Object.fromEntries(await hashes()),results:{name:string;passed:boolean}[]=[];
  const pass=(name:string)=>{results.push({name,passed:true});console.log('PASS '+name);};
@@ -43,7 +47,7 @@ async function main(){
    const response=await fetch(service!.url+'/api'+endpoint,{method,headers,body:body===undefined?undefined:JSON.stringify(body)});
    const result=await response.json() as any;assert.ok(response.ok,JSON.stringify(result));return result;
   }
-  const input={name:'Synthetic Windows API lab',cpus:1,memoryGiB:2,diskGiB:16,identity:{timezone:'UTC',locale:'en-US'},network:{mode:'http',host:'127.0.0.1',port:fixtures.port,strict:true,transparent:true,egressLock:{expectedIp:LAB_EXIT},dns:fixtures.dns}};
+  const input={name:'Synthetic Windows API lab',cpus:1,memoryGiB:2,diskGiB:broker?32:16,identity:{timezone:'UTC',locale:'en-US'},network:{mode:'http',host:'127.0.0.1',port:fixtures.port,strict:true,transparent:true,egressLock:{expectedIp:LAB_EXIT},dns:fixtures.dns}};
   const environment=await api('/environments',input);c=await service.manager.profile(service.manager.store.get(environment.id));pass('Authorized API creates a Windows-only environment');
   async function action(name:'start'|'stop'|'restart'){
    const job=await api(`/environments/${environment.id}/actions/${name}`,{});const deadline=Date.now()+240000;
@@ -89,7 +93,7 @@ async function main(){
  }finally{
   terminal?.terminate();
   try{await service?.close();if(c)assert.equal((await runtime.state(c)).state,'Off');cleanupConfirmed=true;}
-  finally{await fixtures.close();const sourceChangedDuringTest=JSON.stringify(sourceHashes)!==JSON.stringify(Object.fromEntries(await hashes()));await writeFile(path.join(directory,'results.json'),JSON.stringify({scope:'real-windows-http-service',results,sourceHashes,sourceChangedDuringTest,cleanupConfirmed,aiWebsitesVisited:0,realAccountTests:0,complete:complete&&cleanupConfirmed&&!sourceChangedDuringTest},null,2));if(sourceChangedDuringTest)throw Error('Acceptance sources changed during the experiment');}
+  finally{await broker?.call('shutdown').catch(()=>{});await fixtures.close();const sourceChangedDuringTest=JSON.stringify(sourceHashes)!==JSON.stringify(Object.fromEntries(await hashes()));await writeFile(path.join(directory,'results.json'),JSON.stringify({scope:'real-windows-http-service',privilegeSeparated:!!broker,results,sourceHashes,sourceChangedDuringTest,cleanupConfirmed,aiWebsitesVisited:0,realAccountTests:0,complete:complete&&cleanupConfirmed&&!sourceChangedDuringTest},null,2));if(sourceChangedDuringTest)throw Error('Acceptance sources changed during the experiment');}
  }
  console.log(JSON.stringify({passed:results.length,complete:complete&&cleanupConfirmed}));
 }

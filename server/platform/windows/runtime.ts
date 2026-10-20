@@ -18,6 +18,7 @@ import { WindowsNetworkSession } from './session.ts';
 import { measureEgress } from '../../egress.ts';
 import {AppError} from '../../errors.ts';
 import {GUEST_TASK_RUN,GUEST_TASK_CANCEL} from '../../guest-task.ts';
+import type {HyperVBrokerClient,BrokerAction} from './broker.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../..','scripts/windows');
 const inspection=z.object({digest:z.string().regex(/^[a-f0-9]{64}$/),leaseActive:z.boolean(),remainingMs:z.number().nonnegative().max(45000)}).strict();
@@ -55,10 +56,19 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   private serviceStreams=new Map<string,Set<Duplex>>();
   readonly root:string;
   readonly runner:Runner;
-  constructor(root:string,runner:Runner=run) {this.root=root;this.runner=runner;}
+  readonly broker:HyperVBrokerClient|undefined;
+  constructor(root:string,runner:Runner=run,broker?:HyperVBrokerClient) {this.root=root;this.runner=runner;this.broker=broker;}
   private psScript(action:string) {return `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); try { & '${path.join(scripts,'hyperv.ps1').replaceAll("'","''")}' -Action '${action}' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }`;}
   async powershell(action:string,c?:WindowsConfig,options:RunOptions={}) {
     if(process.platform!=='win32')throw Error('Hyper-V backend requires Windows');
+    if(this.broker){
+      if(action==='register-channel')return '';
+      if(action==='export-base')throw new AppError('基盘构建和导出仍使用独立管理员构建入口',409,'BROKER_EXPORT_UNAVAILABLE');
+      const request:Record<string,unknown>=c?{id:c.id}:{};
+      if(action==='disk'&&c)Object.assign(request,{image:path.resolve(c.image),imageSha256:c.imageSha256,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB});
+      if(action==='create'&&c)Object.assign(request,{seed:windowsPaths(this.root,c.id).seed,seedSha256:await fileHash(windowsPaths(this.root,c.id).seed)});
+      return String(await this.broker.call(action as BrokerAction,request,{...options,timeoutMs:options.timeoutMs??45000}));
+    }
     const p=c?windowsPaths(this.root,c.id):undefined;
     const value=c?{...vmIdentity(c.id),...p,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB,image:c.image,
       imagePatch:c.imageSha256===CANONICAL_NOCLOUD_PATCH.sourceSha256?CANONICAL_NOCLOUD_PATCH:null}:undefined;
@@ -92,6 +102,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
       '-o','ServerAliveInterval=5','-o','ServerAliveCountMax=2','-o','LogLevel=ERROR','mu@127.0.0.1'];
   }
   private async channelPort(id:string,platformId:string) {
+    if(this.broker)return z.object({port:z.number().int().min(1).max(65535)}).strict().parse(await this.broker.call('channel',{id})).port;
     const existing=this.channels.get(id);if(existing&&existing.child.exitCode===null&&!existing.child.killed)return existing.port;
     const helper=await this.channelHelper();const child=spawn(helper,['--listen',platformId,String(process.pid)],{stdio:['pipe','pipe','pipe'],windowsHide:true});
     let details='';child.stderr.on('data',b=>{details=(details+b).slice(-2048);});
@@ -104,7 +115,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
       this.channels.set(id,{child,port});return port;
     }catch(error){child.kill();throw error;}
   }
-  private closeChannel(id:string){for(const stream of this.serviceStreams.get(id)??[])stream.destroy();this.serviceStreams.delete(id);const channel=this.channels.get(id);this.channels.delete(id);if(channel){channel.child.stdin.end();channel.child.kill();}}
+  private closeChannel(id:string){for(const stream of this.serviceStreams.get(id)??[])stream.destroy();this.serviceStreams.delete(id);if(this.broker)void this.broker.call('close-channel',{id}).catch(()=>{});const channel=this.channels.get(id);this.channels.delete(id);if(channel){channel.child.stdin.end();channel.child.kill();}}
   async serviceStreamFactory(c:WindowsConfig,service:'vnc'|'cdp'){
     const target=service==='vnc'?5900:service==='cdp'?9222:0;if(!target)throw Error('Unknown guest service');
     const args=await this.ssh(c),destination=args.pop()!,file=path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe');

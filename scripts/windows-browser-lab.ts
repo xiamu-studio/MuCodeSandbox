@@ -10,6 +10,7 @@ import {PROBE_PORT,type WindowsConfig} from '../server/platform/windows/config.t
 import type {RunOptions} from '../server/process.ts';
 import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 import {secureWindowsDirectory} from '../server/platform/windows/credentials.ts';
+import {startBroker,installedBrokerPath} from '../server/platform/windows/broker.ts';
 import {localFixtures,LAB_EXIT} from './windows/local-fixtures.ts';
 
 const page=`<!doctype html><meta charset="utf-8"><title>Windows Linux 本地验收</title><style>body{font:24px sans-serif;background:#eef4f1;padding:40px;color:#164c3a}textarea{display:block;width:80%;height:160px;font:24px sans-serif}button,input{font-size:22px;margin:20px 0}canvas{border:1px solid #888}</style><h1>本地 Linux 浏览器验收</h1><p>LOCAL FIXTURE · NO ACCOUNTS</p><textarea id="text" aria-label="本地文字输入"></textarea><input id="file" type="file"><button id="send" onclick="fetch('/browser-lab/upload',{method:'POST',body:document.querySelector('#file').files[0]}).then(r=>r.text()).then(t=>document.querySelector('#receipt').textContent=t)">上传到本地接收端</button><pre id="receipt"></pre><a download="浏览器下载验收.txt" href="/browser-lab/download">下载本地测试文件</a>`;
@@ -17,7 +18,7 @@ async function main(){
  if(process.platform!=='win32')throw Error('Windows is required');
  const root=windowsRuntimeDirectory();
  const base=JSON.parse(await readFile(path.join(root,'protected-desktop-base.json'),'utf8')),directory=path.join(root,'browser-lab-'+randomUUID());await mkdir(directory,{recursive:true});
- const files=['scripts/windows-browser-lab.ts','scripts/windows/local-fixtures.ts','server/platform/windows/browser.ts','server/platform/windows/browser-guest.ts','server/platform/windows/browser-assets.ts','server/platform/windows/desktop-install.ts','server/platform/windows/paths.ts','server/platform/windows/service.ts','server/platform/windows/manager.ts','server/platform/windows/runtime.ts','server/platform/windows/guest.ts','server/guest-browser.ts','server/guest-browser-sandbox.ts','server/vnc-display.ts','src/windows/WindowsBrowserView.tsx','src/windows/WindowsWorkspace.tsx','src/api.ts'];
+ const files=['scripts/windows-browser-lab.ts','scripts/windows/local-fixtures.ts','server/platform/windows/browser.ts','server/platform/windows/browser-guest.ts','server/platform/windows/browser-assets.ts','server/platform/windows/desktop-install.ts','server/platform/windows/paths.ts','server/platform/windows/service.ts','server/platform/windows/manager.ts','server/platform/windows/runtime.ts','server/platform/windows/guest.ts','server/guest-browser.ts','server/guest-browser-sandbox.ts','server/vnc-display.ts','src/windows/WindowsBrowserView.tsx','src/windows/WindowsWorkspace.tsx','src/api.ts',...(process.argv.includes('--broker')?['native/windows/HyperVBroker.cs','scripts/windows/hyperv.ps1','server/platform/windows/broker.ts']:[])];
  const hashes=()=>Promise.all(files.map(async file=>[file,await fileHash(file)]));const sourceHashes=Object.fromEntries(await hashes());
  await writeFile(path.join(directory,'source.json'),JSON.stringify({sourceHashes,pid:process.pid,base},null,2));
  const results:{name:string;passed:boolean}[]=[],uploads:Buffer[]=[],trace:object[]=[];let complete=false,cleanupConfirmed=false,c:WindowsConfig|undefined,service:Awaited<ReturnType<typeof createWindowsService>>|undefined,viewer:WebSocket|undefined;
@@ -38,7 +39,9 @@ async function main(){
    await this.management(config,['sudo','update-ca-certificates'],{timeoutMs:30000});
   }
  }
- const runtime=new BrowserLabRuntime(root);
+ let broker:Awaited<ReturnType<typeof startBroker>>|undefined;
+ try{if(process.argv.includes('--broker'))broker=await startBroker(await installedBrokerPath());}catch(error){await fixture.close();throw error;}
+ const runtime=new BrowserLabRuntime(root,undefined,broker);
  const curl=(config:WindowsConfig,receiver:string)=>runtime.management(config,['sudo','-n','-H','-u','mu-probe','--','env','-i','PATH=/usr/bin:/bin','curl','-q','--fail','--silent','--show-error','--max-time','4','--cacert','/etc/mucodesandbox/browser-lab-ca.crt','--proxy',`socks5h://127.0.0.1:${PROBE_PORT}`,`https://${receiver}/`],{timeoutMs:10000});
  try{
   service=await createWindowsService({rootDir:path.resolve(import.meta.dirname,'..'),dataDir:path.join(directory,'app'),runtimeRoot:root,base,runtime,probe:config=>async()=>{
@@ -81,7 +84,7 @@ async function main(){
   }
   viewer=await connectViewer();assert.equal(viewer.readyState,WebSocket.OPEN);const closed=new Promise<void>(resolve=>viewer!.once('close',()=>resolve()));fixture.interrupt();await service.manager.monitor();await closed;assert.equal((await runtime.state(c)).state,'Off');assert.equal(service.browser!.entries.size,0);pass('Upstream failure revokes browser streams and confirms Hyper-V shutdown');complete=true;
  }finally{
-  viewer?.terminate();try{await service?.close();if(c)assert.equal((await runtime.state(c)).state,'Off');cleanupConfirmed=true;}finally{await fixture.close();const sourceChangedDuringTest=JSON.stringify(sourceHashes)!==JSON.stringify(Object.fromEntries(await hashes()));await writeFile(path.join(directory,'results.json'),JSON.stringify({scope:'real-windows-browser',sourceHashes,sourceChangedDuringTest,cleanupConfirmed,results,aiWebsitesVisited:0,realAccountTests:0,complete:complete&&cleanupConfirmed&&!sourceChangedDuringTest},null,2));if(sourceChangedDuringTest)throw Error('Browser acceptance source changed during test');}
+  viewer?.terminate();try{await service?.close();if(c)assert.equal((await runtime.state(c)).state,'Off');cleanupConfirmed=true;}finally{await broker?.call('shutdown').catch(()=>{});await fixture.close();const sourceChangedDuringTest=JSON.stringify(sourceHashes)!==JSON.stringify(Object.fromEntries(await hashes()));await writeFile(path.join(directory,'results.json'),JSON.stringify({scope:'real-windows-browser',privilegeSeparated:!!broker,sourceHashes,sourceChangedDuringTest,cleanupConfirmed,results,aiWebsitesVisited:0,realAccountTests:0,complete:complete&&cleanupConfirmed&&!sourceChangedDuringTest},null,2));if(sourceChangedDuringTest)throw Error('Browser acceptance source changed during test');}
  }
  console.log(JSON.stringify({passed:results.length,complete:complete&&cleanupConfirmed}));
 }

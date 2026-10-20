@@ -41,5 +41,10 @@ id_ed25519*
 *-qr.png
 .mucodesandbox/
 .lima/
+.mu-windows/
+*.vhd
+*.vhdx
+*.iso
+windows-local*.json
 docs/current-state-snapshot.json
 docs/archive/current-state-*.json

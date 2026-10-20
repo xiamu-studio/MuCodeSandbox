@@ -68,7 +68,7 @@ export function parseEgress(output: string) {
   return receipt.parse(JSON.parse(output));
 }
 
-export async function measureEgress(runtime: LimaRuntime, e: Environment, options: RunOptions = {}): Promise<NetworkResult> {
+export async function measureEgress(runtime: Pick<LimaRuntime, 'management' | 'egressProbeProxy'>, e: Environment, options: RunOptions = {}): Promise<NetworkResult> {
   const started = performance.now();
   const dns = e.network.dns ?? { address:'1.1.1.1',serverName:'cloudflare-dns.com',port:443,path:'/dns-query' };
   const proxy = runtime.egressProbeProxy(e);

@@ -10,6 +10,8 @@ import { WindowsNetworkSession, type GuardDriver } from '../server/platform/wind
 import { HyperVRuntime, powershellArgs, powershellPath } from '../server/platform/windows/runtime.ts';
 import { run } from '../server/process.ts';
 import { WindowsHostMonitor } from '../server/platform/windows/monitor.ts';
+import {spawn} from 'node:child_process';
+import {setTimeout as delay} from 'node:timers/promises';
 
 const id='12345678-1234-4234-8234-123456789012';
 const config=()=>windowsConfigSchema.parse({version:1,id,image:path.resolve('fixture.vhd'),imageSha256:'a'.repeat(64),proxy:{mode:'http',address:'127.0.0.1',port:12345},expectedIp:'203.0.113.10'});
@@ -23,12 +25,14 @@ test('NoCloud seed contains no default gateway, package downloads, host mounts o
   const c=config(),key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestFixture';
   const seed=cloudInit(c,key,'fixture-private-not-a-real-key',key);
   const user=parse(seed['user-data']),network=parse(seed['network-config']);
-  assert.equal(user.users.find((u:{name:string})=>u.name==='dev').sudo,false);
+  assert.equal(user.users.find((u:{name:string})=>u.name==='dev').sudo,null);
   assert.equal(user.users.find((u:{name:string})=>u.name==='mu-net').uid,NET_UID);
   assert.equal(user.users.find((u:{name:string})=>u.name==='mu-probe').uid,PROBE_UID);
   assert.equal(network.ethernets.management.dhcp4,false);
   assert.equal(network.ethernets.management.dhcp6,false);
   assert.equal(network.ethernets.management['accept-ra'],false);
+  assert.equal(network.ethernets.management['set-name'],'eth0');
+  assert.equal(network.ethernets.management.optional,true);
   assert.equal(network.ethernets.management.routes,undefined);
   assert.equal(user.packages,undefined);assert.equal(user.mounts,undefined);
   assert.equal(user.ssh_pwauth,false);
@@ -76,7 +80,10 @@ test('A late startup probe after shutdown cannot activate a permit',async()=>{
 });
 test('Every shutdown path is attempted even if SSH revocation fails',async()=>{
   const f=fixture();f.d.revoke=async()=>{throw Error('SSH gone');};
-  await assert.rejects(f.session.fail());assert.ok(f.calls.includes('disconnect'));assert.ok(f.calls.includes('stop'));
+  await f.session.fail();assert.equal(f.session.cleanupWarnings.length,1);assert.ok(f.calls.includes('disconnect'));assert.ok(f.calls.includes('stop'));
+});
+test('An unconfirmed hypervisor shutdown remains an error',async()=>{
+  const f=fixture();f.d.stop=async()=>{throw Error('Hyper-V unavailable');};await assert.rejects(f.session.fail());assert.equal(f.session.state,'failed');
 });
 test('Host changes, failed snapshots and long suspend gaps close protection',async()=>{
   for(const mode of ['change','error','sleep','backwards']){
@@ -93,6 +100,30 @@ test('Host changes, failed snapshots and long suspend gaps close protection',asy
 test('Windows doctor actually queries this machine without creating resources',{skip:process.platform!=='win32'},async()=>{
   const f=new HyperVRuntime(path.join(tmpdir(),'mu-windows-doctor'));
   const result=await f.info();assert.equal(typeof result.available,'boolean');assert.ok(Array.isArray(result.issues));
+});
+test('PowerShell JSON transport preserves Chinese paths and suppresses progress XML',{skip:process.platform!=='win32'},async()=>{
+  const input=JSON.stringify({path:'C:\\Users\\测试用户\\虚拟机',value:'输入与输出'});
+  const output=await run(powershellPath(),powershellArgs("Write-Progress -Activity 'module initialization' -Status 'loading'; [Console]::Out.Write([Console]::In.ReadToEnd())"),{input});
+  assert.equal(output,input);
+});
+test('Native Hyper-V helper builds, validates endpoint layout and rejects wildcard IDs',{skip:process.platform!=='win32'},async()=>{
+  const directory=await mkdtemp(path.join(tmpdir(),'mu-channel-'));
+  try{
+    const runtime=new HyperVRuntime(directory),helper=await runtime.channelHelper();
+    assert.match(await run(helper,['--self-test']),/layout verified/);
+    await assert.rejects(run(helper,['00000000-0000-0000-0000-000000000000']));
+  }finally{await rm(directory,{recursive:true,force:true});}
+});
+test('The loopback transport exits when its owning controller is killed',{skip:process.platform!=='win32',timeout:15000},async()=>{
+  const directory=await mkdtemp(path.join(tmpdir(),'mu-channel-owner-'));let owner:ReturnType<typeof spawn>|undefined,helperPid=0;
+  try{
+    const helper=await new HyperVRuntime(directory).channelHelper();
+    const code=`const {spawn}=require('node:child_process');const c=spawn(${JSON.stringify(helper)},['--listen','12345678-1234-4234-8234-123456789012',String(process.pid)],{stdio:['pipe','pipe','pipe']});c.stdout.once('data',b=>process.stdout.write(JSON.stringify({pid:c.pid,port:JSON.parse(b.toString()).port})+'\\n'));setInterval(()=>{},1000);`;
+    owner=spawn(process.execPath,['-e',code],{stdio:['pipe','pipe','pipe']});
+    const ready=await new Promise<{pid:number;port:number}>((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Controller fixture did not start')),5000);owner!.stdout!.once('data',b=>{clearTimeout(timer);try{resolve(JSON.parse(b.toString()));}catch(e){reject(e);}});owner!.once('error',reject);});
+    helperPid=ready.pid;assert.ok(ready.port>0);owner.kill('SIGKILL');
+    const deadline=Date.now()+5000;for(;;){try{process.kill(helperPid,0);}catch(e){if((e as NodeJS.ErrnoException).code==='ESRCH')break;throw e;}assert.ok(Date.now()<deadline,'Native transport survived controller exit');await delay(100);}
+  }finally{owner?.kill();if(helperPid)try{process.kill(helperPid);}catch{}await rm(directory,{recursive:true,force:true});}
 });
 test('Windows IMAPI creates a readable NoCloud ISO with exact filenames',{skip:process.platform!=='win32'},async()=>{
   const root=await mkdtemp(path.join(tmpdir(),'mu-iso-'));

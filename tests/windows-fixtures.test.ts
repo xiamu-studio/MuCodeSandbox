@@ -27,6 +27,6 @@ test('Local TLS/CONNECT fixtures accept only the two synthetic destinations',{sk
       const req=request({host:'127.0.0.1',port:f.port,method:'CONNECT',path:'unapproved.invalid:443'});
       req.on('error',reject);req.on('connect',(res,socket)=>{socket.destroy();resolve(res.statusCode);});req.end();
     });
-    assert.equal(code,403);assert.deepEqual(f.counters(),{receipts:2,denied:1});
+    assert.equal(code,403);assert.deepEqual(f.counters(),{receipts:2,denied:1,dnsRequests:0});
   }finally{await f.close();await rm(root,{recursive:true,force:true});}
 });

@@ -21,6 +21,7 @@ export class WindowsNetworkSession {
   private generation=0;
   private ticking=false;
   private failure:Promise<void>|undefined;
+  cleanupWarnings:unknown[]=[];
   readonly driver:GuardDriver;
   readonly expectedIp:string;
   constructor(driver:GuardDriver,expectedIp:string) {
@@ -67,7 +68,12 @@ export class WindowsNetworkSession {
     this.failure=(async()=>{
       const results=await Promise.allSettled([this.driver.disconnect(),this.driver.revoke(),this.driver.stop()]);
       const errors=results.filter(r=>r.status==='rejected');
-      if(errors.length)throw new AggregateError(errors.map(r=>(r as PromiseRejectedResult).reason),'Network closed; one or more VM cleanup operations failed');
+      this.cleanupWarnings=errors.map(r=>(r as PromiseRejectedResult).reason);
+      // stop() must independently prove hypervisor state Off. Once confirmed,
+      // a racing guest SSH revocation failure is a cleanup warning, not an
+      // unproven network shutdown. An unconfirmed hypervisor stop still fails.
+      if(results[2].status==='fulfilled')return;
+      if(errors.length)throw new AggregateError(errors.map(r=>(r as PromiseRejectedResult).reason),'Protection failed; one or more cleanup operations could not be confirmed');
     })();
     return this.failure;
   }

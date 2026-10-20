@@ -6,13 +6,14 @@ import { leaseFiles, leaseRules, LEASE_HELPER_PATH } from '../../guest-lease.ts'
 import { transparentConfig, startTransparentScript, SING_BOX_VERSION } from '../../transparent-network.ts';
 import { CONFIGURE_NETWORKD_SCRIPT } from '../../guest-networkd.ts';
 import { NET_UID, PROBE_UID, PROBE_PORT, RELAY_PORT, vmIdentity, type WindowsConfig } from './config.ts';
+import { GUEST_CHANNEL, GUEST_CHANNEL_UNIT } from './channel.ts';
 
 export function windowsEnvironment(c: WindowsConfig): Environment {
   return { id:c.id, instanceName:vmIdentity(c.id).name, name:'Windows preview', description:'', kind:'vm', color:'blue',
     cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB,mounts:[],ports:[],browserUrl:'about:blank',
     identity:{timezone:c.timezone,locale:'en-US'},state:'running',lastError:null,browserRunning:false,createdAt:'',updatedAt:'',
     network:{mode:c.proxy.mode,host:'127.0.0.1',port:RELAY_PORT,username:c.proxy.username,password:c.proxy.password,
-      strict:true,transparent:true,noProxy:'',egressLock:{expectedIp:c.expectedIp},
+      strict:true,transparent:true,noProxy:'',egressLock:{expectedIp:c.expectedIp},...(c.dns?{dns:c.dns}:{}),
       ...(c.proxy.mode==='https'?{tls:{serverName:c.proxy.serverName!}}:{})} };
 }
 
@@ -21,21 +22,23 @@ export function cloudInit(c: WindowsConfig, publicKey: string, hostPrivate: stri
   const n=vmIdentity(c.id);
   const userData = '#cloud-config\n'+stringify({
     hostname:'mu-linux',manage_etc_hosts:true,timezone:c.timezone,ssh_pwauth:false,disable_root:true,
-    ssh_deletekeys:true,ssh_genkeytypes:[],ssh_keys:{ed25519_private:hostPrivate,ed25519_public:hostPublic.trim()},
+    ssh_deletekeys:true,ssh_keys:{ed25519_private:hostPrivate.replaceAll('\r\n','\n'),ed25519_public:hostPublic.trim()},
     users:[{name:'mu',uid:2000,lock_passwd:true,shell:'/bin/bash',sudo:'ALL=(ALL) NOPASSWD:ALL',ssh_authorized_keys:[publicKey.trim()]},
-      {name:'dev',uid:2001,lock_passwd:true,shell:'/bin/bash',sudo:false},
+      {name:'dev',uid:2001,lock_passwd:true,shell:'/bin/bash',sudo:null},
       {name:'mu-net',uid:NET_UID,system:true,no_create_home:true,shell:'/usr/sbin/nologin'},
       {name:'mu-probe',uid:PROBE_UID,system:true,no_create_home:true,shell:'/usr/sbin/nologin'}],
     write_files:[
       {path:'/etc/ssh/sshd_config.d/90-mucodesandbox.conf',owner:'root:root',permissions:'0600',content:'PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\nAllowUsers mu\nAllowAgentForwarding no\nX11Forwarding no\nGatewayPorts no\n'},
       {path:'/etc/sysctl.d/90-mucodesandbox.conf',owner:'root:root',permissions:'0644',content:'net.ipv6.conf.all.disable_ipv6=1\nnet.ipv6.conf.default.disable_ipv6=1\nnet.ipv4.ip_forward=0\n'},
+      {path:'/usr/local/libexec/mu-hv-ssh',owner:'root:root',permissions:'0700',content:GUEST_CHANNEL},
+      {path:'/etc/systemd/system/mu-hv-ssh.service',owner:'root:root',permissions:'0644',content:GUEST_CHANNEL_UNIT},
     ],
     // No package downloads on boot. Hyper-V ACLs already restrict the NIC to
     // management SSH before the first instruction executes in this VM.
-    runcmd:[['chmod','0700','/home/mu','/home/dev'],['sysctl','--system']],
+    runcmd:[['chmod','0700','/home/mu','/home/dev'],['sysctl','--system'],['systemctl','daemon-reload'],['systemctl','enable','--now','mu-hv-ssh.service']],
   });
-  return {'user-data':userData,'meta-data':stringify({'instance-id':c.id,'local-hostname':'mu-linux'}),
-    'network-config':stringify({version:2,ethernets:{management:{match:{macaddress:n.mac.match(/../g)!.join(':').toLowerCase()},set_name:'eth0',dhcp4:false,dhcp6:false,'accept-ra':false,addresses:[`${n.guest}/30`],optional:false}}})};
+  return {'user-data':userData,'meta-data':stringify({'instance-id':c.id,'local-hostname':'mu-linux','dsmode':'local'}),
+    'network-config':stringify({version:2,ethernets:{management:{match:{macaddress:n.mac.match(/../g)!.join(':').toLowerCase()},'set-name':'eth0',dhcp4:false,dhcp6:false,'accept-ra':false,addresses:[`${n.guest}/30`],optional:true}}})};
 }
 
 // Package installation uses only the explicitly configured SSH-forwarded
@@ -45,6 +48,7 @@ export function bootstrapScript(c: WindowsConfig) {
   url.username=c.proxy.username;url.password=c.proxy.password;
   return `set -euo pipefail
 sudo cloud-init status --wait >/dev/null
+printf 'datasource_list: [NoCloud]\\n' | sudo tee /etc/cloud/cloud.cfg.d/99-mucodesandbox-datasource.cfg >/dev/null
 sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 update -qq
 sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 install -y --no-install-recommends nftables curl ca-certificates python3 iproute2 locales
 ${CONFIGURE_NETWORKD_SCRIPT}
@@ -97,6 +101,12 @@ export function configureWindowsGuard(c: WindowsConfig, session = randomUUID()) 
   const lease=leaseFiles(leaseRules(n.host,NET_UID,PROBE_UID,NET_UID));
   const tunnel=transparentConfig(e,'127.0.0.1',NET_UID,[n.subnet],PROBE_PORT);
   const script=`set -euo pipefail
+# Management and approved forwarding use Hyper-V sockets. Waiting for an
+# ordinary IP network is unnecessary on this intentionally isolated VM.
+sudo systemctl mask --now systemd-networkd-wait-online.service >/dev/null
+test "$(id -u mu-net)" = '${NET_UID}'
+test "$(id -u mu-probe)" = '${PROBE_UID}'
+test "$(id -u dev)" = '2001'
 ${applyGuardScript(rules,['127.0.0.1:'+RELAY_PORT],guestEnvironment(e),true)}
 sudo install -d -m 0700 /run/mucodesandbox-lease
 sudo install -d -m 0755 /etc/systemd/system/mucodesandbox-egress.service.d
@@ -114,7 +124,7 @@ ${startTransparentScript(tunnel)}
 // nftables' expiring element is intentionally removed from the integrity
 // digest. Chain/rule changes and all other tables remain part of the digest.
 export const INSPECT_WINDOWS_GUARD = `sudo python3 - <<'MU_INSPECT'
-import hashlib,json,subprocess,os
+import hashlib,json,subprocess,os,stat
 def cmd(*a): return subprocess.run(a,check=True,capture_output=True,text=True).stdout
 tables=[]
 for name in ['mu_egress','mu_lease']:
@@ -129,15 +139,20 @@ for name in ['mu_egress','mu_lease']:
    return v
   tables.append(clean(item))
 files={}
-for f in ['/etc/mucodesandbox/network.nft','/etc/mucodesandbox/lease.nft','/etc/mucodesandbox/tunnel.json','/usr/local/libexec/mu-network-lease','/etc/systemd/system/mucodesandbox-egress.service','/etc/systemd/system/mucodesandbox-egress.service.d/lease.conf','/etc/systemd/system/mucodesandbox-lease.service','/etc/systemd/system/mucodesandbox-tunnel.service']:
- s=os.stat(f)
- if s.st_uid!=0 or s.st_mode & 0o022: raise RuntimeError('Unsafe guard file ownership')
+for f in ['/etc/mucodesandbox/network.nft','/etc/mucodesandbox/lease.nft','/etc/mucodesandbox/tunnel.json','/usr/local/libexec/mu-network-lease','/etc/systemd/system/mucodesandbox-egress.service','/etc/systemd/system/mucodesandbox-egress.service.d/lease.conf','/etc/systemd/system/mucodesandbox-lease.service','/etc/systemd/system/mucodesandbox-tunnel.service','/etc/systemd/resolved.conf.d/mucodesandbox.conf','/etc/systemd/networkd.conf.d/99-mucodesandbox.conf']:
+ s=os.lstat(f)
+ if not stat.S_ISREG(s.st_mode) or s.st_uid!=0 or s.st_mode & 0o022: raise RuntimeError('Unsafe guard file ownership')
  with open(f,'rb') as h: files[f]=hashlib.sha256(h.read()).hexdigest()
 for service in ['mucodesandbox-egress','mucodesandbox-lease','mucodesandbox-tunnel']:
  cmd('systemctl','is-active',service)
  cmd('systemctl','is-enabled',service)
 cmd('ip','link','show','mu_tun')
+cmd('systemctl','is-active','systemd-resolved')
+dns=cmd('resolvectl','dns');domains=cmd('resolvectl','domain')
+if 'Global: 172.19.0.2' not in dns or 'Global: ~.' not in domains or os.path.realpath('/etc/resolv.conf')!='/run/systemd/resolve/stub-resolv.conf': raise RuntimeError('Controlled DNS configuration changed')
+def ordered(value): return sorted(value,key=lambda x:json.dumps(x,sort_keys=True))
+network={'rules':ordered(json.loads(cmd('ip','-j','rule','show'))),'routes':ordered(json.loads(cmd('ip','-j','route','show','table','all'))),'dns':dns,'domains':domains}
 lease=json.loads(cmd('/usr/local/libexec/mu-network-lease','status'))
-digest=hashlib.sha256(json.dumps([tables,files],sort_keys=True,separators=(',',':')).encode()).hexdigest()
+digest=hashlib.sha256(json.dumps([tables,files,network],sort_keys=True,separators=(',',':')).encode()).hexdigest()
 print(json.dumps({'digest':digest,'leaseActive':lease['active'],'remainingMs':lease['remainingMs']}))
 MU_INSPECT`;

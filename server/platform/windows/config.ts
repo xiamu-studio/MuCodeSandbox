@@ -22,12 +22,15 @@ export const windowsConfigSchema = z.object({
     serverName: z.string().regex(/^[a-zA-Z0-9.-]+$/).optional(),
   }).strict().refine(v => v.mode !== 'https' || !!v.serverName, 'HTTPS proxy requires a TLS server name'),
   expectedIp: z.string().refine(isIPv4),
+  dns:z.object({address:z.string().refine(isIPv4),serverName:z.string().regex(/^[a-zA-Z0-9.-]+$/),port:z.number().int().min(1).max(65535),path:z.string().regex(/^\/[a-zA-Z0-9/_?=.%+-]*$/)}).strict().optional(),
 }).strict();
 export type WindowsConfig = z.infer<typeof windowsConfigSchema>;
 export const RELAY_PORT = 17401;
 export const PROBE_PORT = 17402;
-export const NET_UID = 991;
-export const PROBE_UID = 992;
+// Reserved before package installation; 991 is systemd-resolve in the pinned
+// Canonical image and must never be mistaken for our tunnel identity.
+export const NET_UID = 970;
+export const PROBE_UID = 971;
 
 export function vmIdentity(id: string) {
   z.uuid().parse(id);

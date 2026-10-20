@@ -1,87 +1,65 @@
 # Windows Hyper-V 开发预览
 
-本轮只交付虚拟机与网络防护的独立开发入口，不把 Mac 桌面应用标为已支持 Windows。真实 VM 启动、客体内核断网及 Windows 故障场景尚未验收。
+分支：`codex/windows-hyperv`。Mac 基线：`cfcb5f9263dcd02cfa725e6d9aee80b065b98aa1`（0.4.65）。
 
-## 隔离现有 Mac 版本
+真实 Linux VM 已完成创建、启动、认证管理连接、组件安装和空白受保护基盘导出。首轮内核 8/8、扩展 DNS/持续流/故障矩阵 16/16、进程强退和双环境矩阵 7/7 通过，最终源码绑定验证继续进行。Windows 桌面 UI、日常文件工具、快照/备份和安装包仍未交付，不能标为完整 Windows 版本。
 
-- 基线为 `cfcb5f9263dcd02cfa725e6d9aee80b065b98aa1`（0.4.65），开发分支 `codex/windows-hyperv`。
-- Mac 的 Manager、Lima/VZ 配置、Swift 助手、桌面入口与打包命令保持原样。Windows 预览通过单独 CLI 进入，未接入现有 Manager。
-- 唯一共用源文件调整是 `measureEgress` 的 TypeScript 参数类型收窄为实际使用的两个方法，函数运行逻辑不变。
-- Windows 使用独立数据根和独立镜像，不读取 Mac 数据库、虚拟磁盘、登录资料或代理配置。不改版本号，不生成或安装 Mac 新包。
+## 与 Mac 隔离
 
-## 本阶段设计
+Mac 的 Manager、Lima/VZ、Swift 助手、桌面入口和打包命令保持不变。Windows 使用独立 CLI、数据根、镜像和密钥。共用文件 `server/egress.ts` 只收窄了 TypeScript 参数类型，运行逻辑不变。未替换 Mac 应用，未修改 `main`。
 
-每环境独立 Hyper-V VM、内部交换机、管理密钥和固定管理子网。创建时先安装虚拟网卡 ACL，再允许启动；两方向默认拒绝全部 IP，仅放行管理宿主与客体间的 SSH。不开通 NAT、ICS、物理桥接或默认交换机，不更改其他 VM。
+## 当前架构
 
-Ubuntu x86_64 内继续使用现有 nftables 默认拒绝、sing-box TUN、受控 DNS 和 45 秒内核联网许可。业务 UDP/IPv6 不放行。宿主 SSH 反向转发仅连接明确配置的上游；无直连备用路径。出口通过至少两个不同接收端核验后才激活业务许可。失败会分别尝试断开唯一宿主通道、撤销客体许可和关闭 VM；一次失败的会话不可恢复续期。
+每环境独立 Hyper-V VM、专属 **Private** 交换机和双向拒绝全部 IP 的网卡 ACL。不创建宿主虚拟网卡、NAT、ICS、物理桥接或自动开机。
 
-网络快照独立轮询，不受出口探测等待阻塞；地址、DNS、路由变化、快照失败或明显休眠间隔触发关闭。快照仅用于内存摘要，不写入代码或常规日志。真实切网/休眠尚需实机验证。
+管理通路为：Windows 控制器 → 每控制器独占的 127.0.0.1 临时端口 → 原生 AF_HYPERV 客户端 → 指定 VM GUID 的 Linux AF_VSOCK → 客体回环 SSH。SSH 私钥、固定 HostKeyAlias 和独立主机密钥负责认证；原生助手只接受明确 VM GUID，不接受通配 VM。没有宿主 shell、文件服务或普通 IP 后备通道。控制器退出时助手关闭全部连接。
 
-镜像入口采用 Canonical 官方 AMD64 Azure VHD，并转换为 VHDX。该镜像使用 BIOS，因此本阶段为 Generation 1 VM；不关闭宿主或其他 VM 的 Secure Boot。正常云镜像、Generation 2 与 Secure Boot 镜像链另行验证，未声称已实现。
+实机发现现有宿主代理路由会影响普通 TCP 管理路径，因此改用 Hyper-V 专用通道，未修改用户代理设置。产品服务 GUID 首次注册需要管理员权限，不覆盖其他应用的服务项。当前仍是管理员运行的开发预览，产品化还需最小权限代理和签名发布。
 
-## 前置条件
+业务流量在 Linux 内经过 nftables、sing-box TUN、受控 DoH 和 45 秒内核联网许可，再通过 SSH 反向转发到唯一配置的上游。网络与探测身份为专用 UID 970/971；安装规则前核验实际身份。业务 UDP/IPv6 不放行，没有直连后备路径。
 
-Windows 11 专业版、可用的 Hyper-V、管理员 PowerShell、Windows OpenSSH、Node.js 24.15.0 或更高版本。开发预览暂以管理员运行生命周期操作；产品化时需要拆出最小权限的宿主代理，不能把管理员运行开发 CLI 当作最终权限模型。
+生产启动先检查关闭的客体防护，再建立转发。至少两个不同接收端的有效回执一致且符合批准出口，才开放业务许可。持续检查内核规则、文件权限、路由、DNS、宿主网络和许可。异常分别尝试断开通道、撤销许可和关闭 VM；停机确认独立于 ACL 完整性。
 
-`npm run windows:dev -- doctor` 只读检查。初检时本机缺少 Hyper-V 管理模块及运行中的 VM 管理服务，且当前进程未提升权限。2026-10-20 按用户“现在启用，不自动重启”的授权执行功能启用脚本，系统返回成功及 `RestartNeeded=true`；复核存在系统待重启标记，管理模块和 VM 服务尚未可用。没有执行重启，真实 VM 测试仍未执行。CPU/本机地址等检查资料不存入本文件。
+45 秒许可存在时间窗口，不承诺瞬时断网、抵抗客体 root 完全失陷、隐藏虚拟化或保证账号不被关联。
 
-管理员可运行 `scripts/windows/enable-hyperv.ps1` 启用功能。脚本使用 `-NoRestart`，不会自动重启。本机已完成该启用步骤，无需再次重复运行；重启由用户保存工作后自行安排。完整本机执行回执仅保存在 Git 忽略的数据目录中。
+## 组件和基盘
 
-## 本地验证
+需要 Windows 11 专业版、Hyper-V、OpenSSH 和 Node.js 24.15.0+。本机已完成 Hyper-V 启用和重启。没有真实账号或 AI 网站测试。
+
+使用固定摘要的 Canonical AMD64 Azure VHD 和 sing-box 1.14.3。下载支持受限并行分段、断点续传和最终整体 SHA-256。未校验文件不会作为组件发布。
+
+导入仅在新建测试目录生成非稀疏副本，原始镜像不变。固定镜像的 Azure-only cloud-init 配置通过绑定完整源摘要、ext4 文件定位及等长前后字节校验的配方改为 NoCloud；不对其他镜像猜测偏移。该 VHD 使用 Generation 1/BIOS，没有关闭宿主或其他 VM 的 Secure Boot。Generation 2 与完整签名镜像链仍待安排。
 
 ```powershell
 npm ci --ignore-scripts --no-audit --no-fund
-npm run test:windows
-npm run build
 npm run windows:dev -- doctor
+npm run windows:dev -- download-base
+npm run windows:dev -- download-tunnel
+npm run windows:build-base -- <本地原始VHD> <SHA-256>
 ```
 
-`--ignore-scripts` 适用于本阶段 CLI 和测试，不代表 Electron 原生终端组件已构建。预览不启动 Electron，不打开浏览器，不访问 AI 网站，不代替用户登录。初检使用系统 Node.js 24.14.1，随后从官方来源下载并核验 Node.js 24.15.0，在独立工具目录重跑本轮测试、基线对照和完整构建，均以该版本记录最终结果；未更改系统 Node 安装。
+构建器仅创建空白 VM。初始化代理只允许读取 Ubuntu 官方包来源，之后关闭。导出前清理管理授权、客体 SSH 主机密钥和 cloud-init/机器身份，写入关闭规则并同步。离线检查已确认导出盘含隧道二进制与关闭规则，旧 SSH 主机私钥和授权文件不存在。这是本地实验基盘，尚不是完成隐私和发行审计的分发镜像。
 
-本地合成 HTTPS 代理只接受两个 RFC 5737 测试地址，将它们转到宿主回环接收器，拒绝其他目的地。证书及私钥现场生成，保存在临时目录或独立数据根中，测试正常结束后清理临时证书。
+失败的空白构建可用 `--resume-builder <旧任务config.json>` 显式继续。要求配置在本数据根内、旧任务失败、旧控制器已退出、源身份一致，且实际 VM 已关闭。不能用于用户环境迁移。
 
-## 准备客体镜像
+数据根默认位于用户本机 `MuCodeSandbox-WindowsPreview`，可通过 `MU_WINDOWS_DATA_DIR` 设置。配置、证书、密钥、磁盘和原始运行报告不提交 Git。
 
-以下是待实机验证的开发流程，不是已完成的验收结果：
-
-1. 启用 Hyper-V 并完成必要重启，重新执行 `doctor`。
-2. `npm run windows:dev -- download-base` 下载固定版本的 Canonical VHD 归档，核验固定 SHA-256 后提取镜像；提取可能占用数十 GiB 磁盘。记录命令返回的本地路径和提取文件的 SHA-256，仅保存在本机。
-3. `npm run windows:dev -- download-tunnel` 下载并核验固定版本 AMD64 sing-box。
-4. 在独立数据根创建本地配置 JSON，填入镜像路径、摘要和自己批准的上游。配置结构见 `server/platform/windows/config.ts`。本机配置和凭据不应提交到 Git。
-5. `npm run windows:dev -- create <本机配置.json>` 创建停止状态的隔离 VM。
-6. `npm run windows:dev -- bootstrap <本机配置.json>` 通过唯一批准的 SSH 转发安装 Ubuntu 包和隧道组件，写入默认关闭规则后停止 VM。只访问软件包来源，不执行账号测试。HTTPS 代理的初始化兼容性仍需验证，初始化失败不得绕过证书或改走直连。
-7. 只有全新、未承载用户资料且不含代理用户名/密码的构建 VM，才能执行 `freeze-base`；该操作清理当前管理授权与 cloud-init 状态，停止 VM 并导出本地实验基础盘。它不是用户环境备份/迁移功能，也不是完成隐私审计的分发镜像。
-8. 对导出盘记录本地 SHA-256，以该盘启动下面的完全本地实验。
-
-`run <本机配置.json>` 是显式启动生产路径的开发命令，会使用现有公共 IP 接收服务核验出口；本轮没有运行它。测试入口使用本地接收器覆盖此路径，不访问这些公共接收服务。
-
-## 真实 VM 合成实验（待执行）
+## 验证与剩余项
 
 ```powershell
-npm run windows:lab -- <本地实验基础盘.vhdx> <SHA-256>
+npm run test:windows
+npm run build
+npm run windows:lab -- <空白受保护基盘.vhdx> <SHA-256>
 ```
 
-需要本机 OpenSSL（默认使用 Git for Windows 自带版本，或通过 `MU_OPENSSL_PATH` 指定）。只创建新测试 VM，不导入用户账号/文件，不删除既有 VM。测试 VM 最终停止并保留，以便检查。基础盘必须已含 nftables、curl、Python 和固定版本 sing-box；本地实验本身不联网安装包。
+`--ignore-scripts` 仅适用于本阶段 CLI，不代表 Electron 原生终端已经构建。
 
-实验设计覆盖：核验前拒绝业务、两个本地 HTTPS 回执、批准通道下开发用户联网、禁止滥用探测例外、禁止直连宿主服务、45 秒许可到期后拒绝新连接、拒绝过期续期并停机。报告仅留在独立数据根。这里的八项属于待执行清单，不能用状态机单测代替内核实测。
+首轮真实 Hyper-V 8/8：核验前拒绝业务、双本地 HTTPS 回执批准、受管 TCP、禁止滥用探测例外、禁止直连宿主、45 秒到期后拒绝新连接、拒绝过期续期、异常后确认 VM 停止。实验代理只映射保留测试地址到本机回环服务，其他目标拒绝。
 
-下一步还要补实机代理中断、已有连接在到期后的行为、ACL/规则篡改、切网/休眠、进程强退、第二环境隔离和开机首包抓取。尚未交付 Windows 界面、文件共享/桥接、备份迁移、WireGuard、安装包、签名及真实 Mac 回归。
+扩展实测已通过 DNS、已建立流、代理/DNS 失败、规则/路由/Hyper-V ACL 篡改。另已通过控制进程强退、同一运行时双环境独立转发和许可、独立文件和身份、A 故障后 B 继续正常使用。首包/逐包证据、真实切网/睡眠、Windows UI 与安装包仍须单独验收，不能由单测代替。例行关闭先断开出口，再限时同步客体磁盘并确认 Hyper-V 状态 Off；同步失败不能阻止强制停机。
 
-## 本轮结果（2026-10-20）
+原有六组网络测试在 Windows 上为 27/39，原始 `main` 独立副本同为 27/39，失败项目一致，涉及 Unix curl 路径、目录 fsync 和旧的 4 秒超时断言。没有为掩盖这些基线失败修改 Mac 行为；真实 Mac 回归未进行。
 
-- 新增 Windows 测试：12 项通过，包含本机 Hyper-V 只读诊断、Windows IMAPI 创建并读取 NoCloud ISO，以及真实回环 TLS/CONNECT 接收器。其余为配置和故障状态机测试。
-- TypeScript 检查通过；完整构建通过；PowerShell 脚本语法检查通过。
-- 原有网络相关六个测试文件：39 项中 27 通过、12 失败。在原始 `main` 的独立源码副本执行相同测试，结果同为 27/39，失败项目一致。主要原因是 Windows 不支持原 Mac 路径的目录 fsync、测试依赖 Unix curl 路径，以及旧测试仍要求 4 秒而代码已使用 8 秒连接等待。没有为掩盖基线失败去修改 Mac 行为。
-- Mac 核心文件与基线无差异；未在 Mac 上运行回归或重新打包。
-- 真实 Hyper-V VM 尚未启动，不能标记 Windows 防护达到 Mac 同等实测水平。
+完整剩余工作见 [Windows 工作清单](windows-work-plan.md)。
 
-## 源码入口
-
-- `server/platform/contract.ts`：预览生命周期接口。
-- `server/platform/windows/`：配置、NoCloud、Hyper-V、隧道、许可会话和宿主监测。
-- `scripts/windows/`：Hyper-V 操作、启动介质和可审阅的功能启用脚本。
-- `scripts/windows-dev.ts`：独立开发入口。
-- `scripts/windows-lab.ts`：真实 VM 的本地合成实验。
-- `tests/windows-platform.test.ts`、`tests/windows-fixtures.test.ts`：本轮已执行测试。
-
-官方来源：[Hyper-V 要求](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/host-hardware-requirements)、[虚拟网卡扩展 ACL](https://learn.microsoft.com/en-us/powershell/module/hyper-v/add-vmnetworkadapterextendedacl)、[NoCloud](https://docs.cloud-init.io/en/latest/reference/datasources/nocloud.html)、[IMAPI ISO](https://learn.microsoft.com/en-us/windows/win32/api/imapi2fs/nf-imapi2fs-ifilesystemimage-createresultimage)、[Canonical 固定镜像校验表](https://cloud-images.ubuntu.com/releases/noble/release-20261017/SHA256SUMS)。
+官方参考：[Hyper-V sockets](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/make-integration-service)、[网卡 ACL](https://learn.microsoft.com/en-us/powershell/module/hyper-v/add-vmnetworkadapterextendedacl)、[NoCloud](https://docs.cloud-init.io/en/latest/reference/datasources/nocloud.html)、[Canonical 校验表](https://cloud-images.ubuntu.com/releases/noble/release-20261017/SHA256SUMS)。

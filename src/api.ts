@@ -1,5 +1,5 @@
 import type { Environment, Snapshot, Job, LogEntry, AgentStatus, Metrics, NetworkResult, NetworkProtection, BrowserInspection, BrowserVersionStatus, LabInfo, LocalCheckReport, EnvironmentSnapshot, BridgeGrant, EgressStatus, HostCommand } from '../shared/types.ts';
-import type { NetworkObservations } from '../shared/network-observations.ts';
+import type { ConnectionQuery,NetworkObservations } from '../shared/network-observations.ts';
 import type { DisplayRequest, GuestDisplay } from '../shared/guest-display.ts';
 import type { DesktopAppId,DesktopAppsStatus } from '../shared/guest-desktop.ts';
 import type {AccessLatency,LatencyTarget} from '../shared/latency.ts';
@@ -8,7 +8,7 @@ import type {ProtectionEvent} from '../shared/protection-events.ts';
 declare global {
   interface Window {
     __MU_CONFIG__: { token: string; version: string };
-    muDesktop?: { onGuestApplication?:(callback:(value:{id:string;target:'browser'|'desktop';application?:string})=>void)=>()=>void; browserAction(input: { id: string; action: string; url?: string }): Promise<void>; onBrowserState(callback: (state: BrowserState) => void): () => void };
+    muDesktop?: { readClipboardImage?:()=>Promise<import('../shared/clipboard-image.ts').ClipboardImage>; onGuestApplication?:(callback:(value:{id:string;target:'browser'|'desktop';application?:string})=>void)=>()=>void; browserAction(input: { id: string; action: string; url?: string }): Promise<void>; onBrowserState(callback: (state: BrowserState) => void): () => void };
   }
 }
 export interface BrowserState { url: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean }
@@ -30,7 +30,7 @@ export const api = {
   desktopApps:(id:string)=>request<DesktopAppsStatus>(`/environments/${id}/desktop-apps`),
   desktopAppAction:(id:string,application:DesktopAppId,action:'install'|'start'|'stop')=>request<Job>(`/environments/${id}/desktop-apps/${application}/${action}`,{method:'POST',body:'{}'}),
   cleanRebuild:(id:string)=>request<{job:Job;replacementEnvironmentId:string}>(`/environments/${id}/rebuild-clean`,{method:'POST',body:JSON.stringify({confirm:'erase-entire-environment'})}),
-  networkObservations:(id:string)=>request<NetworkObservations>(`/environments/${id}/network/observations`),
+  networkObservations:(id:string,query?:ConnectionQuery)=>{const params=new URLSearchParams();if(query){params.set('scope',query.scope??'traffic');if(query.q)params.set('q',query.q);if(query.failures)params.set('failures','1');if(query.before!==undefined)params.set('before',String(query.before));}return request<NetworkObservations>(`/environments/${id}/network/observations${params.size?'?'+params:''}`);},
   sampleNetwork:(id:string)=>request<NetworkObservations>(`/environments/${id}/network/observations`,{method:'POST',body:'{}'}),
   bridgeGrants: (id:string) => request<BridgeGrant[]>(`/environments/${id}/bridge`),
   grantBridge: (id:string,root:string,writable:boolean,minutes:number,commands:HostCommand[]=[]) => request<Job>(`/environments/${id}/bridge`,{method:'POST',body:JSON.stringify({root,writable,minutes,commands})}),

@@ -1,7 +1,9 @@
 # MuCodeSandbox
 
 在自己的 Mac 上管理独立 Linux 虚拟机、浏览器和开发终端。
-当前源码版本为 **0.4.53 本机测试版**。这是 Apple Silicon Mac 上的本地项目，尚不是已签名、公证的正式发行版。
+当前源码及其他Mac测试安装包为 **0.4.65**，本机仍运行 **0.4.64**。DMG仅面向Apple Silicon，构建目标macOS13及以上；新资料服务启动和镜像检查已通过，第二台Mac与旧系统仍待实机验证。尚不是已签名、公证的正式发行版。
+
+其他Mac安装包及验证说明见[分发记录](docs/mac-distribution-validation-2026-10-20.md)。
 
 ## 从这里开始
 
@@ -29,6 +31,11 @@
 联网保护要求至少两份独立、有效且与批准出口一致的检测结果，异常时关闭访问。
 DeepSeek Key仅在本机加密保存，点击翻译才发送原文，不自动重试或回退直连。
 文件面板按需读取列表；不常用的Key设置位于“帮助与更多操作”中。
+连接日志出口 **0.4.59 已安装**：每条记录右侧常显当时检测出口和时间，窄屏换行，不用当前IP补历史；67个后台服务模块和桌面桥接不变，见[验证记录](docs/connection-exit-display-validation-2026-10-19.md)。
+连接日志 **0.4.58 已安装**：参考Clash的紧凑列表/暂停，分开出口检测，搜索已保留历史并分页；不改防护、DNS或路由，见[验证记录](docs/network-log-visibility-validation-2026-10-19.md)。
+画面直接图片⌘V **0.4.57 已安装**：拦截裸v，确认后发Linux Ctrl+V，不按回车；原防护保留。原生页面观察到标准图片paste事件，但受控测试源的一致性未验收，不能当作平台风控或真人认证通过，见[验证记录](docs/guest-image-shortcut-validation-2026-10-19.md)。
+剪贴板图片 **0.4.56 修复版已安装**：0.4.55实际点击暴露旧Electron接口错误，已改用异步接口并补真实运行时合成检查，原资料与防护保留，见[修复记录](docs/image-clipboard-fix-validation-2026-10-19.md)。
+tab切换保留画面连接 **0.4.54 已安装**，本机切换已确认复用连接，见[交付记录](docs/retained-viewer-validation-2026-10-19.md)。
 文件夹导航、时间与文件管理器 **0.4.53 已安装**，Chrome文件夹按钮已实际打开Linux目录，见[交付记录](docs/file-browsing-validation-2026-10-16.md)。
 长文翻译与一键取回 **0.4.52 已安装**，支持放大阅读和字号调整；原资料与防护保持，见 [交付记录](docs/long-translation-validation-2026-10-16.md)。此前文件工具交付见 [0.4.51 记录](docs/file-panel-open-validation-2026-10-16.md)，翻译接入见 [0.4.50 记录](docs/deepseek-translation-validation-2026-10-16.md)。
 不同历史包的通过结果保留各自版本，不自动当作当前包全面重测。

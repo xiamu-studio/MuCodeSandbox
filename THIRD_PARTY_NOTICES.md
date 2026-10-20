@@ -19,9 +19,17 @@ LICENSE remain in the local runtime cache; LICENSE is also installed at
 
 ## noVNC
 
+The local `scripts/retained-frame-updates.ts` bundling patch adds an
+`updatesPaused` property to pinned RFB 1.7.0. It suspends framebuffer requests
+and continuous updates for hidden viewers while retaining the socket and decoder.
+The transformation source is included in this repository under the same MPL-2.0
+terms for this modification. Upstream copyright/license notices are retained.
+
 The guest browser viewer uses `@novnc/novnc` 1.7.0 to implement the RFB client.
 MuCodeSandbox adds a native Uint8Array Base64 fast path during bundling, with the
-existing encoder retained for compatibility. Image bytes and the RFB protocol
+existing encoder retained for compatibility. A local RFB update extension pauses
+hidden viewers and repaints/requests a full frame when a visible viewer needs
+refreshing, while retaining its decoder and authenticated connection. Image bytes and the RFB protocol
 are unchanged. The application transports the stream through authenticated local
 WebSocket and SSH connections.
 
@@ -30,8 +38,8 @@ WebSocket and SSH connections.
 - The installed package retains `LICENSE.txt`, `AUTHORS` and `docs/LICENSE*`,
   including notices for vendored components with their own licenses.
 - Source files covered by MPL remain available in the upstream source above and
-  the installed package. The corresponding modified `core/base64.js` source is
-  included at `desktop/third-party-source/novnc-1.7.0/core/base64.js` inside the
+  the installed package. The corresponding modified `core/base64.js` and
+  `core/rfb.js` sources are included in `desktop/third-party-source/novnc-1.7.0/core/` inside the
   installed application's `Contents/Resources/app` directory, under MPL-2.0.
 
 ## TurboVNC Server

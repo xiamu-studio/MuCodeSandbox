@@ -6,6 +6,7 @@ import type { Environment, Job, LogEntry } from '../shared/types.ts';
 import { AppError } from './errors.ts';
 import { redact, identitySchema } from './validation.ts';
 import type {ProtectionEvent,ProtectionResolution} from '../shared/protection-events.ts';
+import {EXIT_CHECK_HOSTS,type ConnectionObservation,type ConnectionQuery} from '../shared/network-observations.ts';
 
 export class Store {
   db: DatabaseSync;
@@ -135,5 +136,25 @@ export class Store {
   networkSampleHistory(id:string,key:string) {
     return (this.db.prepare("SELECT id,payload FROM network_records WHERE environment_id=? AND kind='sample' AND config_key LIKE ? ORDER BY id DESC LIMIT 300").all(id,`%:${key}:%`) as {id:number;payload:string}[])
       .reverse().map(r=>({...JSON.parse(r.payload),id:r.id}));
+  }
+  networkConnectionPage(id:string,key:string,query:ConnectionQuery){
+    let where="environment_id=? AND kind='connection' AND config_key=?";const values:(string|number)[]=[id,key];
+    const retained=Number((this.db.prepare('SELECT COUNT(*) AS n FROM network_records WHERE '+where).get(...values) as {n:number}).n);
+    if(query.scope&&query.scope!=='all'){
+      const slots=EXIT_CHECK_HOSTS.map(()=>'?').join(',');
+      // Explicit TUN traffic overrides the legacy host heuristic. Never hide a
+      // shared server connection merely because its weaker DNS reference is a probe.
+      const check=`CASE WHEN json_extract(payload,'$.origin')='exit-check' THEN 1 WHEN json_extract(payload,'$.origin')='traffic' THEN 0 ELSE (lower(json_extract(payload,'$.target')) IN (${slots}) OR (json_extract(payload,'$.domainSource')='connection' AND lower(json_extract(payload,'$.domain')) IN (${slots}))) END`;
+      where+=` AND COALESCE((${check}),0)=${query.scope==='checks'?1:0}`;values.push(...EXIT_CHECK_HOSTS,...EXIT_CHECK_HOSTS);
+    }
+    if(query.failures)where+=" AND json_extract(payload,'$.status')='failed'";
+    if(query.q?.trim()){
+      where+=" AND instr(lower(COALESCE(json_extract(payload,'$.target'),'')||' '||COALESCE(json_extract(payload,'$.domain'),'')||' '||COALESCE(json_extract(payload,'$.domainCandidates'),'')||' '||COALESCE(json_extract(payload,'$.exitIp'),'')),?)>0";values.push(query.q.trim().toLowerCase());
+    }
+    const total=Number((this.db.prepare('SELECT COUNT(*) AS n FROM network_records WHERE '+where).get(...values) as {n:number}).n);
+    if(query.before!==undefined){where+=' AND id<?';values.push(query.before);}
+    const rows=this.db.prepare('SELECT id,payload FROM network_records WHERE '+where+' ORDER BY id DESC LIMIT 301').all(...values) as {id:number;payload:string}[];
+    const more=rows.length>300;const page=rows.slice(0,300);
+    return{connections:page.reverse().map(row=>({...JSON.parse(row.payload),id:row.id})) as ConnectionObservation[],connectionPage:{total,retained,nextBefore:more?page[0].id:null}};
   }
 }

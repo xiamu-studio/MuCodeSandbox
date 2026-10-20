@@ -30,7 +30,7 @@ export default function DesktopPanel({environment, snapshot,refresh,onConfigure,
         if(live)setInspection({environmentId:environment.id,environmentState:environment.state,value,error:''});
       }catch(e){
         if(e instanceof ApiError&&e.code==='OPERATION_IN_PROGRESS')return;
-        if(live)setInspection({environmentId:environment.id,environmentState:environment.state,value:null,error:(e as Error).message});
+        if(live)setInspection(previous=>({environmentId:environment.id,environmentState:environment.state,value:previous?.environmentId===environment.id&&previous.environmentState===environment.state?previous.value:null,error:(e as Error).message}));
       }finally{pending=false;}
     };
     setError('');
@@ -38,7 +38,7 @@ export default function DesktopPanel({environment, snapshot,refresh,onConfigure,
     const timer=setInterval(()=>void update(),5000);
     return()=>{live=false;clearInterval(timer);};
   },[environment.id,environment.state,active?.id,visible]);
-  async function inspect(){try{const value=await api.desktopApps(environment.id);setInspection({environmentId:environment.id,environmentState:environment.state,value,error:''});}catch(e){setInspection({environmentId:environment.id,environmentState:environment.state,value:null,error:(e as Error).message});}}
+  async function inspect(){try{const value=await api.desktopApps(environment.id);setInspection({environmentId:environment.id,environmentState:environment.state,value,error:''});}catch(e){setInspection(previous=>({environmentId:environment.id,environmentState:environment.state,value:previous?.environmentId===environment.id&&previous.environmentState===environment.state?previous.value:null,error:(e as Error).message}));}}
   async function action(application:DesktopAppId,value:'install'|'start'|'stop') {if(value==='start')setPreferred(application);setBusy(true);setError('');try{await api.desktopAppAction(environment.id,application,value);await refresh();}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
   const running=environment.state==='running'?data?.apps.find(a=>a.id===preferred&&a.running)??data?.apps.find(a=>a.running):undefined;
   const focusTarget=preferred?data?.apps.find(a=>a.id===preferred&&a.running)?.id:running?.id;
@@ -59,7 +59,7 @@ export default function DesktopPanel({environment, snapshot,refresh,onConfigure,
       <div className="button-row">{!state?<Button disabled icon={<Monitor size={16}/>}>安装状态待检测</Button>:state.installed?<><Button className="primary" icon={<Play size={16}/>} disabled={!usable||!!active||busy} onClick={()=>void action(app.id,'start')}>{state.running?'显示窗口':'打开客户端'}</Button><Button icon={<Square size={16}/>} disabled={!state.running||!!active||busy} onClick={()=>void action(app.id,'stop')}>关闭</Button></>:<Button className="primary" icon={<Download size={16}/>} disabled={!usable||!!active||busy} onClick={()=>void action(app.id,'install')}>安装官方客户端</Button>}</div>
       {state?.running&&<small className="desktop-protection-result">{state.rendererProtected?'渲染进程保护已检查':'正在检查渲染进程'} · 本轮未验证账号登录</small>}
     </section>;})}</div>
-    {running&&<section className="desktop-display"><SectionHeading title={`${DESKTOP_APPS.find(a=>a.id===running.id)?.name} · Linux 沙箱桌面`}/><Suspense fallback={<LoaderCircle className="spin" size={28}/>}><GuestBrowserView id={environment.id} name={`${environment.name} · 桌面应用`} embedded desktop active={visible}/></Suspense></section>}
+    {running&&<section className="desktop-display"><SectionHeading title={`${DESKTOP_APPS.find(a=>a.id===running.id)?.name} · Linux 沙箱桌面`}/><Suspense fallback={<LoaderCircle className="spin" size={28}/>}><GuestBrowserView id={environment.id} name={`${environment.name} · 桌面应用`} timezone={environment.identity.timezone} embedded desktop active={visible}/></Suspense></section>}
     <details className="desktop-notes"><summary>资料保存、清理与运行说明</summary><p>正常关闭、重开或切换查看环境会保存资料。需要清除所有客户端缓存、凭据和本地文件，请到“设置”使用“彻底重建环境”；它会删除旧虚拟机和其快照，创建全新环境。</p><p>桌面客户端直接使用独立显示服务，不会自动打开 Chrome。关闭浏览器不影响客户端；停止环境会关闭全部程序。各客户端拥有独立资料目录，但同一环境内的程序属于同一 Linux 用户，不能作为程序之间的强隔离。</p></details>
   </div>;
 }

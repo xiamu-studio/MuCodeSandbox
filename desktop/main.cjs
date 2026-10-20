@@ -1,4 +1,4 @@
-const { app, BrowserWindow, WebContentsView, session, ipcMain, dialog, Menu, powerMonitor } = require('electron');
+const { app, BrowserWindow, WebContentsView, session, ipcMain, dialog, Menu, powerMonitor, clipboard, nativeImage } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { pathToFileURL } = require('node:url');
@@ -41,7 +41,7 @@ const browserHost = {
   async available() { return true; },
   async openGuest(environment,url){
     const existing=guestWindows.get(environment.id);if(existing){existing.show();existing.focus();return;}
-    const window=new BrowserWindow({width:1320,height:900,minWidth:620,minHeight:400,title:`${environment.name} · Linux 浏览器`,backgroundColor:'#f7f8fa',webPreferences:{contextIsolation:true,nodeIntegration:false,sandbox:true}});
+    const window=new BrowserWindow({width:1320,height:900,minWidth:620,minHeight:400,title:`${environment.name} · Linux 浏览器`,backgroundColor:'#f7f8fa',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,nodeIntegration:false,sandbox:true}});
     guestWindows.set(environment.id,window);
     installLocalEditMenu(window);
     window.webContents.setWindowOpenHandler(()=>({action:'deny'}));
@@ -110,6 +110,10 @@ const browserHost = {
 };
 
 function trusted(event) { return service && event.senderFrame?.url.startsWith(`${service.url}/`); }
+ipcMain.handle('mu:clipboard-image',event=>require('./clipboard-image.cjs').readClipboardImage(event,{clipboard,nativeImage,allowed:event=>{
+  if(!trusted(event)||event.senderFrame!==event.sender.mainFrame)return false;
+  return event.sender===mainWindow?.webContents||[...guestWindows.values()].some(window=>!window.isDestroyed()&&event.sender===window.webContents);
+}}));
 ipcMain.handle('mu:browser-action', async (event, input) => {
   if (!trusted(event) || !input || typeof input.id !== 'string') throw new Error('Invalid sender');
   const entry = browsers.get(input.id);

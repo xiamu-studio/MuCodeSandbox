@@ -4,6 +4,8 @@ dist-server/
 release/
 .mu-data/
 test-results/
+artifacts/tool-pages-*/
+artifacts/MuCodeSandbox-tools-*.zip
 *.log
 .DS_Store
 native/bin/

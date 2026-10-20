@@ -1,0 +1,9 @@
+# Retain tab connections and pause hidden frame updates
+
+Confirmed cause: GuestBrowserView's RFB effect depends on active. Hiding a retained tab disconnects its WebSocket and destroys the canvas; returning requests a fresh ticket and handshake. Guest apps and browser pages are not restarted by that cleanup. Desktop status errors can independently unmount a working viewer, and browser version data is unnecessarily blanked on each return.
+
+Chosen change: retain a viewer after its first visit in the same environment. Pause framebuffer requests/continuous updates while hidden, disable its keyboard/pointer input, and stop hidden audio. Resume requests on activation with a full-frame refresh; retain socket, decoder, canvas, input drafts and display choice. New environment, genuine disconnection, explicit reconnect and app shutdown retain their existing boundaries. Server authorization, expiry, revocation and fail-closed network protection stay unchanged.
+
+Pinned noVNC 1.7.0 receives a small checked bundling transformation exposing updatesPaused. The patch changes only update scheduling at complete-message boundaries; it does not drop protocol bytes, buffer unlimited incoming frames or touch authentication/clipboard/decoder behavior. Fail the build if the pinned source anchors change. Include the modified corresponding source and notices in the package.
+
+Local verification: real production viewer and patched noVNC connected to owned synthetic RFB servers with both incremental-request and continuous-update behavior. Assert hidden frames stop, rapid switches keep tickets/sockets/canvas, no loading overlay on normal return, new environment closes old sockets and real disconnect/manual reconnect work. Recheck display geometry, retained status polling and four-surface tools. Do not open actual AI pages or accounts.

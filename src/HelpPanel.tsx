@@ -1,8 +1,8 @@
 import { useState, type ReactNode } from 'react';
 import { BookOpen, ArrowRight, ShieldCheck, RotateCcw, FolderOpen, Network } from 'lucide-react';
-import guide from '../docs/user-guide.md?raw';
-import technical from '../docs/technical-overview.md?raw';
-import todo from '../docs/TODO.md?raw';
+import guide from '../docs/help/user-guide.md?raw';
+import technical from '../docs/help/technical-overview.md?raw';
+import todo from '../docs/help/limitations.md?raw';
 import { Button } from './components.tsx';
 
 function text(value:string){return value.replace(/\[([^\]]+)\]\([^)]+\)/g,'$1').replace(/\*\*([^*]+)\*\*/g,'$1').replace(/`([^`]+)`/g,'$1');}
@@ -22,7 +22,7 @@ export function MarkdownDocument({body}:{body:string}){
 export function HelpPanel({onCreate,onNetwork,onLab}:{onCreate:()=>void;onNetwork:()=>void;onLab:()=>void}){
   const [document,setDocument]=useState<'start'|'guide'|'technical'|'todo'>('start');
   return <><header className="page-header"><div><div className="eyebrow">按步骤开始</div><h1>使用指南</h1><p>环境、线路、浏览器和备份，一次看清楚。</p></div><BookOpen size={26}/></header>
-    <nav className="help-tabs" aria-label="帮助文档">{[{id:'start',label:'快速上手'},{id:'guide',label:'完整指南'},{id:'technical',label:'技术方案'},{id:'todo',label:'后续待办'}].map(d=><button className={document===d.id?'active':''} key={d.id} onClick={()=>setDocument(d.id as typeof document)}>{d.label}</button>)}</nav>
+    <nav className="help-tabs" aria-label="帮助文档">{[{id:'start',label:'快速上手'},{id:'guide',label:'完整指南'},{id:'technical',label:'技术方案'},{id:'todo',label:'支持范围'}].map(d=><button className={document===d.id?'active':''} key={d.id} onClick={()=>setDocument(d.id as typeof document)}>{d.label}</button>)}</nav>
     {document!=='start'?<MarkdownDocument body={document==='guide'?guide:document==='technical'?technical:todo}/>:<div className="help-start">
       <div className="help-hero"><span className="eyebrow">你的 Mac，一个独立空间</span><h2>先建环境，再确认线路。</h2><p>选择 Linux 沙箱后，网页和开发命令在虚拟机里运行。Mac 负责显示画面；项目和线路由你明确配置。</p><Button className="primary" onClick={onCreate} icon={<ArrowRight size={16}/>}>新建 Linux 沙箱</Button></div>
       <div className="guide-grid">{[{icon:Network,title:'设置你的线路',body:'填写本机代理或选择独立节点，启用透明代理和强制防护。直连环境没有这层保护。',action:onNetwork,label:'前往线路设置'},

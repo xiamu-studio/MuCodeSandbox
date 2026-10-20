@@ -29,6 +29,7 @@ import { diskCapacitySchema } from './disk-recovery.ts';
 import { HostNetworkMonitor } from './host-network.ts';
 import { desktopAppSchema } from './guest-desktop.ts';
 import {GuestExchange,inlineTranslationText,clipboardText,transferName,transferZone,transferPath,transferRevision} from './guest-exchange.ts';
+import {IMAGE_CLIPBOARD_MAX_BYTES} from '../shared/clipboard-image.ts';
 import {TRANSFER_MAX_BYTES} from '../shared/guest-exchange.ts';
 import {TranslationSettings,translationApiKey} from './translation-settings.ts';
 import {translationDirection} from './deepseek-translation.ts';
@@ -58,6 +59,7 @@ export async function createService(options: ServiceOptions) {
   manager.browser=guestBrowser;
   guestBrowser.authorize=(e,allowBusy)=>manager.assertAccess(e.id,allowBusy);
   const guestLinks=new GuestLinks(manager.runtime,id=>{try{return manager.store.get(id);}catch{return undefined;}},id=>manager.active.has(id),async(e,link)=>{await manager.openExternalLink(e.id,link.url);});
+  const fileUploadReaders=new Set<string>();
   const translationSettings=new TranslationSettings(manager.store);
   const guestExchange=new GuestExchange(manager.runtime,async id=>{await manager.assertAccess(id);return manager.store.get(id);},translationSettings);
   guestBrowser.prepareLinks=(e,runOptions)=>guestLinks.prepare(e,runOptions);
@@ -228,9 +230,27 @@ export async function createService(options: ServiceOptions) {
     else if(req.query.paged==='1')res.json(await guestExchange.listPage(id,z.string().optional().parse(req.query.cursor)));
     else res.json(await guestExchange.list(id));
   });
-  app.post('/api/environments/:id/transfer-files',async(req,_res,next)=>{await manager.assertAccess(z.uuid().parse(req.params.id));next();},express.raw({type:'application/octet-stream',limit:TRANSFER_MAX_BYTES}),async(req,res)=>{
-    const name=transferName.parse(req.query.name);if(!Buffer.isBuffer(req.body))throw new AppError('请选择一个文件',400);
-    res.json(await guestExchange.upload(z.uuid().parse(req.params.id),name,req.body));
+  app.post('/api/environments/:id/transfer-files',async(req,res,next)=>{
+    const id=z.uuid().parse(req.params.id);transferName.parse(req.query.name);
+    const length=req.headers['content-length'];
+    if(length&&Number(length)>TRANSFER_MAX_BYTES){res.setHeader('Connection','close');throw new AppError('单个文件最多150 MiB',413,'CONTENT_TOO_LARGE');}
+    if(fileUploadReaders.has(id)||guestExchange.busy.has(id))throw new AppError('当前环境正在接收或处理文件，请稍后重试',409,'TRANSFER_BUSY');
+    fileUploadReaders.add(id);const deadline=setTimeout(()=>res.destroy(),180000);deadline.unref();const release=()=>{clearTimeout(deadline);fileUploadReaders.delete(id);};res.once('finish',release);res.once('close',release);
+    try{await manager.assertAccess(id);res.locals.uploadRevision=manager.store.get(id).updatedAt;next();}catch(error){release();next(error);}
+  },express.raw({type:'application/octet-stream',limit:TRANSFER_MAX_BYTES}),async(req,res)=>{
+    const id=z.uuid().parse(req.params.id),name=transferName.parse(req.query.name);if(!Buffer.isBuffer(req.body))throw new AppError('请选择一个文件',400);
+    if(manager.store.get(id).updatedAt!==res.locals.uploadRevision)throw new AppError('环境已变化，请重新传入文件',409,'CONFIGURATION_CHANGED');
+    const controller=new AbortController(),cancel=()=>{if(!res.writableFinished)controller.abort();};res.once('close',cancel);
+    try{res.json(await guestExchange.upload(id,name,req.body,controller.signal));}finally{res.removeListener('close',cancel);}
+  });
+  app.post('/api/environments/:id/transfer-move',async(req,res)=>{
+    const input=z.object({zone:transferZone,name:transferName,path:transferPath.optional(),revision:transferRevision.optional()}).strict().parse(req.body);
+    res.json(await guestExchange.moveToDownloads(z.uuid().parse(req.params.id),input.zone,input.name,input.path,input.revision));
+  });
+  app.get('/api/environments/:id/transfer-projects',async(req,res)=>res.json(await guestExchange.projects(z.uuid().parse(req.params.id))));
+  app.post('/api/environments/:id/transfer-folder/open',async(req,res)=>{
+    const input=z.union([z.object({zone:transferZone,path:transferPath.optional()}).strict(),z.object({projectId:z.uuid()}).strict()]).parse(req.body);
+    res.json(await guestExchange.openFolder(z.uuid().parse(req.params.id),input));
   });
   app.post('/api/environments/:id/transfer-download',async(req,res)=>{
     const input=z.object({zone:transferZone,name:transferName,path:transferPath.optional(),revision:transferRevision.optional()}).strict().parse(req.body);
@@ -247,6 +267,10 @@ export async function createService(options: ServiceOptions) {
     const id=z.uuid().parse(req.params.id);manager.ensureIdle(id);
     const input=z.object({text:inlineTranslationText,direction:translationDirection.optional()}).strict().parse(req.body);
     res.json(await guestExchange.translate(id,input.text,input.direction));
+  });
+  app.post('/api/environments/:id/clipboard/image',async(req,_res,next)=>{await manager.assertAccess(z.uuid().parse(req.params.id));next();},express.raw({type:'image/png',limit:IMAGE_CLIPBOARD_MAX_BYTES}),async(req,res)=>{
+    if(!Buffer.isBuffer(req.body))throw new AppError('请粘贴PNG图片',400,'INVALID_CLIPBOARD_IMAGE');
+    res.json(await guestExchange.writeClipboardImage(z.uuid().parse(req.params.id),req.body));
   });
   app.post('/api/environments/:id/clipboard/read',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(await guestExchange.readClipboard(z.uuid().parse(req.params.id)));});
   app.post('/api/environments/:id/clipboard/write',async(req,res)=>{const input=z.object({text:clipboardText}).strict().parse(req.body);res.json(await guestExchange.writeClipboard(z.uuid().parse(req.params.id),input.text));});
@@ -272,7 +296,10 @@ export async function createService(options: ServiceOptions) {
   app.post('/api/environments/:id/network/test', async (req, res) => res.json(await manager.testNetwork(z.uuid().parse(req.params.id))));
   app.get('/api/environments/:id/network/latency',(req,res)=>res.json(manager.accessLatency(z.uuid().parse(req.params.id))));
   app.post('/api/environments/:id/network/latency',async(req,res)=>{const input=latencyInput.parse(req.body??{});res.json(await manager.testAccessLatency(z.uuid().parse(req.params.id),input.target));});
-  app.get('/api/environments/:id/network/observations', (req,res)=>res.json(manager.networkObserver.info(manager.store.get(z.uuid().parse(req.params.id)))));
+  app.get('/api/environments/:id/network/observations', (req,res)=>{
+    const query=z.object({q:z.string().max(253).optional(),scope:z.enum(['traffic','checks','all']).optional(),failures:z.enum(['0','1']).transform(v=>v==='1').optional(),before:z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional()}).strict().parse(req.query);
+    res.json(manager.networkObserver.info(manager.store.get(z.uuid().parse(req.params.id)),Object.keys(query).length?query:undefined));
+  });
   app.post('/api/environments/:id/network/observations', async (req,res)=>{z.object({}).strict().parse(req.body);res.json(await manager.sampleNetwork(z.uuid().parse(req.params.id)));});
   app.get('/api/environments/:id/network/egress',(req,res)=>res.json(manager.egressStatus(z.uuid().parse(req.params.id))));
   app.get('/api/environments/:id/network/protection', async (req, res) => {
@@ -341,7 +368,7 @@ export async function createService(options: ServiceOptions) {
   }
   app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     if (error instanceof z.ZodError) res.status(400).json({ error: error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('；'), code: 'VALIDATION_ERROR' });
-    else if(error&&typeof error==='object'&&'type' in error&&error.type==='entity.too.large')res.status(413).json({error:'请求内容过大；文件最多25 MiB，文字最多64 KiB',code:'CONTENT_TOO_LARGE'});
+    else if(error&&typeof error==='object'&&'type' in error&&error.type==='entity.too.large')res.status(413).json({error:'请求内容过大；文件最多150 MiB，文字最多64 KiB',code:'CONTENT_TOO_LARGE'});
     else if (error instanceof AppError) res.status(error.status).json({ error: redact(error.message), code: error.code });
     else res.status(500).json({ error: redact(errorMessage(error)), code: 'INTERNAL_ERROR' });
   });

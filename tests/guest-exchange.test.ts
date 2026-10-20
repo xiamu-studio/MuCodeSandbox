@@ -117,14 +117,16 @@ test('File exchange sends the program and payload through stdin with a short SSH
  const e=env(),runtime=new LimaRuntime('/tmp/mu-exchange-unused');
  runtime.guest=async(_e,args,options)=>{
   assert.equal(args[0],'python3');assert.ok(args.join(' ').length<160);assert.equal(options?.onOutput,undefined);
-  assert.ok(options?.input?.startsWith(JSON.stringify(FILE_EXCHANGE_PYTHON)+'\n'));
-  return execFileSync('python3',args.slice(1),{input:options!.input!.replaceAll('/home/dev',home),stdio:['pipe','pipe','pipe']}).toString();
+  let input:Buffer|string;
+  if(options?.inputBytes){const bytes=Buffer.from(options.inputBytes),line=bytes.indexOf(10);assert.ok(line>0);const program=JSON.parse(bytes.subarray(0,line).toString());assert.equal(program,FILE_EXCHANGE_PYTHON);input=Buffer.concat([Buffer.from(JSON.stringify(program.replaceAll('/home/dev',home))+'\n'),bytes.subarray(line+1)]);}
+  else {assert.ok(options?.input?.startsWith(JSON.stringify(FILE_EXCHANGE_PYTHON)+'\n'));input=options!.input!.replaceAll('/home/dev',home);}
+  return execFileSync('python3',args.slice(1),{input,stdio:['pipe','pipe','pipe']}).toString();
  };
  const exchange=new GuestExchange(runtime,async()=>e),body=Buffer.from('中文\n\0binary');
  try{
   const saved=await exchange.upload(e.id,'中文 $literal.txt',body);
   assert.ok((await exchange.list(e.id)).some(f=>f.name===saved.name));
-  assert.deepEqual(await exchange.download(e.id,'incoming',saved.name),body);
+  assert.deepEqual(await exchange.download(e.id,'downloads',saved.name),body);
  }finally{await rm(root,{recursive:true,force:true});}
 });
 test('Guest clipboard does not poll or read the host clipboard and uses the same manual guard',async()=>{

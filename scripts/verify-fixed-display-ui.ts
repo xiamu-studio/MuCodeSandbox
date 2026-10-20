@@ -204,14 +204,14 @@ try {
   assert.equal(requests.at(-1)?.mode, 'adaptive');
 
   // Two retained panels share the guest desktop. Switching tabs must leave
-  // only the visible panel decoding; hiding both must release all viewers.
+  // only the visible panel updating; hidden viewers retain their sockets and canvases.
   saved={...displayPixels({cssWidth:1920,cssHeight:1080,scaleFactor:2,mode:'fixed'}),browserScaleFactor:2,matched:true};
   frame={width:saved.width,height:saved.height};
   await page.goto(`http://127.0.0.1:${address.port}/viewer-lifecycle.html`);
   const waitPeers = async (count:number) => {
     const deadline=Date.now()+5000;
     while(peers.size!==count&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,25));
-    assert.equal(peers.size,count,'Only visible retained panels may hold an RFB connection');
+    assert.equal(peers.size,count,'Visited panels retain one RFB connection each');
   };
   await page.locator('.guest-browser-connection:visible').filter({hasText:'已连接'}).waitFor();
   await waitPeers(1);
@@ -245,16 +245,16 @@ try {
   const retainedTickets=tickets;
   for(let cycle=0;cycle<3;cycle++){
     await page.getByRole('button',{name:'fixture-overview',exact:true}).click();
-    await waitPeers(0);
-    assert.equal(await page.locator('.guest-browser-canvas canvas').count(),0,'Hidden panels release backing canvases');
+    await waitPeers(cycle===0?1:2);
+    assert.equal(await page.locator('.guest-browser-canvas canvas').count(),cycle===0?1:2,'Hidden panels retain backing canvases');
     await page.getByRole('button',{name:cycle%2?'fixture-browser':'fixture-desktop',exact:true}).click();
     await page.locator('.guest-browser-connection:visible').filter({hasText:'已连接'}).waitFor();
-    await waitPeers(1);
+    await waitPeers(2);
   }
-  assert.equal(tickets,retainedTickets+3,'Each resume obtains a fresh one-use ticket');
+  assert.equal(tickets,retainedTickets+1,'Only the first desktop visit obtains a ticket');
   assert.deepEqual(unexpectedCalls,[],'Switching viewers must not stop/reset guest apps or clear their profiles');
   assert.deepEqual(errors, []);
-  const report = { passed: true, fixtureOnly: true, checked: ['default fixed DPR 2 with complete fit view', 'fit bottom-right input coordinates', 'native source/host pixel mapping', 'ordinary resize/fullscreen/exit leaves desktop unchanged', 'scroll/crop input coordinates', 'fit does not upscale', 'selection changes real desktop request', 'reconnect restores session choice', 'reopened viewer stays complete', 'explicit adaptive mode', 'hidden retained views release connections and canvases', 'tab resume obtains fresh ticket without lifecycle mutation'], normal, native, cropped, fit, large, reopened, requests, mousePress: pointer, fitMousePress: fitPointer, errors };
+  const report = { passed: true, fixtureOnly: true, checked: ['default fixed DPR 2 with complete fit view', 'fit bottom-right input coordinates', 'native source/host pixel mapping', 'ordinary resize/fullscreen/exit leaves desktop unchanged', 'scroll/crop input coordinates', 'fit does not upscale', 'selection changes real desktop request', 'reconnect restores session choice', 'reopened viewer stays complete', 'explicit adaptive mode', 'hidden retained views keep connections and canvases', 'tab resume reuses authenticated connection without lifecycle mutation'], normal, native, cropped, fit, large, reopened, requests, mousePress: pointer, fitMousePress: fitPointer, errors };
   await writeFile(path.join(results, 'ui.json'), JSON.stringify(report, null, 2));
   await rm(path.join(results, 'ui-failure.json'), { force: true });
   console.log(JSON.stringify({ passed: true, requests: requests.length, report: path.join(results, 'ui.json') }));

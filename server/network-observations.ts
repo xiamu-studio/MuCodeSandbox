@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import type { Environment, NetworkResult, EgressStatus } from '../shared/types.ts';
-import { exitSummary, type ConnectionObservation, type ExitObservation, type ExitVerificationObservation, type NetworkObservations, type ProbeProvider } from '../shared/network-observations.ts';
+import { exitSummary, type ConnectionQuery,type ConnectionObservation, type ExitObservation, type ExitVerificationObservation, type NetworkObservations, type ProbeProvider } from '../shared/network-observations.ts';
 import type { Store } from './store.ts';
 import type { LimaRuntime } from './runtime.ts';
 
@@ -41,7 +41,7 @@ export interface JournalBatch { cursor: string | null; events: { key: string; at
 // Only observed host names are retained. DNS associations are explicitly weaker than
 // a domain requested by this exact connection; shared CDN IPs must not be guessed.
 export class JournalContext {
-  traces = new Map<string,{domain:string;port:number;at:number;addresses:string[]}>();
+  traces = new Map<string,{domain?:string;port:number;at:number;addresses:string[];origin:'exit-check'|'traffic'}>();
   dns = new Map<string,Map<string,{at:number;expires:number}>>();
   prune(at:number) {
     for(const [key,value] of this.traces)if(at-value.at>120_000)this.traces.delete(key);
@@ -66,22 +66,23 @@ export function parseJournal(output: string, context=new JournalContext()): Jour
     const scope=`${String(entry._BOOT_ID??'boot')}:${String(entry._SYSTEMD_INVOCATION_ID??'service')}`;
     const traceKey=trace?`${scope}:${trace}`:null;
     context.prune(time);
-    const inbound=clean.match(/inbound\/(?:socks|http|tun)\[[\w-]+\]: inbound connection to ([^\s,]+)(?:\s|$)/);
-    const requested=inbound?safeTarget(inbound[1]):null;
+    const inbound=clean.match(/inbound\/(?:socks|http|tun)\[([\w-]+)\]: inbound connection to ([^\s,]+)(?:\s|$)/);
+    const requested=inbound?safeTarget(inbound[2]):null;
     if(traceKey&&inbound){
       context.traces.delete(traceKey);
-      if(requested&&!isIP(requested.target))context.traces.set(traceKey,{domain:requested.target.toLowerCase(),port:requested.port,at:time,addresses:[]});
+      if(requested)context.traces.set(traceKey,{...(!isIP(requested.target)?{domain:requested.target.toLowerCase()}:{}),port:requested.port,at:time,addresses:isIP(requested.target)?[requested.target]:[],origin:inbound[1]==='exit-probe'?'exit-check':'traffic'});
     }
     const lookup=clean.match(/dns: lookup succeed for ([a-zA-Z0-9.-]+): ([0-9a-fA-F:. ]+)$/);
     const request=traceKey?context.traces.get(traceKey):undefined;
     if(request&&lookup&&request.domain===lookup[1].toLowerCase()&&time>=request.at)request.addresses=lookup[2].trim().split(/\s+/).filter(ip=>isIP(ip)).slice(0,20);
     const value = parseConnection(message); if (!value) continue;
+    if(request&&time>=request.at)value.origin=request.origin;
     if(value.protocol==='DNS'&&value.dnsAddresses){
       for(const ip of value.dnsAddresses){const key=`${scope}:${ip}`,domains=context.dns.get(key)??new Map();
         const domain=value.target.toLowerCase(),expires=time+(value.dnsTtlSeconds??0)*1000;
         domains.set(domain,{at:time,expires});while(domains.size>16)domains.delete(domains.keys().next().value!);context.dns.set(key,domains);}
     } else if(isIP(value.target)) {
-      if(request&&time>=request.at&&request.port===value.port&&request.addresses.includes(value.target)){
+      if(request?.domain&&time>=request.at&&request.port===value.port&&request.addresses.includes(value.target)){
         value.domain=request.domain;value.domainSource='connection';
       }else {
         const domains=[...(context.dns.get(`${scope}:${value.target}`)??[])].filter(([,seen])=>seen.at<=time&&seen.expires>=time).map(([domain])=>domain);
@@ -196,22 +197,25 @@ export class NetworkObserver {
     if(this.closed)return Promise.resolve();if(this.pending)return this.pending;
     const guests=this.store.list().filter(e=>e.kind==='vm'&&e.state==='running'&&this.available(e));
     this.pending=Promise.allSettled(guests.map(async e=>{
-      const tasks:Promise<unknown>[]=[this.collect(e)];
-      if(Date.now()-(this.due.get(e.id)??0)>=30_000)tasks.push(this.sample(e));
-      await Promise.allSettled(tasks);
+      // Ordinary observation probes have their own per-environment in-flight
+      // guard and shutdown wait. A slow probe must not hold the journal queue.
+      // This does not change Manager's independent quorum/lease protection.
+      if(Date.now()-(this.due.get(e.id)??0)>=30_000)void this.sample(e).catch(()=>{});
+      await this.collect(e);
     })).then(()=>{}).finally(()=>{this.pending=undefined;});return this.pending;
   }
-  info(e:Environment):NetworkObservations {
+  info(e:Environment,query?:ConnectionQuery):NetworkObservations {
     const key=observationKey(e);
     const currentSamples=this.store.networkRecords(e.id,'sample',`${this.session}:${key}:${this.generation(e.id)}`) as ExitObservation[];
     const samples=this.store.networkSampleHistory(e.id,key) as ExitObservation[];
-    const connections=this.store.networkRecords(e.id,'connection',key) as ConnectionObservation[];
+    const paged=query?this.store.networkConnectionPage(e.id,key,query):undefined;
+    const connections=paged?.connections??this.store.networkRecords(e.id,'connection',key) as ConnectionObservation[];
     const candidate=captureSupported(e)?this.status.get(e.id):undefined;
     const state=candidate?.key===key&&candidate.generation===this.generation(e.id)?candidate:undefined;
     return {enabled:e.kind==='vm'&&e.state==='running',capture:captureSupported(e)?state?.capture??'waiting':'unsupported',
       ...(state?{capture:state.capture,captureIssue:state.captureIssue,collectedAt:state.collectedAt}:{}),
       captureGaps:this.store.networkRecords(e.id,'gap',key).length,startedAt:this.startedAt,sampleIntervalSeconds:30,lockIp:e.network.egressLock?.expectedIp??null,
-      samples,connections,summary:exitSummary(e.state==='running'?currentSamples:samples)};
+      samples,connections,...(paged?{connectionPage:paged.connectionPage}:{}),summary:exitSummary(e.state==='running'?currentSamples:samples)};
   }
   async close(){this.closed=true;clearInterval(this.timer);await this.pending;await Promise.allSettled(this.sampling.values());}
   forget(id:string){this.cursors.delete(id);this.status.delete(id);this.due.delete(id);this.configured.delete(id);this.contexts.delete(id);}

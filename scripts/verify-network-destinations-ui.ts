@@ -28,6 +28,8 @@ try {
   await page.goto(service.launchUrl());
   await page.getByRole('button',{name:'网络目标显示验证 Linux 沙箱'}).click();
   await page.getByRole('button',{name:'日志',exact:true}).click();
+  await page.getByRole('combobox',{name:'连接类型'}).selectOption('all');
+  await page.getByRole('combobox',{name:'连接展示方式'}).selectOption('table');
   const table=page.locator('.network-connections-table');await table.waitFor();
   assert.equal(await table.getByRole('columnheader',{name:/目标网址/}).count(),1);
   assert.equal(await table.getByRole('columnheader',{name:/沙箱出口 IP/}).count(),1);

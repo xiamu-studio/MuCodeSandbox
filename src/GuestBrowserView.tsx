@@ -3,22 +3,28 @@ import { ArrowLeft, Circle, Globe, LoaderCircle, Maximize2, Minimize2, Monitor, 
 import type RFB from '@novnc/novnc';
 import { api,ApiError,request } from './api.ts';
 import GuestAudio from './GuestAudio.tsx';
+import GuestTimezoneClock from './GuestTimezoneClock.tsx';
 import GuestQuickTools from './GuestQuickTools.tsx';
 import { IconButton } from './components.tsx';
 import { useEmbeddedGuestLayout } from './guest-view-layout.ts';
+import {useGuestImagePaste} from './guest-image-paste.ts';
 import { DEFAULT_FIXED_DISPLAY, FIXED_DISPLAY_PRESETS, FIXED_DISPLAY_SCALE, displayPreference, displayRequestKey, fitDisplay, guestPresentation, type DisplayRequest, type GuestDisplay, type PresentationMode } from '../shared/guest-display.ts';
 
 type Connection = 'connecting' | 'connected' | 'disconnected' | 'failed';
 
-export default function GuestBrowserView({ id, name, embedded = false,desktop=false,active=true,starting=false }: { id: string; name?: string; embedded?: boolean;desktop?:boolean;active?:boolean;starting?:boolean }) {
+export default function GuestBrowserView({ id, name, timezone, embedded = false,desktop=false,active=true,starting=false }: { id: string; name?: string; timezone?:string; embedded?: boolean;desktop?:boolean;active?:boolean;starting?:boolean }) {
   const container = useRef<HTMLDivElement>(null);
   const viewport = useRef<HTMLDivElement>(null);
   const surface = useRef<HTMLDivElement>(null);
   const remote = useRef<RFB | null>(null);
+  const [visitedId,setVisitedId]=useState<string|null>(active?id:null);
+  useEffect(()=>{if(active)setVisitedId(id);},[id,active]);
   const [attempt, setAttempt] = useState(0);
   const [connection, setConnection] = useState<Connection>('connecting');
   const [error, setError] = useState('');
+  const imagePaste=useGuestImagePaste({id,active,connected:connection==='connected',container,remote});
   const [title, setTitle] = useState(name ?? '沙箱浏览器');
+  const [clockIdentity,setClockIdentity]=useState<{id:string;timezone:string}|null>(null);
   const [fullscreen, setFullscreen] = useState(false);
   const activeView=useRef(active);activeView.current=active;
   const [display,setDisplay]=useState<GuestDisplay|null>(null);
@@ -32,14 +38,15 @@ export default function GuestBrowserView({ id, name, embedded = false,desktop=fa
   const confirmedDisplay = useRef<GuestDisplay | null>(null);
   const requestedDisplay = useRef<DisplayRequest>({ ...DEFAULT_FIXED_DISPLAY });
   const scheduleDisplay = useRef<() => void>(() => {});
+  const refreshFrame = useRef<() => void>(() => {});
   useEmbeddedGuestLayout(surface, embedded, active, fullscreen);
 
   useEffect(() => {
     if (name) { setTitle(name); return; }
     let live = true;
-    void api.snapshot().then(snapshot => { if (live) setTitle(snapshot.environments.find(environment => environment.id === id)?.name ?? '沙箱浏览器'); }).catch(() => {});
+    void api.snapshot().then(snapshot => { if (live) {const environment=snapshot.environments.find(environment => environment.id === id);setTitle(environment?.name ?? '沙箱浏览器');setClockIdentity(environment?{id,timezone:environment.identity.timezone}:null);} }).catch(() => {});
     return () => { live = false; };
-  }, [id, name]);
+  }, [id, name, attempt]);
 
   useEffect(() => {
     const update = () => setFullscreen(document.fullscreenElement === surface.current);
@@ -50,12 +57,11 @@ export default function GuestBrowserView({ id, name, embedded = false,desktop=fa
   useEffect(()=>{if(!active&&document.fullscreenElement===surface.current)void document.exitFullscreen().catch(()=>{});},[active]);
 
   useEffect(() => {
-    // Retained tabs keep their UI state, but must not keep decoding the same
-    // high-resolution desktop in the background. Disconnecting this viewer
-    // leaves the guest display, applications and profile running unchanged.
-    if (!active) { setConnection('disconnected'); setResizing(false); return; }
+    // Connect on first visit; ordinary tab switches retain the authenticated
+    // socket, decoder and canvas. Visibility only controls update flow below.
+    if (visitedId!==id) return;
     if (!container.current) return;
-    let disposed = false;
+    let disposed = false,ended=false;
     let client: RFB | undefined;
     let readyTimer: ReturnType<typeof setTimeout> | undefined;
     let cancelReady: (() => void) | undefined;
@@ -98,13 +104,15 @@ export default function GuestBrowserView({ id, name, embedded = false,desktop=fa
       remote.current = client;
       client.scaleViewport = true;
       client.resizeSession = false;
-      client.focusOnClick = true;
+      client.focusOnClick = activeView.current;
+      client.viewOnly = !activeView.current;
+      client.updatesPaused = !activeView.current;
       client.qualityLevel = 9;
       client.compressionLevel = 2;
       client.background = '#e6e9ed';
       listeners = [
         ['connect', () => { if (!disposed) { setConnection('connected'); setError(''); } }],
-        ['disconnect', () => { if (!disposed) setConnection(value => value === 'failed' ? value : 'disconnected'); }],
+        ['disconnect', () => { ended=true;if (!disposed) setConnection(value => value === 'failed' ? value : 'disconnected'); }],
         ['credentialsrequired', () => { if (!disposed) client?.sendCredentials({ password }); }],
         ['securityfailure', event => {
           if (disposed) return;
@@ -119,10 +127,34 @@ export default function GuestBrowserView({ id, name, embedded = false,desktop=fa
       clearTimeout(readyTimer); cancelReady?.();
       remote.current = null;
       for (const [event, listener] of listeners) client?.removeEventListener(event, listener);
-      client?.disconnect();
+      if(!ended)client?.disconnect();
       target.replaceChildren();
     };
-  }, [id, attempt, active]);
+  }, [id, attempt, visitedId]);
+
+  useEffect(()=>{
+    const client=remote.current;if(!client)return;
+    client.viewOnly=!active;client.focusOnClick=active;client.updatesPaused=!active;
+    if(!active)setResizing(false);
+  },[id,active,connection]);
+
+  useEffect(()=>{
+    const target=viewport.current,client=remote.current;
+    if(!target||!client||!active||connection!=='connected')return;
+    let timer:ReturnType<typeof setTimeout>|undefined,last=0;
+    const redraw=()=>{
+      if(document.hidden||!activeView.current||remote.current!==client||target.clientWidth<1||target.clientHeight<1)return;
+      last=performance.now();client.refreshFrame?.();
+    };
+    // Coalesce focus/resize/fullscreen bursts; never poll or inspect pixels.
+    const schedule=()=>{clearTimeout(timer);timer=setTimeout(redraw,Math.max(180,750-(performance.now()-last)));};
+    refreshFrame.current=schedule;
+    const observer=new ResizeObserver(schedule);observer.observe(target);
+    window.addEventListener('focus',schedule);window.addEventListener('pageshow',schedule);window.addEventListener('resize',schedule);window.visualViewport?.addEventListener('resize',schedule);
+    document.addEventListener('visibilitychange',schedule);document.addEventListener('fullscreenchange',schedule);
+    target.addEventListener('contextrestored',schedule,true);schedule();
+    return()=>{clearTimeout(timer);refreshFrame.current=()=>{};observer.disconnect();window.removeEventListener('focus',schedule);window.removeEventListener('pageshow',schedule);window.removeEventListener('resize',schedule);window.visualViewport?.removeEventListener('resize',schedule);document.removeEventListener('visibilitychange',schedule);document.removeEventListener('fullscreenchange',schedule);target.removeEventListener('contextrestored',schedule,true);};
+  },[id,active,connection,attempt]);
 
   useEffect(()=>{
     const target=viewport.current;if(!target||!active||connection!=='connected')return;
@@ -193,16 +225,17 @@ export default function GuestBrowserView({ id, name, embedded = false,desktop=fa
   return <div className={`guest-browser-view ${embedded ? 'embedded' : 'standalone'}`} ref={surface}>
     <header className="guest-browser-toolbar" style={{flexWrap:'wrap'}}>
       {!embedded && <IconButton title="返回工作区" onClick={() => location.assign('/')}><ArrowLeft size={17} /></IconButton>}
-      <div className="guest-browser-title"><Globe size={17} /><strong title={title}>{title}</strong><span>Linux</span></div>
+      <div className="guest-browser-title"><Globe size={17} /><strong title={title}>{title}</strong><span>Linux</span><GuestTimezoneClock timezone={timezone??(clockIdentity?.id===id?clockIdentity.timezone:undefined)} active={active}/></div>
       <span className="guest-browser-resolution" role="status" title={display?`真实桌面 ${display.screenWidth??display.cssWidth}×${display.screenHeight??display.cssHeight}；画面 ${display.width}×${display.height} 像素；查看区域 ${Math.round(view.width)}×${Math.round(view.height)}。${presentation.scrolls?'拖动查看区域滚动条查看其余桌面。':presentation.downscaled?'画面缩小展示。':'按原始像素展示。'}`:'正在确认真实桌面'}>{resizing?'正在设置桌面':display?`${display.mode==='fixed'?'固定':'自适应'} ${display.cssWidth}×${display.cssHeight} · ${display.browserScaleFactor}×${display.matched?'':' · 未确认'}`:''}</span>
       <IconButton title="显示设置" aria-expanded={settings} onClick={()=>setSettings(value=>!value)}><Monitor size={17}/></IconButton>
       <div className={`guest-browser-connection state-${connection}`} role="status">{connection === 'connecting' ? <LoaderCircle size={13} className="spin" /> : <Circle size={6} fill="currentColor" />}<span>{label}</span></div>
-      <GuestAudio id={id} connected={connection === 'connected'} />
+      <GuestAudio id={id} connected={active&&connection === 'connected'} />
       <GuestQuickTools key={id} id={id} active={active} dropTarget={surface} onReturn={()=>remote.current?.focus()} connected={connection === 'connected'} onPaste={pasteGuestText} onKey={key=>{if(activeView.current){remote.current?.focus();remote.current?.sendKey(key==='enter'?0xff0d:0xff08,key==='enter'?'Enter':'Backspace');}}}/>
       <IconButton title={desktop?'重新连接桌面画面':'重新连接浏览器画面'} onClick={() => setAttempt(value => value + 1)}><RotateCw size={16} /></IconButton>
       <IconButton title={fullscreen ? '退出全屏' : '全屏'} disabled={!document.fullscreenEnabled} onClick={() => void toggleFullscreen()}>{fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}</IconButton>
     </header>
     {settings&&<div className="guest-browser-keyboard" style={{flexWrap:'wrap',fontSize:12}}>
+      <button type="button" className="button" disabled={connection!=='connected'} title="重新绘制完整画面，保留当前网页和连接" onClick={()=>refreshFrame.current()}>重绘画面</button>
       <label>虚拟桌面 <select aria-label="虚拟桌面模式" style={{width:'auto'}} value={preference.mode??'adaptive'} disabled={connection!=='connected'||resizing} onChange={event=>chooseDisplay(event.target.value==='fixed'?{...DEFAULT_FIXED_DISPLAY}:{...preference,mode:'adaptive'})}><option value="fixed">固定尺寸 · 本次浏览器会话</option><option value="adaptive">随查看窗口调整</option></select></label>
       {preference.mode==='fixed'&&<label>桌面尺寸 <select aria-label="固定桌面尺寸" style={{width:'auto'}} value={presetKey} disabled={connection!=='connected'||resizing} onChange={event=>{const [cssWidth,cssHeight]=event.target.value.split('x').map(Number);chooseDisplay({cssWidth,cssHeight,scaleFactor:FIXED_DISPLAY_SCALE,mode:'fixed'});}}>{!knownPreset&&<option value={presetKey}>{preference.cssWidth}×{preference.cssHeight} · 2×</option>}{FIXED_DISPLAY_PRESETS.map(value=><option key={`${value.cssWidth}x${value.cssHeight}`} value={`${value.cssWidth}x${value.cssHeight}`}>{value.cssWidth}×{value.cssHeight} · 2×</option>)}</select></label>}
       <label>查看方式 <select aria-label="画面查看方式" style={{width:'auto'}} value={presentationMode} onChange={event=>setPresentationMode(event.target.value as PresentationMode)}><option value="native">原始像素 · 清晰 / 可滚动</option><option value="fit">适合窗口 · 只缩小</option></select></label>
@@ -215,6 +248,8 @@ export default function GuestBrowserView({ id, name, embedded = false,desktop=fa
       {connection !== 'connected' && <div className="guest-browser-overlay" aria-live="polite">{connection === 'connecting' ? <LoaderCircle size={25} className="spin" /> : <Globe size={29} strokeWidth={1.4} />}<strong>{label}</strong>{error && <span>{error}</span>}</div>}
     </div>
     {connection === 'connected' && error && <div className="guest-browser-error" role="alert">{error}</div>}
+    {imagePaste.status&&<div className="guest-image-paste-status" role="status">{imagePaste.status}</div>}
+    {imagePaste.error&&<div className="guest-browser-error" role="alert">{imagePaste.error}</div>}
     {connection === 'connected' && displayError && <div className="guest-browser-error" role="alert">{displayError} <button type="button" className="button" disabled={resizing} onClick={()=>scheduleDisplay.current()}>重试显示设置</button></div>}
   </div>;
 }

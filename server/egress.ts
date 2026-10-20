@@ -7,7 +7,7 @@ import { AppError, errorMessage } from './errors.ts';
 
 export const EGRESS_URL = 'https://ipwho.is/';
 // This includes starting the bounded command through Lima / SSH. The HTTPS
-// receiver gets 12s (and connect 4s), independently of transport setup. This
+// receiver gets 12s (and connect 8s), independently of transport setup. This
 // remains below the 45s kernel lease; an IP mismatch still rejects immediately.
 export const EGRESS_TIMEOUT_MS = 24_000;
 export const EGRESS_RECEIVERS = [
@@ -85,7 +85,7 @@ export async function measureEgress(runtime: LimaRuntime, e: Environment, option
     try {
       const output = await runtime.management(e, ['/usr/bin/sudo', '-H', '-u', 'mu-probe', '--', 'env', '-i', 'PATH=/usr/bin:/bin', '/usr/bin/curl', '-q',
     '--ipv4', '--fail', '--silent', '--show-error', '--proto', '=https', '--tlsv1.2',
-    '--max-time', '12', '--connect-timeout', '4', '--max-filesize', '65536',
+    '--max-time', '12', '--connect-timeout', '8', '--max-filesize', '65536',
     '--proxy', proxy, '--noproxy', proxy ? '' : '*', '--cacert', '/etc/ssl/certs/ca-certificates.crt',
         ...resolution,'--write-out',diagnosticFormat,target.url],
       { ...options, signal, timeoutMs: EGRESS_TIMEOUT_MS });

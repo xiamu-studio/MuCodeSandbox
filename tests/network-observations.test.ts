@@ -60,6 +60,37 @@ test('DNS reference respects TTL and refuses to identify a website from a shared
   assert.equal(parseJournal(row(outgoing.replace('203.0.113.3','203.0.113.4'),30_000),ctx).events[0].value.domain,undefined);
 });
 
+test('Capture labels the actual probe inbound, never a TUN connection inferred from a shared probe DNS address',()=>{
+ const ctx=new JournalContext(),now=Date.now();const row=(text:string,i:number)=>JSON.stringify({__CURSOR:'s=origin;i='+i,__REALTIME_TIMESTAMP:String((now+i)*1000),_BOOT_ID:'origin',_SYSTEMD_INVOCATION_ID:'one',MESSAGE:text});
+ parseJournal(row('INFO [14 0ms] inbound/socks[exit-probe]: inbound connection to api.ipify.org:443',0),ctx);
+ parseJournal(row('INFO [14 1ms] dns: lookup succeed for api.ipify.org: 203.0.113.2',1),ctx);
+ const probe=parseJournal(row('INFO [14 2ms] outbound/socks[upstream]: outbound connection to 203.0.113.2:443',2),ctx).events[0].value;assert.equal(probe.origin,'exit-check');assert.equal(probe.domain,'api.ipify.org');
+ parseJournal(row('INFO [15 0ms] dns: exchanged A api.ipify.org. 60 IN A 203.0.113.2',3),ctx);
+ parseJournal(row('INFO [14 0ms] inbound/tun[mu-tun]: inbound connection to 203.0.113.2:443',4),ctx);
+ const traffic=parseJournal(row('INFO [14 1ms] outbound/socks[upstream]: outbound connection to 203.0.113.2:443',5),ctx).events[0].value;assert.equal(traffic.origin,'traffic');assert.equal(traffic.domainSource,'dns');
+});
+
+test('Connection search covers retained history before paging, separates check traffic conservatively and isolates config/environment',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'mu-connection-query-')),store=new Store(dir),e=env(),other=env(),key='query-key';store.save(e);store.save(other);
+ const add=(source:string,payload:object,id=e.id,config=key)=>store.addNetworkRecord(id,'connection',config,source,{at:new Date().toISOString(),target:'203.0.113.5',port:443,status:'attempt',protocol:'TCP',route:'proxy',...payload});
+ try{
+  add('old-site',{domain:'www.google.example',origin:'traffic'});add('old-failure',{domain:'chat.fixture.test',status:'failed',origin:'traffic'});
+  for(let i=0;i<350;i++)add('probe-'+i,{domain:'api.ipify.org',domainSource:'connection',origin:'exit-check'});
+  add('legacy-probe',{domain:'api.ipify.org',domainSource:'connection'});add('legacy-dns-probe',{target:'api.ipify.org',protocol:'DNS'});
+  add('shared-probe-ip',{domain:'api.ipify.org',domainSource:'dns'});add('explicit-site-probe-host',{domain:'api.ipify.org',domainSource:'connection',origin:'traffic'});
+  add('candidates',{domainCandidates:['one.fixture.test','two.fixture.test']});add('other-env',{domain:'hidden.fixture.test'},other.id);add('other-config',{domain:'hidden.fixture.test'},e.id,'other');
+  assert.equal(store.networkRecords(e.id,'connection',key).some((r:any)=>r.domain==='www.google.example'),false);
+  const traffic=store.networkConnectionPage(e.id,key,{scope:'traffic'});assert.equal(traffic.connections.length,5);assert.equal(traffic.connectionPage.total,5);assert.ok(traffic.connections.some(r=>r.domain==='www.google.example'));assert.ok(traffic.connections.some(r=>r.domainSource==='dns'&&r.domain==='api.ipify.org'));
+  const checks=store.networkConnectionPage(e.id,key,{scope:'checks'});assert.equal(checks.connections.length,300);assert.equal(checks.connectionPage.total,352);assert.ok(checks.connectionPage.nextBefore);
+  const second=store.networkConnectionPage(e.id,key,{scope:'checks',before:checks.connectionPage.nextBefore!});assert.equal(second.connections.length,52);assert.equal(second.connectionPage.nextBefore,null);assert.ok(!second.connections.some(row=>checks.connections.some(first=>first.id===row.id)));
+  assert.equal(store.networkConnectionPage(e.id,key,{scope:'traffic',q:'GOOGLE'}).connections.length,1);
+  assert.equal(store.networkConnectionPage(e.id,key,{scope:'all',q:'two.fixture'}).connections.length,1);
+  assert.equal(store.networkConnectionPage(e.id,key,{scope:'all',q:"' OR 1=1 --"}).connections.length,0);
+  assert.equal(store.networkConnectionPage(e.id,key,{scope:'all',q:'hidden.fixture'}).connections.length,0);
+  const failed=store.networkConnectionPage(e.id,key,{scope:'all',failures:true});assert.equal(failed.connections.length,1);assert.equal(failed.connections[0].domain,'chat.fixture.test');
+ }finally{store.close();await rm(dir,{recursive:true,force:true});}
+});
+
 test('Connection exit context never substitutes current, future, failed or expired approvals for past connections',()=>{
   const now=Date.now(),at=(delta:number)=>new Date(now+delta).toISOString();
   const approvals=[{id:1,at:at(0),status:'verified' as const,ip:'203.0.113.10'}];
@@ -149,6 +180,16 @@ test('Collected connection receipts are persisted and isolated from later approv
   }finally{await observer.close();store.close();await rm(dir,{recursive:true,force:true});}
 });
 
+test('A slow ordinary observation probe does not block journal collection, and close still waits for probes',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'mu-observer-queues-')),store=new Store(dir),e=env();store.save(e);const runtime=new LimaRuntime(dir);let cursor=0,probes=0,release!:()=>void;const gate=new Promise<void>(r=>release=r);
+ runtime.management=async(_e,args)=>args.includes('show')?'mucodesandbox-network\n':journal('INFO outbound/socks[upstream]: outbound connection to queue.fixture.test:443','s=queue;i='+(++cursor));
+ const observer=new NetworkObserver(store,runtime,async()=>{probes++;await gate;return{ip:'203.0.113.7',country:'',city:'',latencyMs:1,source:'guest'};},()=>true);
+ try{
+  await observer.tick();assert.equal(probes,2);assert.equal(observer.info(e).connections.length,1);await observer.tick();assert.equal(observer.info(e).connections.length,2);assert.equal(probes,2);
+  let closed=false;const finishing=observer.close().then(()=>{closed=true;});await Promise.resolve();assert.equal(closed,false);release();await finishing;assert.equal(closed,true);
+ }finally{release();await observer.close();store.close();await rm(dir,{recursive:true,force:true});}
+});
+
 test('Observation API retains authentication and cannot accept arbitrary destinations or sample stopped environments',async()=>{
   const dir=await mkdtemp(path.join(tmpdir(),'mu-observation-api-'));
   const browser={native:false,available:async()=>true,running:()=>false,open:async()=>{},close:async()=>{},clear:async()=>{},dispose:async()=>{}};
@@ -160,6 +201,9 @@ test('Observation API retains authentication and cannot accept arbitrary destina
     assert.equal((await fetch(url)).status,401);
     assert.equal((await fetch(url,{headers:{...headers,Origin:'https://untrusted.example'}})).status,403);
     const response=await fetch(url,{headers});assert.equal(response.status,200);assert.equal((await response.json()).enabled,false);
+    assert.equal((await fetch(url+'?scope=traffic&q=fixture',{headers})).status,200);
+    for(const bad of ['scope=arbitrary','before=-1','before=1.5','before=9007199254740992','url=http://169.254.169.254/','q='+('x'.repeat(254))])assert.equal((await fetch(url+'?'+bad,{headers})).status,400);
+    assert.equal((await fetch(url+'?scope=all')).status,401);
     assert.equal((await fetch(url,{method:'POST',headers,body:'{"url":"http://169.254.169.254/"}'})).status,400);
     assert.equal((await fetch(url,{method:'POST',headers,body:'{}'})).status,409);
   }finally{await service.close();await rm(dir,{recursive:true,force:true});}

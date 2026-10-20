@@ -64,7 +64,7 @@ test('Exit measurement is bounded, TLS verified, IPv4 and independent of user cu
   assert.equal(command[command.indexOf('--proxy')+1],'');
   assert.equal(options.timeoutMs,24_000,'Lima command setup has its own bounded budget');
   assert.equal(command[command.indexOf('--max-time')+1],'12','The HTTPS receiver has its own deadline below the kernel lease');
-  assert.equal(command[command.indexOf('--connect-timeout')+1],'4');
+  assert.equal(command[command.indexOf('--connect-timeout')+1],'8');
   for (const value of ['', 'null', '[]', '{"ip":"::1"}', '{"ip":"abc"}', '{"ip":"8.8.8.8","success":false}', 'x'.repeat(65_537)]) assert.throws(() => parseEgress(value));
 });
 

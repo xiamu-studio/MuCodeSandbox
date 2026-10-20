@@ -7,6 +7,7 @@ export interface ConnectionObservation {
   id: number; at: string; target: string; port: number; status: 'attempt' | 'failed' | 'dns-result' | 'dns-cached';
   protocol: 'TCP' | 'UDP' | 'DNS'; route: 'proxy' | 'proxy-dns';
   domain?: string; domainSource?: 'connection' | 'dns'; domainCandidates?: string[];
+  origin?: 'exit-check' | 'traffic';
   dnsAddresses?: string[]; dnsTtlSeconds?: number;
   exitIp?: string; exitCheckedAt?: string; exitSource?: 'verification' | 'observation';
 }
@@ -17,10 +18,13 @@ export interface NetworkObservations {
   enabled: boolean; capture: 'ready' | 'waiting' | 'unsupported' | 'error';
   captureIssue?: string; collectedAt?: string; captureGaps: number; startedAt: string; sampleIntervalSeconds: number;
   lockIp: string | null; samples: ExitObservation[]; connections: ConnectionObservation[];
+  connectionPage?:{total:number;retained:number;nextBefore:number|null};
   summary: { state: 'waiting' | 'unchanged' | 'changed' | 'failed' | 'stale';
     lastIp: string | null; lastCheckedAt: string | null; distinctIps: number; changes: number;
     failures: number; successes: number; firstCheckedAt: string | null };
 }
+export interface ConnectionQuery {q?:string;scope?:'traffic'|'checks'|'all';failures?:boolean;before?:number}
+export const EXIT_CHECK_HOSTS=['api.ipify.org','ipwho.is','api.ipwho.is','icanhazip.com','ipv4.icanhazip.com'] as const;
 
 export function exitSummary(samples: ExitObservation[], now = Date.now()): NetworkObservations['summary'] {
   const successes = samples.filter(s => s.status === 'success' && s.ip);

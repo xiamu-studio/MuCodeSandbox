@@ -1,7 +1,7 @@
 {
   "name": "mucodesandbox",
   "productName": "MuCodeSandbox",
-  "version": "0.4.53",
+  "version": "0.4.65",
   "private": true,
   "type": "module",
   "description": "Local development environments and independent browser sessions for AI tools.",
@@ -12,7 +12,7 @@
   "scripts": {
     "dev": "node --watch server/main.ts --dev",
     "start": "node server/main.ts",
-    "build": "tsc --noEmit && vite build && tsc -p tsconfig.server.json && node scripts/write-build-info.mjs",
+    "build": "tsc --noEmit && tsc -p tsconfig.desktop.json && vite build && tsc -p tsconfig.server.json && node scripts/write-build-info.mjs",
     "test": "node --test tests/*.test.ts",
     "test:ui": "node scripts/verify-ui.mjs",
     "test:desktop": "node scripts/verify-desktop.mjs",

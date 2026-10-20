@@ -10,12 +10,13 @@ export interface RunOptions {
   signal?: AbortSignal;
   onOutput?: (text: string) => void;
   input?: string;
+  inputBytes?: Uint8Array;
   maxBytes?: number;
 }
 export const run: Runner = (file, args, options = {}) => new Promise((resolve, reject) => {
   if (options.signal?.aborted) return reject(new AppError('操作已取消', 409, 'CANCELLED'));
   const child = spawn(file, args, { env: options.env, cwd: options.cwd, shell: false, detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'] } satisfies SpawnOptions);
-  let output = '';
+  let output = '',outputBytes=0;
   let reason: Error | null = null;
   let forceTimer: NodeJS.Timeout | undefined;
   let settled = false;
@@ -46,8 +47,8 @@ export const run: Runner = (file, args, options = {}) => new Promise((resolve, r
   const timer = setTimeout(() => stop(new AppError('操作超时，请检查日志和网络连接', 504, 'TIMEOUT')), options.timeoutMs ?? 30_000);
   const append = (chunk: Buffer) => {
     const text = chunk.toString();
-    output += text;
-    if (Buffer.byteLength(output) > (options.maxBytes ?? 4_000_000)) output = output.slice(-1_000_000);
+    output += text;outputBytes+=Buffer.byteLength(text);
+    if (outputBytes > (options.maxBytes ?? 4_000_000)) {output = output.slice(-1_000_000);outputBytes=Buffer.byteLength(output);}
     options.onOutput?.(text);
   };
   child.stdout.on('data', append);
@@ -59,5 +60,5 @@ export const run: Runner = (file, args, options = {}) => new Promise((resolve, r
   child.on('close', code => {
     finish(reason ?? undefined, code);
   });
-  child.stdin.end(options.input);
+  child.stdin.end(options.inputBytes??options.input);
 });

@@ -23,9 +23,9 @@ Ubuntu x86_64 内继续使用现有 nftables 默认拒绝、sing-box TUN、受�
 
 Windows 11 专业版、可用的 Hyper-V、管理员 PowerShell、Windows OpenSSH、Node.js 24.15.0 或更高版本。开发预览暂以管理员运行生命周期操作；产品化时需要拆出最小权限的宿主代理，不能把管理员运行开发 CLI 当作最终权限模型。
 
-`npm run windows:dev -- doctor` 只读检查。本轮实际检查显示本机缺少 Hyper-V 管理模块及运行中的 VM 管理服务，且当前进程未提升权限，因而真实 VM 测试未执行。CPU/本机地址等检查资料不存入本文件。
+`npm run windows:dev -- doctor` 只读检查。初检时本机缺少 Hyper-V 管理模块及运行中的 VM 管理服务，且当前进程未提升权限。2026-10-20 按用户“现在启用，不自动重启”的授权执行功能启用脚本，系统返回成功及 `RestartNeeded=true`；复核存在系统待重启标记，管理模块和 VM 服务尚未可用。没有执行重启，真实 VM 测试仍未执行。CPU/本机地址等检查资料不存入本文件。
 
-管理员可运行 `scripts/windows/enable-hyperv.ps1` 启用功能。脚本使用 `-NoRestart`，不会自动重启。需要先得到用户对本机启用步骤的回复；重启由用户保存工作后自行安排。
+管理员可运行 `scripts/windows/enable-hyperv.ps1` 启用功能。脚本使用 `-NoRestart`，不会自动重启。本机已完成该启用步骤，无需再次重复运行；重启由用户保存工作后自行安排。完整本机执行回执仅保存在 Git 忽略的数据目录中。
 
 ## 本地验证
 

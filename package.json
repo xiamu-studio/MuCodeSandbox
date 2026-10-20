@@ -20,7 +20,7 @@
     "windows:lab": "node scripts/windows-lab.ts",
     "windows:isolation-lab": "node scripts/windows-isolation-lab.ts",
     "windows:service-lab": "node scripts/windows-service-lab.ts",
-    "test:windows": "node --test tests/windows-platform.test.ts tests/windows-fixtures.test.ts tests/windows-download.test.ts tests/windows-package-proxy.test.ts tests/windows-credentials.test.ts tests/windows-manager.test.ts tests/windows-service.test.ts",
+    "test:windows": "node --test tests/windows-platform.test.ts tests/windows-fixtures.test.ts tests/windows-download.test.ts tests/windows-package-proxy.test.ts tests/windows-credentials.test.ts tests/windows-manager.test.ts tests/windows-service.test.ts tests/windows-terminal.test.ts tests/windows-terminal-process.test.ts",
     "test:ui": "node scripts/verify-ui.mjs",
     "test:desktop": "node scripts/verify-desktop.mjs",
     "test:desktop-crash": "node scripts/verify-desktop-crash.ts --bridge-owner",

@@ -24,6 +24,7 @@ export class WindowsManager {
  readonly store:Store;readonly runtime:WindowsBackend;readonly options:WindowsManagerOptions;
  readonly active=new Map<string,string>();readonly sessions=new Map<string,WindowsNetworkSession>();
  readonly profiles=new Map<string,WindowsConfig>();readonly tasks=new Map<string,{controller:AbortController;promise:Promise<void>}>();
+ onAccessRevoked:((id:string)=>void)|undefined;
  private timer:ReturnType<typeof setInterval>;private monitorTask:Promise<void>|undefined;private closeTask:Promise<void>|undefined;private closing=false;private hostIssue:string|null=null;
  constructor(store:Store,runtime:WindowsBackend,options:WindowsManagerOptions){
   this.store=store;this.runtime=runtime;this.options=options;
@@ -83,6 +84,7 @@ export class WindowsManager {
  private async lifecycle(e:Environment,action:'start'|'stop'|'restart',signal:AbortSignal){
   const c=await this.profile(e,action!=='stop');
   if(action==='stop'||action==='restart'){
+   this.onAccessRevoked?.(e.id);
    const existing=this.sessions.get(e.id);this.sessions.delete(e.id);if(existing)await existing.fail();else await this.runtime.stop(c);this.store.state(e.id,'stopped');
   }
   if(action==='stop')return;
@@ -96,6 +98,7 @@ export class WindowsManager {
    const session=await this.runtime.session(c,this.options.probe?.(c));this.sessions.set(e.id,session);await this.runtime.connect(c);signal.throwIfAborted();await session.open();signal.throwIfAborted();
    this.store.state(e.id,'running');this.store.log(e.id,null,'网络规则、出口和限时联网许可已通过核验');
   }catch(error){
+   this.onAccessRevoked?.(e.id);
    const session=this.sessions.get(e.id);this.sessions.delete(e.id);try{if(session)await session.fail();else await this.runtime.stop(c);}catch(stopError){throw new AggregateError([error,stopError],'启动失败且停机未确认');}throw error;
   }
  }
@@ -109,6 +112,7 @@ export class WindowsManager {
   await this.assertAccess(id);const guard=await this.runtime.inspectGuard(await this.profile(e));return {prepared:true,bootArmed:true,active:session.state==='active'&&guard.leaseActive,policy:'transparent',firewallActive:true,transparentReady:true,transparentActive:true,proxyEndpoints:[`${e.network.host}:${e.network.port}`],blockedPackets:0,checkedAt:new Date().toISOString(),integrity:'verified',leasePrepared:true,leaseActive:guard.leaseActive,leaseRemainingMs:guard.remainingMs};
  }
  private async quarantine(id:string,issue:string){
+  this.onAccessRevoked?.(id);
   const session=this.sessions.get(id);this.sessions.delete(id);try{if(session)await session.fail();else await this.runtime.stop(await this.profile(this.store.get(id),false));this.store.state(id,'error',issue+'；环境已确认关闭');}
   catch(error){this.store.state(id,'error',issue+'；停机未确认：'+redact(errorMessage(error)));}
  }

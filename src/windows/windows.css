@@ -7,4 +7,12 @@
 .windows-preview .windows-job>span{flex:1;overflow-wrap:anywhere}
 .windows-preview .windows-job>time{color:var(--muted,#737b75)}
 .windows-preview .log-surface{max-height:360px;overflow:auto}
+.windows-preview .windows-tools{margin:24px 0}
+.windows-preview .terminal-tool{height:650px}
+.windows-preview .terminal-container{min-height:200px;flex:1}
+.windows-terminal-input{padding:12px;display:flex;align-items:end;gap:12px;flex-wrap:wrap;background:#edf2f0;color:#283431}
+.windows-terminal-input label{flex:1;min-width:220px}.windows-terminal-input textarea{display:block;width:100%;height:64px;margin-top:6px;resize:vertical}
+.windows-terminal-input small{flex-basis:100%}.windows-terminal-input p{color:#a33}
+.windows-file-row{display:flex;align-items:center;gap:16px;padding:12px 0;border-bottom:1px solid var(--line)}
+.windows-file-row>span{flex:1;overflow-wrap:anywhere}
 @media(max-width:760px){.windows-preview .windows-environment-row>span:nth-child(2){display:none}.windows-preview .windows-job>time{display:none}}

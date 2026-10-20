@@ -8,13 +8,14 @@ import GuestQuickTools from './GuestQuickTools.tsx';
 import {safeTerminalPaste,terminalInputChunks} from './terminal-input.ts';
 import '@xterm/xterm/css/xterm.css';
 
-export default function TerminalPanel({ environment, command = 'shell',active=true }: { environment: Environment; command?: 'shell' | 'claude';active?:boolean }) {
+export default function TerminalPanel({ environment, command = 'shell',active=true,quickTools='full' }: { environment: Environment; command?: 'shell' | 'claude';active?:boolean;quickTools?:'full'|'text' }) {
   const container = useRef<HTMLDivElement>(null);
   const surface=useRef<HTMLDivElement>(null);
   const session=useRef<{term:Terminal;socket?:WebSocket;ready:boolean}|null>(null);
   const visible=useRef(active);visible.current=active;
   const [attempt, setAttempt] = useState(0);
   const [status, setStatus] = useState('连接中');
+  const [draft,setDraft]=useState(''),[textError,setTextError]=useState('');
   useEffect(() => {
     if (!container.current) return;
     let disposed = false;
@@ -57,8 +58,10 @@ export default function TerminalPanel({ environment, command = 'shell',active=tr
   async function paste(text:string){const current=currentSession();const value=safeTerminalPaste(text,current.term.modes.bracketedPasteMode);current.term.focus();current.term.paste(value);}
   async function readText(){return currentSession().term.getSelection();}
   function sendKey(key:'backspace'|'enter'){try{const current=currentSession();current.term.focus();current.socket!.send(JSON.stringify({type:'input',data:key==='enter'?'\r':'\x7f'}));}catch{/* Disconnected controls are disabled. */}}
+  function pasteDraft(){setTextError('');void paste(draft).then(()=>setDraft(''),error=>setTextError(error.message));}
   return <div className="terminal-tool" ref={surface}>
-    <div className="terminal-header"><span>{command === 'claude' ? <Bot size={16} /> : <TerminalSquare size={16} />} {environment.name}<span className="terminal-path">{environment.mounts[0]?.guestPath ?? '/workspace'}</span></span><span className="terminal-actions"><span className="terminal-connection" role="status"><Circle size={7} fill={status === '已连接' ? '#87c8a4' : '#8b969a'} /> {status}</span><GuestQuickTools key={environment.id+':'+command} id={environment.id} active={active} connected={status==='已连接'} dropTarget={surface} terminal onPaste={paste} onReadText={readText} onKey={sendKey} onReturn={()=>{if(visible.current)session.current?.term.focus();}}/><button className="icon-button dark" title="重新连接" aria-label="重新连接终端" onClick={() => setAttempt(n => n + 1)}><RotateCw size={15} /></button></span></div>
+    <div className="terminal-header"><span>{command === 'claude' ? <Bot size={16} /> : <TerminalSquare size={16} />} {environment.name}<span className="terminal-path">{environment.mounts[0]?.guestPath ?? '/workspace'}</span></span><span className="terminal-actions"><span className="terminal-connection" role="status"><Circle size={7} fill={status === '已连接' ? '#87c8a4' : '#8b969a'} /> {status}</span>{quickTools==='full'&&<GuestQuickTools key={environment.id+':'+command} id={environment.id} active={active} connected={status==='已连接'} dropTarget={surface} terminal onPaste={paste} onReadText={readText} onKey={sendKey} onReturn={()=>{if(visible.current)session.current?.term.focus();}}/>}<button className="icon-button dark" title="重新连接" aria-label="重新连接终端" onClick={() => setAttempt(n => n + 1)}><RotateCw size={15} /></button></span></div>
     <div className="terminal-container" ref={container} />
+    {quickTools==='text'&&<div className="windows-terminal-input"><label>中文与多行输入<textarea aria-label="终端待粘贴文字" value={draft} maxLength={65536} onChange={event=>setDraft(event.target.value)} onKeyDown={event=>{if(event.ctrlKey&&event.key==='Enter'&&!event.nativeEvent.isComposing){event.preventDefault();pasteDraft();}}}/></label><button type="button" className="button" disabled={!active||status!=='已连接'||!draft} onClick={pasteDraft}>粘贴到终端</button><small>仅粘贴文字，不自动执行。Ctrl+Enter 粘贴；在终端内按 Enter 执行。</small>{textError&&<p role="alert">{textError}</p>}</div>}
   </div>;
 }

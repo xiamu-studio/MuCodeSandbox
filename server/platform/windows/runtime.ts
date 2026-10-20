@@ -15,6 +15,8 @@ import { windowsConfigSchema, windowsPaths, vmIdentity, RELAY_PORT, PROBE_PORT, 
 import { cloudInit, bootstrapScript, installAmd64TunnelScript, configureWindowsGuard, INSPECT_WINDOWS_GUARD, windowsEnvironment } from './guest.ts';
 import { WindowsNetworkSession } from './session.ts';
 import { measureEgress } from '../../egress.ts';
+import {AppError} from '../../errors.ts';
+import {GUEST_TASK_RUN,GUEST_TASK_CANCEL} from '../../guest-task.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../..','scripts/windows');
 const inspection=z.object({digest:z.string().regex(/^[a-f0-9]{64}$/),leaseActive:z.boolean(),remainingMs:z.number().nonnegative().max(45000)}).strict();
@@ -104,6 +106,32 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   async management(c:WindowsConfig,command:string[],options:RunOptions={}) {
     return this.runner(path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe'),
       [...await this.ssh(c),command.map(shellQuote).join(' ')],options);
+  }
+  private developer(c:WindowsConfig,command:string[]){
+    return ['sudo','-n','-H','-u','dev','--','env','-i','HOME=/home/dev','USER=dev','LOGNAME=dev','SHELL=/bin/bash',
+      'PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin','TERM=xterm-256color','LANG=C.UTF-8','LC_ALL=C.UTF-8',`TZ=${c.timezone}`,
+      '/usr/local/bin/mu-proxy-run','bash','-c','cd /workspace && exec "$@"','--',...command];
+  }
+  async guest(c:WindowsConfig,command:string[],options:RunOptions={}){
+    options.signal?.throwIfAborted();const token=randomUUID(),timeoutMs=options.timeoutMs??30000;
+    if(!Number.isFinite(timeoutMs)||timeoutMs<=0||timeoutMs>86400000)throw new AppError('开发任务超时时间无效',400);
+    let cancellation:Promise<string>|undefined;
+    const cancel=()=>{cancellation??=this.management(c,this.developer(c,['python3','-c',GUEST_TASK_CANCEL,token]),{timeoutMs:8000});void cancellation.catch(()=>{});};
+    options.signal?.addEventListener('abort',cancel,{once:true});
+    try{return await this.management(c,this.developer(c,['python3','-c',GUEST_TASK_RUN,token,String(timeoutMs),...command]),options);}
+    catch(error){if(error instanceof AppError&&['TIMEOUT','CANCELLED'].includes(error.code))cancel();throw error;}
+    finally{options.signal?.removeEventListener('abort',cancel);if(cancellation)await cancellation;}
+  }
+  async terminalLaunch(c:WindowsConfig){
+    const args=(await this.ssh(c)).filter(arg=>arg!=='-T');
+    // Disable the SSH escape interpreter: input must never open a host shell,
+    // change forwarding or start a host command through ~! / ~C escapes.
+    args.unshift('-tt','-a','-x','-o','EscapeChar=none','-o','ClearAllForwardings=yes','-o','PermitLocalCommand=no','-o','IdentityAgent=none');
+    args.push(this.developer(c,['bash','-l']).map(shellQuote).join(' '));
+    const systemRoot=process.env.SystemRoot??'C:\\Windows';
+    const env:Record<string,string>={SystemRoot:systemRoot,PATH:path.join(systemRoot,'System32'),TERM:'xterm-256color'};
+    for(const key of ['SystemDrive','TEMP','TMP','USERPROFILE','LOCALAPPDATA','PROGRAMDATA'])if(process.env[key])env[key]=process.env[key]!;
+    return {file:path.join(systemRoot,'System32/OpenSSH/ssh.exe'),args,env,cwd:this.root};
   }
   async create(input:WindowsConfig,options:RunOptions={}) {
     const c=windowsConfigSchema.parse(input),p=windowsPaths(this.root,c.id),n=vmIdentity(c.id);

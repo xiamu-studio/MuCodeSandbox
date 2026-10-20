@@ -245,10 +245,10 @@ with os.fdopen(fd,'wb') as f:
 export const inlineTranslationText=z.string().min(1).max(TRANSLATION_INPUT_LIMIT).refine(text=>text.length<=TRANSLATION_INPUT_LIMIT&&!!text.trim()&&!text.includes('\0'),`请输入最多 ${TRANSLATION_INPUT_LIMIT} 字的普通文本`);
 
 export class GuestExchange {
-  runtime:LimaRuntime;authorize:(id:string)=>Promise<Environment>;
+  runtime:Pick<LimaRuntime,'guest'|'management'>;authorize:(id:string)=>Promise<Environment>;
   busy=new Set<string>();
   private translationSettings?:Pick<TranslationSettings,'credential'|'revision'>;
-  constructor(runtime:LimaRuntime,authorize:(id:string)=>Promise<Environment>,translationSettings?:Pick<TranslationSettings,'credential'|'revision'>){this.runtime=runtime;this.authorize=authorize;this.translationSettings=translationSettings;}
+  constructor(runtime:Pick<LimaRuntime,'guest'|'management'>,authorize:(id:string)=>Promise<Environment>,translationSettings?:Pick<TranslationSettings,'credential'|'revision'>){this.runtime=runtime;this.authorize=authorize;this.translationSettings=translationSettings;}
   private async operation<T>(id:string,work:(e:Environment)=>Promise<T>){
     if(this.busy.has(id))throw new AppError('当前环境正在传输，请稍后重试',409,'TRANSFER_BUSY');
     this.busy.add(id);

@@ -1,15 +1,19 @@
-import {useCallback,useEffect,useRef,useState} from 'react';
+import {lazy,Suspense,useCallback,useEffect,useRef,useState} from 'react';
 import {Box,LockKeyhole,Plus,RefreshCw,Settings,ShieldCheck,TerminalSquare} from 'lucide-react';
 import type {Environment,LogEntry,NetworkProtection,Snapshot} from '../../shared/types.ts';
 import {api,editConfig} from '../api.ts';
 import {Button,Field,Modal,Notice,SectionHeading,Status,dateLabel} from '../components.tsx';
 import './windows.css';
+import WindowsFilesPanel from './WindowsFilesPanel.tsx';
+const TerminalPanel=lazy(()=>import('../TerminalPanel.tsx'));
 
 const displayIssue=(message:string)=>message.replaceAll('Two distinct matching exit receipts are required','未获得两个与批准出口一致的核验结果，请检查代理和出口配置');
 
 export default function WindowsWorkspace(){
  const [snapshot,setSnapshot]=useState<Snapshot|null>(null),[selectedId,select]=useState<string|null>(null),[system,showSystem]=useState(false);
  const [error,setError]=useState(''),[connected,setConnected]=useState(true),[dialog,setDialog]=useState<'new'|Environment|null>(null);
+ const [tool,setTool]=useState<'terminal'|'files'|null>(null);
+ useEffect(()=>{setTool(null);},[selectedId]);
  const [protection,setProtection]=useState<NetworkProtection|null>(null),[guardError,setGuardError]=useState(''),[logs,setLogs]=useState<LogEntry[]>([]);
  const live=useRef(false),pending=useRef<Promise<void>|null>(null);
  const refresh=useCallback(()=>{
@@ -51,7 +55,7 @@ export default function WindowsWorkspace(){
      <header className="page-header"><div><div className="eyebrow">WINDOWS</div><h1>系统状态</h1><p>Hyper-V 管理预览</p></div></header>
      <dl className="facts"><div><dt>运行组件</dt><dd>{snapshot.system.runtime.available?'已就绪':'需要处理'}</dd></div><div><dt>虚拟化后端</dt><dd>Windows Hyper-V</dd></div><div><dt>设备资源</dt><dd>{snapshot.system.cpus} 核心 · {snapshot.system.memoryGiB} GiB</dd></div><div><dt>数据目录</dt><dd className="path-text">{snapshot.system.dataDir}</dd></div><div><dt>版本</dt><dd>{snapshot.system.version}</dd></div></dl>
      {snapshot.system.runtime.error&&<Notice kind="error">{snapshot.system.runtime.error}</Notice>}
-     <Notice>当前可创建、启动、停止和核验 Linux 环境。浏览器、终端、文件传输、共享、快照和安装包仍在开发。</Notice>
+     <Notice>当前可管理 Linux 环境，使用交互式终端和文件传输。浏览器画面、共享、快照和安装包仍在开发。</Notice>
     </>:selected?<>
      <header className="page-header environment-header"><div><div className="eyebrow">HYPER-V · LINUX</div><h1>{selected.name}</h1><p>{selected.description}</p></div><div className="environment-header-actions"><Status state={selected.state}/><Button disabled={!connected||!!active||selected.state!=='running'} onClick={()=>void action('restart')} icon={<RefreshCw size={15}/>}>重启</Button><Button className="primary" loading={!!active} disabled={!connected} onClick={()=>void action(selected.state==='running'?'stop':'start')}>{active?'处理中':selected.state==='running'?'停止':'启动'}</Button></div></header>
      {selected.lastError&&<Notice kind="error">{displayIssue(selected.lastError)}</Notice>}
@@ -59,6 +63,9 @@ export default function WindowsWorkspace(){
      {guardError&&<Notice kind="error">{guardError}</Notice>}
      <SectionHeading title="环境配置" action={<Button disabled={!!active||selected.state==='running'} onClick={()=>setDialog(selected)}>编辑配置</Button>}/>
      <dl className="facts"><div><dt>资源</dt><dd>{selected.cpus} 核心 · {selected.memoryGiB} GiB 内存 · {selected.diskGiB} GiB 磁盘</dd></div><div><dt>代理</dt><dd>{selected.network.mode.toUpperCase()} · {selected.network.host}:{selected.network.port}</dd></div><div><dt>批准的出口</dt><dd>{selected.network.egressLock?.expectedIp}</dd></div><div><dt>时区</dt><dd>{selected.identity.timezone}</dd></div><div><dt>凭据</dt><dd>{selected.network.passwordConfigured?'已加密保存':'未设置密码'}</dd></div></dl>
+     <div className="button-row windows-tools">{window.__MU_CONFIG__.capabilities?.terminal&&<Button disabled={selected.state!=='running'||!!active} onClick={()=>setTool(tool==='terminal'?null:'terminal')} icon={<TerminalSquare size={15}/>}>Linux 终端</Button>}{window.__MU_CONFIG__.capabilities?.files&&<Button disabled={selected.state!=='running'||!!active} onClick={()=>setTool(tool==='files'?null:'files')}>文件传输</Button>}</div>
+     {selected.state==='running'&&!active&&tool==='terminal'&&<Suspense fallback={<p>加载终端…</p>}><TerminalPanel key={selected.id} environment={selected} quickTools="text"/></Suspense>}
+     {selected.state==='running'&&!active&&tool==='files'&&<WindowsFilesPanel key={selected.id} id={selected.id}/>}
     </>:<>
      <header className="page-header"><div><div className="eyebrow">WINDOWS PREVIEW</div><h1>工作区</h1><p>独立 Linux 环境 · 严格代理联网</p></div><Button className="primary" disabled={!connected} onClick={()=>setDialog('new')} icon={<Plus size={16}/>}>新建环境</Button></header>
      <Notice>先配置代理和明确批准的出口 IPv4。启动时核验出口，核验失败或连接中断会关闭环境。</Notice>

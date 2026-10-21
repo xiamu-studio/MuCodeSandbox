@@ -4,7 +4,7 @@ import {readFile} from 'node:fs/promises';
 import path from 'node:path';
 import express from 'express';
 import {z} from 'zod';
-import {VERSION} from '../../../shared/version.ts';
+import {VERSION} from './release.ts';
 import {createUISession} from '../../ui-session.ts';
 import {AppError} from '../../errors.ts';
 import type {HyperVBrokerClient} from './broker.ts';

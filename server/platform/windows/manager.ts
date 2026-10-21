@@ -5,7 +5,7 @@ import {isIPv4} from 'node:net';
 import {cpus,totalmem,freemem,hostname} from 'node:os';
 import path from 'node:path';
 import type {Environment,Job,Snapshot,NetworkProtection} from '../../../shared/types.ts';
-import {VERSION} from '../../../shared/version.ts';
+import {VERSION} from './release.ts';
 import {Store} from '../../store.ts';
 import {environmentSchema,redact} from '../../validation.ts';
 import {AppError,errorMessage} from '../../errors.ts';

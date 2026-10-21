@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','power-inspect','power-discard-failed','power-clear-failed','power-prepare-reset','power-run','power-recover','power-progress','power-collect','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-loss','adoption-review','adoption-approve','adoption-ui','adoption-ui-stage','adoption-ui-collect','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','upgrade-stage','upgrade-seed','upgrade-baseline','upgrade-current','upgrade-compare-current','upgrade-current-check','upgrade-baseline-next','upgrade-next','upgrade-compare-next','upgrade-next-check','upgrade-reject','upgrade-final','upgrade-inspect','upgrade-collect','power-inspect','power-discard-failed','power-clear-failed','power-prepare-reset','power-run','power-recover','power-progress','power-collect','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-loss','adoption-review','adoption-approve','adoption-ui','adoption-ui-stage','adoption-ui-collect','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -70,6 +70,22 @@ try{
   try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
   Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
   do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'power-capabilities-inspected-and-evaluation-vm-off' $value;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown not confirmed'};Start-Sleep -Seconds 2}while($true)
+ }
+ if($Phase.StartsWith('upgrade-')){
+  $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-upgrade-operator.ps1'))
+  if($Phase -eq 'upgrade-stage'){
+   Invoke-Command -Session $session -ScriptBlock {if($env:COMPUTERNAME -ne 'MU-CLEAN-LAB' -or @(Get-VM).Count){throw 'Upgrade staging requires the empty isolated guest'};[void][IO.Directory]::CreateDirectory('C:\MuLab\upgrade-payload')}
+   $packages=@{};foreach($role in @('baseline','current','next')){$packageMetadata=Get-Content -LiteralPath (Join-Path $PSScriptRoot ('../../.mu-data/windows-run/upgrade-'+$role+'-package.json')) -Raw|ConvertFrom-Json;$installer=@($packageMetadata.artifacts|Where-Object{$_ -like '*.exe'})[0];$pkg=Get-Content -LiteralPath (Join-Path $packageMetadata.stage.app package.json) -Raw|ConvertFrom-Json;$target='C:\MuLab\upgrade-payload\'+$role+'.exe';Copy-Item -LiteralPath $installer -Destination $target -ToSession $session -Force;$packages[$role]=@{file=$target;version=$pkg.version;sha256=(Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant()}}
+   Invoke-Command -Session $session -ArgumentList ($packages|ConvertTo-Json -Depth 5 -Compress) -ScriptBlock {param($json) $packages=$json|ConvertFrom-Json;foreach($role in @('baseline','current','next')){if((Get-FileHash -LiteralPath $packages.$role.file).Hash.ToLowerInvariant() -ne $packages.$role.sha256){throw 'Upgrade payload digest changed'}};[IO.File]::WriteAllText('C:\MuLab\approved\upgrade-packages.json',$json)}
+   Save-Probe 'verified-upgrade-installers-staged';exit 0
+  }
+  if($Phase -in @('upgrade-baseline','upgrade-compare-current','upgrade-baseline-next','upgrade-compare-next','upgrade-inspect','upgrade-collect')){
+   $action=$Phase.Substring(8);$value=Invoke-Command -Session $session -ArgumentList $operatorSource,$action -ScriptBlock {param($source,$action) & ([ScriptBlock]::Create($source)) -Action $action};Save-Probe 'upgrade-diagnostic-evidence' $value
+   if($Phase -eq 'upgrade-collect'){
+    Assert-LabVM|Out-Null;try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{};Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
+    do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'upgrade-complete-and-evaluation-vm-off' $value;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown not confirmed'};Start-Sleep -Seconds 2}while($true)
+   };exit 0
+  }
  }
  if($Phase.StartsWith('power-')){
   $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-power-operator.ps1'))
@@ -383,6 +399,7 @@ try{
   }
  }
  Save-Probe 'preparing-standard-user-probe'
+ if($Phase.StartsWith('upgrade-')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-upgrade-client.mjs') -Destination C:\MuLab\upgrade-client.mjs -ToSession $session -Force}
  if($Phase.StartsWith('power-')){
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-power-client.mjs') -Destination C:\MuLab\power-client.mjs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-channel.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-channel.ps1 -ToSession $session -Force
@@ -396,6 +413,13 @@ try{
  }
  if($Phase -eq 'network'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-network-client.mjs') -Destination C:\MuLab\network-client.mjs -ToSession $session -Force}
  if($Phase.StartsWith('ledger-') -or $Phase.StartsWith('resource-') -or $Phase.StartsWith('adoption-') -or $Phase.StartsWith('power-') -or $Phase -in @('cache','cache-ui')){
+  $sourcePackage=Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../.mu-data/windows-run/desktop-package.json') -Raw|ConvertFrom-Json
+  if($sourcePackage.stage.release){
+   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/release.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\release.js -ToSession $session -Force
+   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/shared/windows-release.js') -Destination C:\MuLab\product\resources\app\dist-server\shared\windows-release.js -ToSession $session -Force
+   Copy-Item -LiteralPath (Join-Path $sourcePackage.stage.app 'dist-server/windows-release.json') -Destination C:\MuLab\product\resources\app\dist-server\windows-release.json -ToSession $session -Force
+   Invoke-Command -Session $session -ArgumentList $sourcePackage.stage.release.version -ScriptBlock {param($version) $package=Get-Content -LiteralPath C:\MuLab\product\resources\app\package.json -Raw|ConvertFrom-Json;$package.version=$version;[IO.File]::WriteAllText('C:\MuLab\product\resources\app\package.json',($package|ConvertTo-Json -Depth 12 -Compress))}
+  }
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-ledger-client.mjs') -Destination C:\MuLab\ledger-client.mjs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ProtectedLedger.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HostComponents.cs -ToSession $session -Force
@@ -426,7 +450,7 @@ try{
   $manifest=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json
   if((Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.nodeSha256){throw 'Packaged Node digest changed'}
   if((Get-FileHash -LiteralPath C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.hostScriptSha256){throw 'Packaged servicing script changed'}
-  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny') -or $phase.StartsWith('resource-') -or $phase.StartsWith('adoption-') -or $phase.StartsWith('power-')){
+  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny') -or $phase.StartsWith('resource-') -or $phase.StartsWith('adoption-') -or $phase.StartsWith('power-') -or $phase.StartsWith('upgrade-')){
    $build=@'
 import {buildBroker} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/broker.js';
 import {writeFile} from 'node:fs/promises';

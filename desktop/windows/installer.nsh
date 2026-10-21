@@ -37,6 +37,33 @@
     SetErrorLevel 2
     Quit
   ${EndIf}
+  !ifndef BUILD_UNINSTALLER
+    ; Check the installed and selected roots before the old uninstaller runs.
+    ReadRegStr $R7 HKCU "${INSTALL_REGISTRY_KEY}" InstallLocation
+    System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_REGISTERED_ROOT", t "$R7")'
+    ReadRegStr $R7 HKCU "${UNINSTALL_REGISTRY_KEY}" DisplayVersion
+    System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_REGISTERED_VERSION", t "$R7")'
+    System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_INSTALL_VERSION", t "${VERSION}")'
+    InitPluginsDir
+    SetOutPath $PLUGINSDIR
+    File "/oname=mu-check-release.ps1" "@MU_WINDOWS_VERSION_CHECK_FILE@"
+    System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_VERSION_SCRIPT", t "$PLUGINSDIR\mu-check-release.ps1")'
+    nsExec::ExecToStack /TIMEOUT=15000 '"$PowerShellPath" -NoLogo -NoProfile -NonInteractive -EncodedCommand @MU_WINDOWS_VERSION_CHECK@'
+    Pop $R9
+    Pop $R8
+    !insertmacro MuInstallTrace "install-release-check=$R9"
+    ${If} $R9 != 0
+      ${IfNot} ${Silent}
+        MessageBox MB_OK|MB_ICONEXCLAMATION "This Windows Preview release cannot replace the installed version, or its release metadata could not be verified. Existing files and data were preserved."
+      ${EndIf}
+      ${If} $R9 == 4
+        SetErrorLevel 4
+      ${Else}
+        SetErrorLevel 5
+      ${EndIf}
+      Quit
+    ${EndIf}
+  !endif
   ; The parent installer also held $INSTDIR as its working directory. Release
   ; that directory before its child uninstaller attempts the sibling rename.
   SetOutPath $TEMP

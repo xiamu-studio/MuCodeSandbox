@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';import path from 'node:path';import {readFile} from 'node:fs/promises';
+import {run} from '../server/process.ts';import {powershellPath,powershellArgs} from '../server/platform/windows/runtime.ts';import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
+const phase=process.argv[2];assert.ok(['deployment-inspect','host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','collect-stop'].includes(phase));
+const index=JSON.parse(await readFile('.mu-data/windows-run/pro-host-lab.json','utf8')),directory=path.resolve(index.directory);
+assert.equal(path.dirname(directory),path.resolve(windowsRuntimeDirectory()));assert.match(path.basename(directory),/^pro-host-[a-f0-9-]{36}$/);
+const script=phase==='deployment-inspect'?'scripts/windows/inspect-pro-deployment.ps1':'scripts/windows/verify-pro-host.ps1';
+const body="& '"+path.resolve(script).replaceAll("'","''")+"' -Directory '"+directory.replaceAll("'","''")+"' -OwnerPid "+process.pid+(phase==='deployment-inspect'?'':" -Phase '"+phase+"'"),encoded=Buffer.from(body,'utf16le').toString('base64');
+console.log('Running '+phase+' only inside the new disconnected Pro VM.');
+await run(powershellPath(),powershellArgs("$ErrorActionPreference='Stop';$p=Start-Process -FilePath '"+powershellPath()+"' -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','"+encoded+"') -WorkingDirectory '"+directory.replaceAll("'","''")+"' -Verb RunAs -WindowStyle Hidden -Wait -PassThru;if($p.ExitCode -ne 0){throw 'The Pro probe did not pass; inspect the retained fixture and its live processes before retrying'}"),{timeoutMs:5100000,onOutput:value=>process.stdout.write(value)});
+console.log('Pro '+phase+' completed; the physical host was not restarted.');

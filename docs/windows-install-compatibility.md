@@ -27,6 +27,6 @@ Computer Use 在启动卸载器时返回“product policy blocks this app”。�
 
 实际下载完成并通过整体摘要校验。scripts/windows-pro-download.ts 固定该版本、语言、官方主机及摘要；临时签名链接只保存在忽略的请求文件中。scripts/windows-pro-inspect.ts 仅以普通用户读取已提取 WIM 的有界 XML 元数据，格式参考 [wimlib 的原始头定义](https://github.com/ebiggers/wimlib/blob/master/include/wimlib/header.h)。本机忽略回执记录 ISO/WIM/XML 摘要和全部镜像索引。
 
-离线元数据确认 Professional 位于索引 4，为 Windows 11 Pro、AMD64、zh-CN、构建 26300.9457。此阶段没有创建或启动 Pro 虚拟机，不代表 Pro 上的组件安装、嵌套 Linux 或网络防护已经通过。
+离线元数据确认 Professional 位于索引 4，为 Windows 11 Pro、AMD64、zh-CN、构建 26300.9457。介质准备阶段没有创建或启动 Pro 虚拟机；后续已完成独立 Pro VM 的真实组件安装及嵌套 Linux 核心链路，详见 [Pro 验收](windows-pro-validation.md)。网络逐包补测和完整图形流程继续分别记录。
 
-物理宿主不重启，现有评估 VM 不变，不访问 AI 网站。下一步在独立 Pro 测试 VM 部署该镜像，再交叉核对组件准备、嵌套启动和控制面板登记。
+物理宿主不重启，现有评估 VM 不变，不访问 AI 网站。Pro 的组件/嵌套核心链路已通过，控制面板登记及完整图形安装仍待交叉核对。

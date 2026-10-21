@@ -77,5 +77,55 @@ public sealed class MuPacketLabGuard:IDisposable {
     public string ReadCommand(string name){
         using(identity.Impersonate())using(var file=new FileStream(FilePath(name),FileMode.Open,FileAccess.Read,FileShare.Read)){if(file.Length>4096)throw new ArgumentException("Diagnostic request too large");using(var reader=new StreamReader(file,System.Text.Encoding.UTF8,true))return reader.ReadToEnd();}
     }
+    // Offline deployment inputs are opened with the ordinary owner's token.
+    // Retained handles reject links and prevent replacement while an elevated
+    // diagnostic copies them into its newly created, protected virtual disk.
+    private SafeFileHandle OpenOwnerFile(string path){
+        SafeFileHandle file;
+        using(identity.Impersonate())file=CreateFile(path,0x80000000,1,IntPtr.Zero,3,0x08200000,IntPtr.Zero);
+        if(file.IsInvalid){file.Dispose();throw new IOException("Cannot open ordinary-user diagnostic input");}
+        var info=new byte[52];
+        if(!GetFileInformationByHandle(file,info)||((FileAttributes)BitConverter.ToUInt32(info,0)&(FileAttributes.ReparsePoint|FileAttributes.Directory))!=0){file.Dispose();throw new IOException("Diagnostic input must be a regular file");}
+        return file;
+    }
+    public void PinInputFile(string input){
+        string full=Path.GetFullPath(input),parent=Path.GetDirectoryName(full);
+        if(full.Length<4||full[1]!=':')throw new ArgumentException("Local diagnostic input required");
+        using(identity.Impersonate()){
+            string cursor=Path.GetPathRoot(parent);Pin(cursor);
+            foreach(string part in parent.Substring(cursor.Length).Split(new[]{'\\'},StringSplitOptions.RemoveEmptyEntries)){cursor=Path.Combine(cursor,part);Pin(cursor);}
+        }
+        held.Add(OpenOwnerFile(full));
+    }
+    public void CopyGuestSeed(string destination){
+        string source=FilePath("guest-seed");
+        var pending=new Stack<string>();pending.Push(source);
+        int count=0;long bytes=0;
+        while(pending.Count!=0){
+            string folder=pending.Pop();string[] entries;
+            using(identity.Impersonate()){Pin(folder);entries=Directory.GetFileSystemEntries(folder);}
+            Directory.CreateDirectory(Path.Combine(destination,folder.Substring(source.Length).TrimStart('\\')));
+            foreach(string entry in entries){
+                FileAttributes attrs;using(identity.Impersonate())attrs=File.GetAttributes(entry);
+                if((attrs&FileAttributes.ReparsePoint)!=0)throw new IOException("Diagnostic seed link rejected");
+                string target=Path.Combine(destination,entry.Substring(source.Length+1));
+                if((attrs&FileAttributes.Directory)!=0){pending.Push(entry);continue;}
+                if(++count>12000)throw new IOException("Diagnostic seed contains too many files");
+                using(var handle=OpenOwnerFile(entry))using(var input=new FileStream(handle,FileAccess.Read,65536,false)){
+                    bytes+=input.Length;if(bytes>64L*1024*1024*1024)throw new IOException("Diagnostic seed exceeds its size bound");
+                    using(var output=new FileStream(target,FileMode.CreateNew,FileAccess.Write,FileShare.None)){input.CopyTo(output);output.Flush(true);}
+                }
+            }
+        }
+    }
+    public string ReadGuestCredentials(){
+        string seed=FilePath("guest-seed"),parent=Path.Combine(seed,"private");
+        using(identity.Impersonate()){Pin(seed);Pin(parent);}
+        using(var handle=OpenOwnerFile(Path.Combine(parent,"credentials.json")))
+        using(var input=new FileStream(handle,FileAccess.Read,4096,false)){
+            if(input.Length>4096)throw new IOException("Diagnostic credential input too large");
+            using(var reader=new StreamReader(input,new System.Text.UTF8Encoding(false,true),true))return reader.ReadToEnd();
+        }
+    }
     public void Dispose(){for(int i=held.Count-1;i>=0;i--)held[i].Dispose();identity.Dispose();Owner.Dispose();}
 }

@@ -14,11 +14,11 @@ export const LAB_PROBE_HOSTS=['receiver-a.mu.test','receiver-b.mu.test'] as cons
 
 // Every possible destination is mapped to loopback or rejected. The fixture
 // proxy never opens an Internet connection, including DNS or model services.
-export async function localFixtures(directory:string,openssl:string,exitIp=LAB_EXIT,content?:(request:IncomingMessage,response:ServerResponse)=>boolean,trace?:(value:object)=>void) {
+export async function localFixtures(directory:string,openssl:string,exitIp=LAB_EXIT,content?:(request:IncomingMessage,response:ServerResponse)=>boolean,trace?:(value:object)=>void,options:{productionProbeAliases?:boolean;reuseCertificate?:boolean}={}) {
   await mkdir(directory,{recursive:true});
   const key=path.join(directory,'fixture-key.pem'),cert=path.join(directory,'fixture-cert.pem');
-  await run(openssl,['req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=Mu local test only',
-    '-addext','subjectAltName=IP:203.0.113.10,IP:203.0.113.11,IP:203.0.113.12,DNS:receiver.mu.test,DNS:receiver-a.mu.test,DNS:receiver-b.mu.test,DNS:dns.mu.test','-keyout',key,'-out',cert],{timeoutMs:15000});
+  if(!options.reuseCertificate)await run(openssl,['req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=Mu local test only',
+    '-addext','subjectAltName=IP:203.0.113.10,IP:203.0.113.11,IP:203.0.113.12,DNS:receiver.mu.test,DNS:receiver-a.mu.test,DNS:receiver-b.mu.test,DNS:dns.mu.test'+(options.productionProbeAliases?',DNS:api.ipify.org,DNS:ipwho.is,DNS:api.ipwho.is,DNS:icanhazip.com,DNS:ipv4.icanhazip.com':''),'-keyout',key,'-out',cert],{timeoutMs:15000});
   const material={key:await readFile(key),cert:await readFile(cert)};
   const sockets=new Set<Duplex>();let receipts=0,denied=0,stopped=false,dnsRequests=0,available=true,conflict=false,dnsAvailable=true;
   const tunnels=new Set<Duplex>();
@@ -28,7 +28,7 @@ export async function localFixtures(directory:string,openssl:string,exitIp=LAB_E
       res.writeHead(200,{'content-type':'text/plain','cache-control':'no-store'});let sequence=0;
       const interval=setInterval(()=>res.write(String(++sequence)+'\n'),100);res.on('close',()=>clearInterval(interval));return;
     }
-    receipts++;res.setHeader('content-type','application/json');res.end(JSON.stringify({ip:conflict&&index===1?'203.0.113.11':exitIp,fixture:true}));
+    receipts++;const ip=conflict&&index===1?'203.0.113.11':exitIp;if(options.productionProbeAliases&&/^(?:ipv4\.)?icanhazip\.com(?::443)?$/.test(req.headers.host??'')){res.setHeader('content-type','text/plain');res.end(ip+'\n');return;}res.setHeader('content-type','application/json');res.end(JSON.stringify({ip,fixture:true}));
   }));
   // A local RFC 8484 endpoint resolves only the synthetic acceptance hostname.
   const resolver=httpsServer(material,(req,res)=>{void(async()=>{
@@ -38,6 +38,7 @@ export async function localFixtures(directory:string,openssl:string,exitIp=LAB_E
       const data=req.method==='GET'?Buffer.from(url.searchParams.get('dns')??'','base64url'):Buffer.concat(blocks);
       const question=dns.Packet.parse(data),answer=dns.Packet.createResponseFromRequest(question);dnsRequests++;
       const names:Record<string,string>={'receiver.mu.test':LAB_EXIT,'receiver-a.mu.test':LAB_RECEIVERS[0],'receiver-b.mu.test':LAB_RECEIVERS[1]};
+      if(options.productionProbeAliases)Object.assign(names,{'api.ipify.org':LAB_RECEIVERS[0],'ipwho.is':LAB_RECEIVERS[1],'api.ipwho.is':LAB_RECEIVERS[1],'icanhazip.com':LAB_RECEIVERS[0],'ipv4.icanhazip.com':LAB_RECEIVERS[0]});
       for(const q of question.questions)if(names[q.name]&&q.type===dns.Packet.TYPE.A)answer.answers.push(new dns.Packet.Resource({name:q.name,type:dns.Packet.TYPE.A,class:dns.Packet.CLASS.IN,ttl:0,address:names[q.name]}));
       trace?.({event:'dns',questions:question.questions.map(q=>({name:q.name,type:q.type})),answers:answer.answers.length});res.writeHead(200,{'content-type':'application/dns-message'});res.end(answer.toBuffer());
     }catch(error){trace?.({event:'dns-error',message:error instanceof Error?error.message:'parse failure'});res.writeHead(400).end();}

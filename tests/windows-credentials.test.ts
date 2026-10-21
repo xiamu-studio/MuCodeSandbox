@@ -25,5 +25,9 @@ test('Windows data ACL removes an existing explicit Everyone grant',{skip:proces
   await run('icacls.exe',[directory,'/grant','*S-1-1-0:(OI)(CI)F']);await secureWindowsDirectory(directory);
   const result=await run(powershellPath(),powershellArgs(`$acl=[IO.Directory]::GetAccessControl('${directory.replaceAll("'","''")}'); $rules=$acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]); [Console]::Write(($rules | ForEach-Object {$_.IdentityReference.Value}) -join ',')`));
   assert.ok(!result.split(',').includes('S-1-1-0'));assert.ok(result.split(',').includes('S-1-5-18'));
+  await secureWindowsDirectory(directory);
+  const again=await run(powershellPath(),powershellArgs(`$acl=[IO.Directory]::GetAccessControl('${directory.replaceAll("'","''")}');[Console]::Write($acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))`));
+  await secureWindowsDirectory(directory);
+  assert.equal(await run(powershellPath(),powershellArgs(`$acl=[IO.Directory]::GetAccessControl('${directory.replaceAll("'","''")}');[Console]::Write($acl.GetSecurityDescriptorSddlForm([Security.AccessControl.AccessControlSections]::Access))`)),again);
  }finally{await rm(directory,{recursive:true,force:true});}
 });

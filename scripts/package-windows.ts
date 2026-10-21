@@ -1,0 +1,13 @@
+import path from 'node:path';
+import {readFile,writeFile,mkdir} from 'node:fs/promises';
+import {createRequire} from 'node:module';
+import {prepareWindowsPackage} from './windows/package-runtime.ts';
+const root=path.resolve(import.meta.dirname,'..'),cache=path.join(root,'.mu-data/windows-package-cache/builder');await mkdir(cache,{recursive:true});await writeFile(path.join(cache,'package.json'),JSON.stringify({type:'commonjs'}));process.env.ELECTRON_BUILDER_CACHE=cache;process.env.CSC_IDENTITY_AUTO_DISCOVERY='false';for(const key of ['CSC_LINK','CSC_KEY_PASSWORD','WIN_CSC_LINK','WIN_CSC_KEY_PASSWORD'])delete process.env[key];
+const require=createRequire(import.meta.url),{build,Platform,Arch}=require('electron-builder');
+const stage=await prepareWindowsPackage(),target=process.argv.includes('--dir')?'dir':'nsis',output=path.join(root,'release','windows-preview-'+path.basename(stage.directory).replace('windows-package-',''));
+await mkdir(output,{recursive:true});const base=require('../desktop/windows/builder.cjs');
+const check=await readFile(path.join(root,'desktop/windows/check-running.ps1'),'utf8'),template=await readFile(path.join(root,'desktop/windows/installer.nsh'),'utf8'),include=path.join(stage.directory,'installer.nsh');
+if(template.split('@MU_WINDOWS_RUNNING_CHECK@').length!==2)throw Error('Installer process check placeholder changed');
+await writeFile(include,template.replace('@MU_WINDOWS_RUNNING_CHECK@',Buffer.from(check,'utf16le').toString('base64')));
+const result=await build({projectDir:stage.app,targets:Platform.WINDOWS.createTarget([target],Arch.x64),config:{...base,directories:{app:stage.app,output},electronVersion:stage.electronVersion,electronDist:path.dirname(stage.electron),win:{...base.win,icon:path.join(root,'assets/icon.png')},nsis:{...base.nsis,include},extraResources:[{from:stage.node,to:'node',filter:['node.exe','LICENSE']},{from:stage.manifest,to:'windows-runtime-manifest.json'}],publish:null}});
+await writeFile(path.resolve('.mu-data/windows-run/desktop-package.json'),JSON.stringify({stage,output,artifacts:result},null,2));console.log(JSON.stringify({output,artifacts:result}));

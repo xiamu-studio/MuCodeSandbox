@@ -2,11 +2,11 @@
 
 分支：`codex/windows-hyperv`。Mac 基线：`cfcb5f9263dcd02cfa725e6d9aee80b065b98aa1`（0.4.65）。
 
-真实 Linux VM 已完成创建、启动、认证管理连接、组件安装和空白受保护基盘导出。首轮内核 8/8、扩展 DNS/持续流/故障矩阵 16/16、进程强退和双环境矩阵 7/7 通过。另有本机管理网页、终端、文件传输、Linux 浏览器和可选权限分离预览。独立 Windows 桌面客户端、快照/备份和安装包仍未交付，不能标为完整 Windows 版本。
+真实 Linux VM 已完成创建、启动、认证管理连接、组件安装和空白受保护基盘导出。首轮内核 8/8、扩展 DNS/持续流/故障矩阵 16/16、进程强退和双环境矩阵 7/7 通过。现有本机管理网页、终端、文件传输、Linux 浏览器、普通用户权限代理和独立 Windows 桌面预览。桌面安装包为未签名测试包，仍需预先准备基盘；快照/备份和干净机器的一键准备尚未交付，不能标为完整 Windows 版本。
 
 ## 与 Mac 隔离
 
-Mac 的 Manager、Lima/VZ、Swift 助手、桌面入口和打包命令保持不变。Windows 使用独立 CLI、数据根、镜像和密钥。共用文件 `server/egress.ts` 只收窄了 TypeScript 参数类型，运行逻辑不变。未替换 Mac 应用，未修改 `main`。
+Mac 的 Manager、Lima/VZ、Swift 助手、桌面入口和打包命令保持不变。Windows 使用独立 CLI、数据根、镜像和密钥。共用文件 `server/egress.ts` 只收窄了 TypeScript 参数类型；VNC 增加可传入认证流的接口，Mac 仍经原有 Unix socket 包装调用。未替换 Mac 应用，未修改 `main`，真实 Mac 回归尚未进行。
 
 ## 当前架构
 
@@ -46,7 +46,7 @@ npm run windows:build-base -- <本地原始VHD> <SHA-256>
 
 ## Windows 管理预览
 
-已提供独立的本机网页管理入口，支持新建、编辑、启动、停止、重启、操作记录和防护核验。运行环境中可打开 Linux 终端，或手动上传/下载文件并浏览交换目录。使用图形基盘的新环境支持独立 Linux Chrome 画面、网址打开、画面尺寸和手动文本剪贴板。现有 Mac Electron 入口、Lima 管理器和打包命令保持独立；Windows 尚无桌面安装包。独立桌面客户端、音频、图片剪贴板、共享、快照和备份仍在适配。
+已提供独立的本机网页管理入口，支持新建、编辑、启动、停止、重启、操作记录和防护核验。运行环境中可打开 Linux 终端，或手动上传/下载文件并浏览交换目录。使用图形基盘的新环境支持独立 Linux Chrome 画面、网址打开、画面尺寸和手动文本剪贴板。现有 Mac Electron 入口、Lima 管理器和打包命令保持独立。Windows 桌面预览使用相同管理 API；音频、图片剪贴板、共享、快照和备份仍在适配。
 
 先准备受保护基盘，构建器会在运行数据根写入 `protected-base.json`。在管理员 PowerShell 中执行：
 
@@ -67,6 +67,45 @@ npm run windows:ui
 终端由 Windows ConPTY 驱动固定的 OpenSSH 客户端，通过原有 Hyper-V socket 通道进入客体 `dev` 用户，不能使用 sudo。已禁用 SSH 逃逸解释器、代理转发和本地命令，避免终端输入打开宿主 shell 或增加宿主转发。一次性连接凭证绑定当前防护会话，停止或重新启动后旧凭证失效。原生终端放在独立子进程中；关闭终端或失去控制进程的 IPC 后有界退出，避免 ConPTY 读取线程使主服务无法退出。
 
 中文输入框支持普通 Unicode 文字粘贴，不自动执行；多行粘贴要求客体终端支持括号粘贴。上传文件保存到 `/home/dev/Downloads`，单个文件最多 150 MiB，最多两个并发传输。下载、传入和导出目录只能通过客体文件描述符访问，拒绝符号链接、硬链接、跨挂载点及路径跳转；下载前检查文件版本。文件任务使用客体进程组监督器，取消时终止对应开发任务。没有持续共享宿主目录，也没有自动同步宿主剪贴板。
+
+## 独立 Windows 桌面测试包
+
+Windows 使用 `desktop/windows/main.cjs` 和独立打包配置。应用身份为 `local.mucodesandbox.windows.preview`，与 Mac 应用不同；根目录的 Mac Electron 入口及 `package:mac` 保持原有配置。
+
+桌面、管理服务和 ConPTY 使用普通用户权限。管理画面启用 Chromium 沙箱、上下文隔离，关闭 Node 集成和权限请求，只允许本次精确的回环服务来源；不向画面提供宿主 Node 桥。Node 管理器是独立进程，发行包内置经固定摘要核对的官方 Node 24.15.0，启动时检查其文件摘要。正常退出必须收到停机回执并等待管理进程结束。失去桌面进程时，操作系统进程句柄监测和受保护代理分别负责结束管理会话及确认停机；这些退出路径需使用真实 VM 验收。
+
+源码开发需要 Node 24.15.0+、当前 npm 依赖、官方 Electron 运行文件，以及 `.mu-data/tools/node-v24.15.0-win-x64.zip`。Node ZIP 的固定 SHA-256 为 `cc5149eabd53779ce1e7bdc5401643622d0c7e6800ade18928a767e940bb0e62`，来源是 [Node 官方分发目录](https://nodejs.org/dist/v24.15.0/)。未匹配的运行时不会打包。
+
+```powershell
+# 在普通用户 PowerShell 中使用自己的运行目录和管理数据库。
+$env:MU_WINDOWS_DATA_DIR='<已有 protected-desktop-base.json 的本机运行目录>'
+$env:MU_WINDOWS_APP_DIR='<独立的 Windows 管理数据库目录>'
+npm run windows:desktop
+npm run windows:package
+```
+
+`windows:package` 在独立临时目录整理运行依赖，生成 `release/windows-preview-<随机编号>` 中的 NSIS 安装器和 `win-unpacked`。测试包明确不签名，不探测或使用用户签名身份；Node 不依赖终端 PATH，ConPTY 使用已有 Windows AMD64 组件，避开 Electron 原生 ABI。VM、基盘、管理凭据、测试 CA、抓包和运行日志不在包内。
+
+安装器按当前用户安装，不自动启动、不自动重启。运行中的桌面或内置 Node 会阻止安装/卸载；升级不会代替桌面结束管理进程。应用文件在同一磁盘内暂存后清理，以支持安装目录和系统临时目录分属不同磁盘。发行依赖排除测试缓存，避免其过长嵌套路径遗留在卸载暂存目录。管理数据及 Hyper-V 资源独立保留，卸载应用不会删除环境。
+
+这个包尚不包含干净机器的一键准备流程。Hyper-V、Windows OpenSSH 和已经准备好的图形基盘仍是前提；首次或源码更新后的受保护代理安装，以及每次启动代理，都可能显示管理员确认。首次使用应沿用上述环境变量指向自己的基盘目录，或在默认运行目录准备基盘。没有基盘时不允许创建可联网环境。
+
+```powershell
+npm run windows:install-lab
+npm run windows:desktop-lab
+# 同一个安装包在安装后运行真实 VM 验收，再检查卸载和数据保留：
+npm run windows:install-lab -- --desktop-lab --reuse-fixture '<旧 desktop-lab-编号目录>'
+# 显式复用上一轮本地合成信任基盘，或测试已经安装的可执行文件：
+npm run windows:desktop-lab -- --reuse-fixture '<旧 desktop-lab-编号目录>' --executable '<安装后的 Windows Preview.exe>'
+```
+
+上述实验只使用合成数据和本地 HTTPS。桌面实验单独复制并信任本地测试 CA 的基盘，生产程序没有探测覆盖开关；正常出口探测域名在实验 DNS 中仅解析到保留测试地址，由回环接收端应答。原始生产图形基盘保持原摘要。报告保存在忽略目录，记录当次源码及安装产物摘要；强退后的检查由独立管理员只读程序完成，先检查实际 Off，再启动任何新代理。
+
+Windows 上自动化工具可能把启动器父进程作为 `.process()` 返回。强退验收从 Electron 主进程读取实际 PID，再固定 Windows 进程句柄并核对可执行文件路径，确认该进程确实退出后才开始 VM 检查；报告同时保留启动器与实际主进程身份。早期误杀启动器的失败记录未改写为通过。
+
+安装器验收与 NSIS 升级流程一样，核对并复制卸载程序到安装目录之外，使用 `_?=` 显式指定安装目录后等待其实际退出；验证应用、登记表和同盘暂存目录均已消失，独立用户数据仍在。控制面板入口、交互式向导和跨版本升级仍需第二台机器验收。
+
+本轮桌面实机矩阵 10/10，覆盖生产探测、本机转发、真实 ConPTY、二进制往返、Linux 浏览器画面及三种退出路径；强制结束实际 Electron 主进程后约 1.7 秒独立确认 VM Off。安装器另有 5/5 检查。排除发布依赖中的测试缓存后，最终包的 5,667 个运行文件与实机受测包逐字节一致，应用程序摘要也相同；最终包再次完成安装、同版本重复安装和卸载。报告和原始失败记录只保存在本机。
 
 ## 可选普通用户权限代理
 
@@ -125,7 +164,7 @@ VNC 和 CDP 通过固定目标的 SSH stdio 流进入客体回环端口，Window
 
 图形验收命令为 `npm run windows:browser-lab -- --interactive`，会创建全新的空白 VM 并使用本地测试页。运行数据、测试 CA/NSS 数据库、截图和一次性启动链接均保存在受限的忽略目录中，不提交 Git。交互模式输出的本地查看信息位于 `.mu-data/windows-run/browser-lab-view.json`；完成画面和中文粘贴操作后，在其中 `marker` 指定的位置写入标记，脚本会核查实际客体文字，再执行故障与停机检查。
 
-当前已通过 57 项 Windows 本地测试、14 项共享显示/沙箱检查及 12 项真实浏览器验收：双本地出口、安装临时接口清理、导航前沙箱、原生语言/时区、受信任测试 CA 的 HTTPS、Canvas/Worker、真实画面尺寸、认证画面连接、浏览器上传/下载、手动中文剪贴板、故障撤销与确认停机。管理员入口及可选权限代理入口均已完成真实浏览器矩阵，报告绑定当次源码，测试期间源码未变，控制进程正常退出。
+当前已通过 65 项 Windows 本地测试、18 项共享显示/沙箱检查及 12 项真实浏览器验收：双本地出口、安装临时接口清理、导航前沙箱、原生语言/时区、受信任测试 CA 的 HTTPS、Canvas/Worker、真实画面尺寸、认证画面连接、浏览器上传/下载、手动中文剪贴板、故障撤销与确认停机。管理员入口及可选权限代理入口均已完成真实浏览器矩阵，报告绑定当次源码，测试期间源码未变，控制进程正常退出。
 
 测试曾出现一次本地 DNS/代理探测中断并触发确认停机，该次原因尚未复现定位。故障诊断会先断开业务出口，再保存本地日志。长期稳定性仍需后续验收，不能用几分钟的实测代替。
 
@@ -161,7 +200,7 @@ npm run windows:lab -- <空白受保护基盘.vhdx> <SHA-256>
 npm run windows:service-lab -- <空白受保护基盘.vhdx> <SHA-256>
 ```
 
-`--ignore-scripts` 可用于当前 Node 源码预览；Windows 终端使用依赖中已有的 ConPTY 预构建组件。Electron ABI、安装包与升级仍须另行验收。
+`--ignore-scripts` 可用于当前 Node 源码预览；Windows 终端使用依赖中已有的 ConPTY 预构建组件。独立桌面使用内置 Node 运行 ConPTY；正式签名、跨版本升级和干净机器准备仍须另行验收。
 
 首轮真实 Hyper-V 8/8：核验前拒绝业务、双本地 HTTPS 回执批准、受管 TCP、禁止滥用探测例外、禁止直连宿主、45 秒到期后拒绝新连接、拒绝过期续期、异常后确认 VM 停止。实验代理只映射保留测试地址到本机回环服务，其他目标拒绝。
 
@@ -169,10 +208,12 @@ npm run windows:service-lab -- <空白受保护基盘.vhdx> <SHA-256>
 
 浏览器界面操作检查使用合成后端，覆盖中文粘贴、上传和下载，不替代真实 VM 实验。旧的宿主 Python 文件往返测试在 Windows 上失败，原始 `main` 的独立副本同样失败；共享文件实现只调整运行时类型边界，其 Linux 实际行为通过 Hyper-V 客体验证。没有为旧测试修改 Mac 文件处理行为；真实 Mac 回归仍待安排。
 
-真实切网/睡眠、完整日常功能、安装包及跨机器包级回归仍须单独验收，不能由单测代替。例行关闭先断开出口，再限时同步客体磁盘并确认 Hyper-V 状态 Off；同步失败不能阻止强制停机。
+真实切网/睡眠、完整日常功能、干净安装及跨机器包级回归仍须单独验收，不能由单测代替。例行关闭先断开出口，再限时同步客体磁盘并确认 Hyper-V 状态 Off；同步失败不能阻止强制停机。
 
 原有六组网络测试在 Windows 上为 27/39，原始 `main` 独立副本同为 27/39，失败项目一致，涉及 Unix curl 路径、目录 fsync 和旧的 4 秒超时断言。没有为掩盖这些基线失败修改 Mac 行为；真实 Mac 回归未进行。
 
 完整剩余工作见 [Windows 工作清单](windows-work-plan.md)。
+
+补充回归记录：`tests/guest-display.test.ts` 的旧 Unix socket 接收端在这台 Windows 上触发 Node 原生断言退出；原始 `main` 文件副本同样在前三项通过后退出，未把它计入已通过的共享检查。没有为通过该测试改写 Mac 的 socket 行为。Windows 实际 VNC 通过认证管理流完成实机验收。
 
 官方参考：[Hyper-V sockets](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/make-integration-service)、[网卡 ACL](https://learn.microsoft.com/en-us/powershell/module/hyper-v/add-vmnetworkadapterextendedacl)、[NoCloud](https://docs.cloud-init.io/en/latest/reference/datasources/nocloud.html)、[Canonical 校验表](https://cloud-images.ubuntu.com/releases/noble/release-20261017/SHA256SUMS)。

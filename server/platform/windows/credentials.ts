@@ -17,9 +17,18 @@ export async function secureWindowsDirectory(directory:string,runner:Runner=run)
  await mkdir(directory,{recursive:true});if((await lstat(directory)).isSymbolicLink())throw Error('Windows data root cannot be a reparse point');
  const script=`$ErrorActionPreference='Stop'
 $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$existing=[IO.Directory]::GetAccessControl('${directory.replaceAll("'","''")}')
+$owner=$existing.GetOwner([Security.Principal.SecurityIdentifier]).Value
+if($owner -notin @($sid.Value,'S-1-5-18','S-1-5-32-544')){throw 'Data directory belongs to another user'}
+$existingRules=@($existing.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier]))
+$expected=@($sid.Value,'S-1-5-18','S-1-5-32-544')
+$valid=$existing.AreAccessRulesProtected -and $existingRules.Count -eq 3
+foreach($rule in $existingRules){if($rule.AccessControlType -ne 'Allow' -or $rule.IdentityReference.Value -notin $expected -or $rule.FileSystemRights -ne [Security.AccessControl.FileSystemRights]::FullControl -or [int]$rule.InheritanceFlags -ne 3 -or $rule.PropagationFlags -ne 'None'){$valid=$false}}
+if($valid){exit 0}
 $acl=New-Object Security.AccessControl.DirectorySecurity
 $acl.SetAccessRuleProtection($true,$false)
-$acl.SetOwner($sid)
+# Preserve an already trusted owner. Updating the DACL does not require taking
+# ownership of a directory created by an earlier elevated source preview.
 $inheritance=[Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
 foreach($value in @($sid.Value,'S-1-5-18','S-1-5-32-544')){
  $identity=New-Object Security.Principal.SecurityIdentifier($value)

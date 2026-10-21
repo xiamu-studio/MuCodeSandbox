@@ -18,6 +18,8 @@
     "windows:ui": "node scripts/windows-ui.ts",
     "windows:broker-install": "node scripts/windows-broker-install.ts",
     "windows:broker-ui": "node scripts/windows-broker-ui.ts",
+    "windows:desktop": "npm run build && node scripts/windows-desktop.ts",
+    "windows:package": "npm run build && node scripts/package-windows.ts",
     "windows:broker-lab": "node scripts/windows-broker-lab.ts",
     "windows:broker-owner-lab": "node scripts/windows-broker-owner-lab.ts",
     "windows:broker-security-lab": "node scripts/windows-broker-security-lab.ts",
@@ -29,7 +31,7 @@
     "windows:isolation-lab": "node scripts/windows-isolation-lab.ts",
     "windows:service-lab": "node scripts/windows-service-lab.ts",
     "windows:browser-lab": "node scripts/windows-browser-lab.ts",
-    "test:windows": "node --test tests/windows-platform.test.ts tests/windows-fixtures.test.ts tests/windows-download.test.ts tests/windows-package-proxy.test.ts tests/windows-credentials.test.ts tests/windows-manager.test.ts tests/windows-service.test.ts tests/windows-terminal.test.ts tests/windows-terminal-process.test.ts tests/windows-browser-transport.test.ts tests/windows-broker-client.test.ts tests/windows-runtime-cleanup.test.ts tests/windows-packet-evidence.test.ts",
+    "test:windows": "node --test tests/windows-platform.test.ts tests/windows-fixtures.test.ts tests/windows-download.test.ts tests/windows-package-proxy.test.ts tests/windows-credentials.test.ts tests/windows-manager.test.ts tests/windows-service.test.ts tests/windows-terminal.test.ts tests/windows-terminal-process.test.ts tests/windows-browser-transport.test.ts tests/windows-broker-client.test.ts tests/windows-runtime-cleanup.test.ts tests/windows-packet-evidence.test.ts tests/windows-desktop.test.ts",
     "test:ui": "node scripts/verify-ui.mjs",
     "test:desktop": "node scripts/verify-desktop.mjs",
     "test:desktop-crash": "node scripts/verify-desktop-crash.ts --bridge-owner",
@@ -229,7 +231,9 @@
     "test:packaged-workflow-probe-evidence": "node scripts/verify-packaged-workflow-evidence.ts --probe",
     "test:packaged-workflow-bridge-owner": "node scripts/verify-packaged-workflow.ts --bridge-owner",
     "test:packaged-workflow-bridge-owner-evidence": "node scripts/verify-packaged-workflow-evidence.ts --bridge-owner",
-    "test:packaged-workflow-evidence": "node scripts/verify-packaged-workflow-evidence.ts"
+    "test:packaged-workflow-evidence": "node scripts/verify-packaged-workflow-evidence.ts",
+    "windows:desktop-lab": "node scripts/windows-desktop-lab.ts",
+    "windows:install-lab": "node scripts/windows-install-lab.ts"
   },
   "dependencies": {
     "@novnc/novnc": "1.7.0",

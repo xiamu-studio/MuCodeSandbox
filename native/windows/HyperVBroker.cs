@@ -27,9 +27,11 @@ public static class MuHyperVBroker {
     private static readonly Dictionary<string, object> VmGates = new Dictionary<string, object>();
     private static readonly Dictionary<string, Process> Channels = new Dictionary<string, Process>();
     private static readonly Dictionary<string, int> ChannelPorts = new Dictionary<string, int>();
+    private static readonly HashSet<string> StartedHere = new HashSet<string>();
     private static readonly List<NamedPipeServerStream> Pipes = new List<NamedPipeServerStream>();
     private static readonly List<IDisposable> Held = new List<IDisposable>();
     private static readonly ManualResetEvent RequestsIdle=new ManualResetEvent(true),ShutdownComplete=new ManualResetEvent(false);
+    private static readonly CancellationTokenSource Closing = new CancellationTokenSource();
     private static int ActiveRequests;
     private static Process Owner;
     private static WindowsIdentity OwnerIdentity;
@@ -84,6 +86,7 @@ public static class MuHyperVBroker {
     private static void Save() {lock(Gate){var next=Ledger+"."+Guid.NewGuid().ToString("N")+".next";using(var stream=new FileStream(next,FileMode.CreateNew,FileAccess.Write,FileShare.None)){byte[] data=Encoding.UTF8.GetBytes(Json().Serialize(Records));stream.Write(data,0,data.Length);stream.Flush(true);}if(File.Exists(Ledger))File.Replace(next,Ledger,null);else File.Move(next,Ledger);}}
     private static Dictionary<string,object> Owned(string id){lock(Gate){Dictionary<string,object> record;if(!Records.TryGetValue(id,out record)||Convert.ToString(record["ownerSid"])!=OwnerSid)throw new UnauthorizedAccessException("VM is not registered to this user");return record;}}
     private static Dictionary<string,object>[] RecordSnapshot(){lock(Gate)return Records.Values.Select(record=>new Dictionary<string,object>(record)).ToArray();}
+    private static Dictionary<string,object>[] ShutdownSnapshot(){lock(Gate)return Records.Values.OrderByDescending(record=>StartedHere.Contains(Convert.ToString(record["id"]))||Channels.ContainsKey(Convert.ToString(record["id"]))).Select(record=>new Dictionary<string,object>(record)).ToArray();}
     private static object VmGate(string id){lock(Gate){object value;if(!VmGates.TryGetValue(id,out value)){value=new object();VmGates[id]=value;}return value;}}
     private static Dictionary<string,object> Parameters(Dictionary<string,object> record) {
         string id=Convert.ToString(record["id"]),name="mu-win-"+id.Replace("-","");byte[] hash;using(var sha=SHA256.Create())hash=sha.ComputeHash(Encoding.UTF8.GetBytes(id));
@@ -232,13 +235,14 @@ public static class MuHyperVBroker {
             lock(VmGate(id)){
                 if((action=="status"||action=="stop")&&(!owned.ContainsKey("platformId")||Convert.ToString(owned["stage"])!="ready"))return Json().Serialize(RecoverAllocation(owned));
                 if(!owned.ContainsKey("platformId")||action=="start"&&Convert.ToString(owned["stage"])!="ready")throw new InvalidOperationException("VM is not ready");
+                if(action=="start")lock(Gate)StartedHere.Add(id);
                 if(action=="stop")CloseChannel(id);try{return Invoke(action,Parameters(owned),30000,action=="stop"?CancellationToken.None:cancellation);}finally{if(action=="start"&&cancellation.IsCancellationRequested){CloseChannel(id);try{Invoke("stop",Parameters(owned),30000,CancellationToken.None);}catch{}}}
             }
         }
         throw new ArgumentException("Operation is not permitted");
     }
     private static void Serve(NamedPipeServerStream pipe) {
-        var cancel=new CancellationTokenSource();bool counted=false;try {
+        var cancel=new CancellationTokenSource();var closingRegistration=Closing.Token.Register(()=>cancel.Cancel());bool counted=false;try {
             using(var timeout=new Timer(_=>{try{pipe.Dispose();}catch{}},null,10000,Timeout.Infinite)){
                 var bytes=new List<byte>();int value;while((value=pipe.ReadByte())!=10){if(value<0||bytes.Count>=65536)throw new ArgumentException("Request exceeds bounds");bytes.Add((byte)value);}timeout.Change(Timeout.Infinite,Timeout.Infinite);
                 uint pid;if(!GetNamedPipeClientProcessId(pipe.SafePipeHandle.DangerousGetHandle(),out pid)||pid!=Owner.Id||Owner.HasExited)throw new UnauthorizedAccessException("Application process rejected");
@@ -248,10 +252,14 @@ public static class MuHyperVBroker {
                 var request=Json().Deserialize<Dictionary<string,object>>(new UTF8Encoding(false,true).GetString(bytes.ToArray()));object result=Dispatch(pipe,request,cancel.Token);byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=true,result=result})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();if(Convert.ToString(request["action"])=="shutdown"){try{pipe.WaitForPipeDrain();}catch{}ThreadPool.QueueUserWorkItem(_=>Shutdown());}
             }
         }catch(Exception error){try{byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=false,code=error is UnauthorizedAccessException?"DENIED":error is ArgumentException?"INVALID_REQUEST":error is OperationCanceledException?"CANCELLED":"BROKER_FAILED",error=error is ArgumentException||error is UnauthorizedAccessException?error.Message:"Privileged VM operation failed"})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();}catch{}try{File.AppendAllText(Path.Combine(UserRoot,"broker-errors.log"),DateTime.UtcNow.ToString("o")+" "+error.ToString()+Environment.NewLine);}catch{}}
-        finally{cancel.Cancel();pipe.Dispose();lock(Gate){Pipes.Remove(pipe);if(counted){ActiveRequests--;if(ActiveRequests==0)RequestsIdle.Set();}}}
+        finally{closingRegistration.Dispose();cancel.Cancel();pipe.Dispose();lock(Gate){Pipes.Remove(pipe);if(counted){ActiveRequests--;if(ActiveRequests==0)RequestsIdle.Set();}}}
     }
-    private static void Shutdown(){bool producer=false;lock(Gate){if(!Stopping){Stopping=true;producer=true;foreach(var pipe in Pipes.ToArray())try{pipe.Dispose();}catch{}}}if(!producer){ShutdownComplete.WaitOne();return;}
-        try{RequestsIdle.WaitOne(30000);foreach(var record in RecordSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);try{Invoke(record.ContainsKey("platformId")?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
+    private static void Shutdown(){bool producer=false;NamedPipeServerStream[] closingPipes=null;lock(Gate){if(!Stopping){Stopping=true;producer=true;closingPipes=Pipes.ToArray();}}if(!producer){ShutdownComplete.WaitOne();return;}
+        // A synchronous pipe read/dispose must not hold Gate or delay force-off.
+        // Cancel privileged work directly, independently of client pipe EOF.
+        Closing.Cancel();foreach(var pipe in closingPipes)ThreadPool.QueueUserWorkItem(_=>{try{pipe.Dispose();}catch{}});
+        foreach(var record in ShutdownSnapshot())CloseChannel(Convert.ToString(record["id"]));
+        try{RequestsIdle.WaitOne(30000);foreach(var record in ShutdownSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);try{Invoke(record.ContainsKey("platformId")?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
     }
     public static int Main(string[] args) {
         if(args.Length==1&&args[0]=="--self-test"){try{ValidateKeys(new Dictionary<string,object>{{"action","start"},{"command","bad"}},"action","id");return 1;}catch(ArgumentException){}Console.WriteLine("Broker request boundary verified");return 0;}

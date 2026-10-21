@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import {readFile} from 'node:fs/promises';
+import {run} from '../server/process.ts';
+import {powershellPath,powershellArgs} from '../server/platform/windows/runtime.ts';
+import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
+
+const phase=process.argv[2];
+assert.ok(['before-reboot','after-reboot','inspect','oobe','reset-hyperv','collect-stop','pe-boot','pe-resume','console','oobe-enter'].includes(phase),'Choose an explicit clean-host diagnostic phase');
+const lab=JSON.parse(await readFile('.mu-data/windows-run/clean-host-lab.json','utf8')),directory=path.resolve(lab.directory);
+assert.equal(path.dirname(directory),path.resolve(windowsRuntimeDirectory()));
+assert.match(path.basename(directory),/^clean-host-[a-f0-9-]{36}$/);
+const pe=['pe-boot','pe-resume'].includes(phase),consolePhase=['console','oobe-enter'].includes(phase);
+const script=path.resolve('scripts/windows/'+(pe?'finish-clean-host.ps1':consolePhase?'clean-host-console.ps1':'verify-clean-host.ps1'));
+const argumentsText=pe?' -UseGuestPE':consolePhase?(phase==='oobe-enter'?' -AdvanceLocalSetup':''):` -Phase '${phase}'`;
+const body=`& '${script.replaceAll("'","''")}' -Directory '${directory.replaceAll("'","''")}' -OwnerPid ${process.pid}${argumentsText}`;
+const encoded=Buffer.from(body,'utf16le').toString('base64');
+console.log('Running '+phase+' only inside the disconnected evaluation VM.');
+await run(powershellPath(),powershellArgs(`$ErrorActionPreference='Stop';$p=Start-Process -FilePath '${powershellPath()}' -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','${encoded}') -WorkingDirectory '${directory.replaceAll("'","''")}' -Verb RunAs -WindowStyle Hidden -Wait -PassThru;if($p.ExitCode -ne 0){throw 'The clean-host probe did not pass; inspect its private probe report'}`),{timeoutMs:5100000,onOutput:value=>process.stdout.write(value)});
+console.log('Clean-host '+phase+' completed; physical host was not restarted.');

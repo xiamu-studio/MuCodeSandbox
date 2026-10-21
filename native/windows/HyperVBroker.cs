@@ -34,22 +34,30 @@ public static partial class MuHyperVBroker {
     private static readonly CancellationTokenSource Closing = new CancellationTokenSource();
     private static int ActiveRequests;
     private static Process Owner;
+    private static IntPtr OwnerHandle;
     private static WindowsIdentity OwnerIdentity;
     private static string OwnerSid, UserRoot, Ledger, ScriptFile;
     private static volatile bool Stopping;
     private static bool SetupOnly;
     [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetNamedPipeClientProcessId(IntPtr pipe, out uint pid);
     [DllImport("advapi32.dll", SetLastError=true)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-    [DllImport("advapi32.dll", SetLastError=true)] private static extern bool DuplicateToken(IntPtr token,int level,out IntPtr duplicate);
+    [DllImport("advapi32.dll",SetLastError=true)] private static extern bool GetTokenInformation(IntPtr token,int kind,out int value,int length,out int returned);
     [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
+    [DllImport("kernel32.dll",SetLastError=true)] private static extern IntPtr OpenProcess(uint access,bool inherit,int pid);
+    [DllImport("kernel32.dll",SetLastError=true)] private static extern uint WaitForSingleObject(IntPtr handle,uint milliseconds);
     [DllImport("kernel32.dll")] private static extern uint GetFileType(IntPtr file);
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode,SetLastError=true)] private static extern uint GetFinalPathNameByHandle(IntPtr file,StringBuilder path,uint length,uint flags);
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] private static extern IntPtr CreateFile(string name,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
 
     private static JavaScriptSerializer Json() { return new JavaScriptSerializer{ MaxJsonLength=65536, RecursionLimit=16 }; }
+    private static bool OwnerExited {get{return OwnerHandle==IntPtr.Zero||WaitForSingleObject(OwnerHandle,0)!=258;}}
     private static string ProcessSid(Process process) {
-        IntPtr token; if(!OpenProcessToken(process.Handle,10,out token))throw new UnauthorizedAccessException("Owner identity unavailable");
-        try {IntPtr duplicate;if(!DuplicateToken(token,2,out duplicate))throw new UnauthorizedAccessException("Owner token unavailable");try{OwnerIdentity=new WindowsIdentity(duplicate);}finally{CloseHandle(duplicate);}if(new WindowsPrincipal(OwnerIdentity).IsInRole(WindowsBuiltInRole.Administrator))throw new UnauthorizedAccessException("Application must run without administrator privileges");return OwnerIdentity.User.Value;} finally { CloseHandle(token); }
+        // Pin only process query/synchronization rights and query the owner's
+        // identity/elevation. Source files use the validated pipe caller's token;
+        // another administrator need not duplicate the owner's primary token.
+            OwnerHandle=OpenProcess(0x1000|0x100000,false,process.Id);if(OwnerHandle==IntPtr.Zero)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Bound owner process unavailable");Held.Add(new HandleOwner(OwnerHandle));
+            IntPtr token;if(!OpenProcessToken(OwnerHandle,8,out token)){int error=Marshal.GetLastWin32Error();throw new System.ComponentModel.Win32Exception(error,"Bound owner identity unavailable (Win32 "+error+")");}
+            try{int elevated,returned;if(!GetTokenInformation(token,20,out elevated,4,out returned))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"Bound owner elevation unavailable");if(elevated!=0)throw new UnauthorizedAccessException("Application must run without administrator privileges");OwnerIdentity=new WindowsIdentity(token);return OwnerIdentity.User.Value;}finally{CloseHandle(token);}
     }
     private static DirectorySecurity PrivateAcl() {
         var acl=new DirectorySecurity();acl.SetAccessRuleProtection(true,false);acl.SetOwner(AdminSid);
@@ -112,7 +120,7 @@ public static partial class MuHyperVBroker {
     }
     private static FileStream CallerFile(NamedPipeServerStream pipe,string source,long max) {
         if(source.Length>4096||source.Length<4||source[1]!=':'||source[2]!='\\'||source.Substring(2).Contains(":"))throw new ArgumentException("Local disk file required");
-        FileStream input=null;using(OwnerIdentity.Impersonate()){input=new FileStream(source,FileMode.Open,FileAccess.Read,FileShare.Read,1048576,FileOptions.SequentialScan);}
+        FileStream input=null;pipe.RunAsClient(()=>input=new FileStream(source,FileMode.Open,FileAccess.Read,FileShare.Read,1048576,FileOptions.SequentialScan));
         try{if(GetFileType(input.SafeFileHandle.DangerousGetHandle())!=1||input.Length<1||input.Length>max)throw new ArgumentException("Input file exceeds bounds");var path=new StringBuilder(32768);if(GetFinalPathNameByHandle(input.SafeFileHandle.DangerousGetHandle(),path,(uint)path.Capacity,0)==0||path.ToString().StartsWith("\\\\?\\UNC\\",StringComparison.OrdinalIgnoreCase))throw new ArgumentException("Network input rejected");return input;}catch{input.Dispose();throw;}
     }
     private static void CopyCaller(NamedPipeServerStream pipe,string source,string destination,string digest,long max,CancellationToken cancellation) {
@@ -258,7 +266,7 @@ public static partial class MuHyperVBroker {
         var cancel=new CancellationTokenSource();var closingRegistration=Closing.Token.Register(()=>cancel.Cancel());bool counted=false;try {
             using(var timeout=new Timer(_=>{try{pipe.Dispose();}catch{}},null,10000,Timeout.Infinite)){
                 var bytes=new List<byte>();int value;while((value=pipe.ReadByte())!=10){if(value<0||bytes.Count>=65536)throw new ArgumentException("Request exceeds bounds");bytes.Add((byte)value);}timeout.Change(Timeout.Infinite,Timeout.Infinite);
-                uint pid;if(!GetNamedPipeClientProcessId(pipe.SafePipeHandle.DangerousGetHandle(),out pid)||pid!=Owner.Id||Owner.HasExited)throw new UnauthorizedAccessException("Application process rejected");
+                uint pid;if(!GetNamedPipeClientProcessId(pipe.SafePipeHandle.DangerousGetHandle(),out pid)||pid!=Owner.Id||OwnerExited)throw new UnauthorizedAccessException("Application process rejected");
                 string sid=null;pipe.RunAsClient(()=>sid=WindowsIdentity.GetCurrent(true).User.Value);if(sid!=OwnerSid)throw new UnauthorizedAccessException("Application user rejected");
                 var watching=new Thread(()=>{try{pipe.ReadByte();}catch{}cancel.Cancel();});watching.IsBackground=true;watching.Start();
                 lock(Gate){if(Stopping)throw new OperationCanceledException("Broker is closing");ActiveRequests++;RequestsIdle.Reset();counted=true;}
@@ -283,16 +291,16 @@ public static partial class MuHyperVBroker {
             Owner=Process.GetProcessById(ownerPid);OwnerSid=ProcessSid(Owner);var common=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),"MuCodeSandbox-HyperVBroker-v1");TrustedExecutable(common);PrivateDirectory(common);var users=Path.Combine(common,"users");PrivateDirectory(users);UserRoot=Path.Combine(users,OwnerSid);PrivateDirectory(UserRoot);Directory.SetCurrentDirectory(UserRoot);PrivateDirectory(Path.Combine(UserRoot,"images"));PrivateDirectory(Path.Combine(UserRoot,"vms"));
             // The previous owner can exit before its agent finishes VM cleanup.
             // Wait for that sealed store to be released, never bypass its lock.
-            var waiting=Stopwatch.StartNew();for(;;){if(Owner.HasExited)throw new OperationCanceledException("Application exited while waiting for storage");try{Held.Add(new FileStream(Path.Combine(UserRoot,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None));break;}catch(IOException){if(waiting.ElapsedMilliseconds>90000)throw;Thread.Sleep(100);}}
+            var waiting=Stopwatch.StartNew();for(;;){if(OwnerExited)throw new OperationCanceledException("Application exited while waiting for storage");try{Held.Add(new FileStream(Path.Combine(UserRoot,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None));break;}catch(IOException){if(waiting.ElapsedMilliseconds>90000)throw;Thread.Sleep(100);}}
             Ledger=Path.Combine(UserRoot,"vms.json");if(File.Exists(Ledger)){var saved=Json().Deserialize<Dictionary<string,Dictionary<string,object>>>(File.ReadAllText(Ledger));foreach(var pair in saved)Records.Add(pair.Key,pair.Value);}
             byte[] scriptBytes=Convert.FromBase64String(HyperVScript);string scriptHash;using(var sha=SHA256.Create())scriptHash=BitConverter.ToString(sha.ComputeHash(scriptBytes)).Replace("-","").ToLowerInvariant();ScriptFile=Path.Combine(UserRoot,"hyperv-"+scriptHash+".ps1");if(File.Exists(ScriptFile)){if((File.GetAttributes(ScriptFile)&FileAttributes.ReparsePoint)!=0||HashFile(ScriptFile)!=scriptHash)throw new UnauthorizedAccessException("Protected script changed");}else{using(var scriptStream=new FileStream(ScriptFile,FileMode.CreateNew,FileAccess.Write,FileShare.None)){scriptStream.Write(scriptBytes,0,scriptBytes.Length);scriptStream.Flush(true);}}
             if(detectHost){var status=(Dictionary<string,object>)HostStatus();SetupOnly=!Convert.ToBoolean(status["ready"])||HostJobLive(HostJob());}
             if(!SetupOnly)foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
-            var watcher=new Thread(()=>{try{Owner.WaitForExit();}catch{}Shutdown();});watcher.IsBackground=true;watcher.Start();
+            var watcher=new Thread(()=>{WaitForSingleObject(OwnerHandle,0xffffffff);Shutdown();});watcher.IsBackground=true;watcher.Start();
             var security=new PipeSecurity();security.SetAccessRuleProtection(true,false);security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(OwnerSid),PipeAccessRights.ReadWrite,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(SystemSid,PipeAccessRights.FullControl,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(AdminSid,PipeAccessRights.FullControl,AccessControlType.Allow));
             while(!Stopping){NamedPipeServerStream pipe=null;try{pipe=new NamedPipeServerStream("MuCodeSandbox-Broker-"+args[3],PipeDirection.InOut,16,PipeTransmissionMode.Byte,PipeOptions.Asynchronous,65536,65536,security);lock(Gate)Pipes.Add(pipe);pipe.WaitForConnection();ThreadPool.QueueUserWorkItem(_=>Serve(pipe));}catch{if(pipe!=null){pipe.Dispose();lock(Gate)Pipes.Remove(pipe);}if(!Stopping)Thread.Sleep(100);}}
             return 0;
-        }catch(Exception error){Console.Error.WriteLine("Windows broker could not start: "+error.GetType().Name);return 1;}
+        }catch(Exception error){Console.Error.WriteLine("Windows broker could not start: "+error.ToString());return 1;}
         finally{Shutdown();for(int i=Held.Count-1;i>=0;i--)Held[i].Dispose();if(OwnerIdentity!=null)OwnerIdentity.Dispose();}
     }
 }

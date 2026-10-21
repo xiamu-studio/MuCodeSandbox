@@ -57,6 +57,13 @@ public sealed class MuPacketLabGuard:IDisposable {
         Directory.CreateDirectory(path,acl);Pin(path);var actual=Directory.GetAccessControl(path);var owner=(SecurityIdentifier)actual.GetOwner(typeof(SecurityIdentifier));if(!owner.Equals(admin)&&owner.Value!="S-1-5-18")throw new UnauthorizedAccessException("Diagnostic staging owner changed");
         foreach(FileSystemAccessRule rule in actual.GetAccessRules(true,true,typeof(SecurityIdentifier)))if(rule.AccessControlType==AccessControlType.Allow&&rule.IdentityReference.Value!="S-1-5-18"&&rule.IdentityReference.Value!="S-1-5-32-544")throw new UnauthorizedAccessException("Diagnostic staging permissions changed");return path;
     }
+    public string ReopenArtifacts(){
+        string path=FilePath("trace-artifacts");Pin(path);
+        var acl=Directory.GetAccessControl(path);var owner=(SecurityIdentifier)acl.GetOwner(typeof(SecurityIdentifier));
+        if(owner.Value!="S-1-5-18"&&owner.Value!="S-1-5-32-544")throw new UnauthorizedAccessException("Diagnostic staging owner changed");
+        foreach(FileSystemAccessRule rule in acl.GetAccessRules(true,true,typeof(SecurityIdentifier)))if(rule.AccessControlType==AccessControlType.Allow&&rule.IdentityReference.Value!="S-1-5-18"&&rule.IdentityReference.Value!="S-1-5-32-544")throw new UnauthorizedAccessException("Diagnostic staging permissions changed");
+        return path;
+    }
     public void PublishArtifacts(){
         string path=FilePath("trace-artifacts");
         foreach(string file in Directory.GetFiles(path)){

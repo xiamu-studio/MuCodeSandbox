@@ -16,6 +16,23 @@ test('An active managed guest blocks host servicing before any privileged reques
 test('Pending reboots and unsupported requirements cannot trigger another component operation',async()=>{for(const status of [{...ready,restartRequired:true,canPrepare:false},{...ready,supported:false,canPrepare:false}]){const calls:string[]=[],host=new WindowsHostComponents({call:async(action:string)=>{calls.push(action);return status;}} as unknown as HyperVBrokerClient,()=>true);await assert.rejects(host.prepare(),{code:'HOST_REQUIREMENTS'});assert.deepEqual(calls,['host-status']);}});
 test('Concurrent state refreshes share one actual privileged query',async()=>{let resolve!:(value:unknown)=>void,calls=0;const host=new WindowsHostComponents({call:async()=>{calls++;return new Promise(r=>{resolve=r;});}} as unknown as HyperVBrokerClient,()=>true),a=host.refresh(),b=host.refresh();resolve(ready);assert.deepEqual(await a,await b);assert.equal(calls,1);});
 
+test('An underlying hypervisor does not start the newly installed Hyper-V service before its requested reboot',{skip:process.platform!=='win32'},async()=>{
+ const directory=await mkdtemp(path.join(tmpdir(),'mu-host-restart-')),task=path.join(directory,'host-components','job-'+randomUUID()+'.json');
+ try{
+  await mkdir(path.dirname(task));await mkdir(path.join(directory,'MuCodeSandbox-HyperVBroker-v1'));await writeFile(task,JSON.stringify({status:'starting',phase:'checking',processId:0,processStart:'',snapshot:null,changed:[],restartNeeded:false,bootId:'nested-boot',errorCode:null}));
+  await run(powershellPath(),powershellArgs(`$ErrorActionPreference='Stop';$env:ProgramData='${directory.replaceAll("'","''")}';$TaskFile='${task.replaceAll("'","''")}';$Action='prepare'
+$tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile('${path.resolve('scripts/windows/host-components.ps1').replaceAll("'","''")}',[ref]$tokens,[ref]$errors);if($errors.Count){throw 'Invalid servicing source'}
+$statements=@($ast.EndBlock.Statements);$start=-1;for($i=0;$i -lt $statements.Count;$i++){if($statements[$i].Extent.Text.StartsWith('if($Action -eq ''status'')')){$start=$i;break}};if($start -lt 0){throw 'Preparation entry missing'}
+$script:queries=0
+function Get-HostComponentStatus {$script:queries++;[ordered]@{supported=$true;firmwareVirtualization=$true;slat=$true;ready=$false;restartRequired=$false;hyperV=$(if($script:queries -eq 1){'disabled'}else{'enabled'});managementModule=$false;sshClientPresent=$true;hypervisorPresent=$true;vmmsRunning=$false;bootId='nested-boot'}}
+function Enable-WindowsOptionalFeature {[CmdletBinding()]param([switch]$Online,[string]$FeatureName,[switch]$All,[switch]$NoRestart);if(-not $NoRestart -or $FeatureName -ne 'Microsoft-Hyper-V-All'){throw 'Unexpected feature request'};[pscustomobject]@{RestartNeeded=$true}}
+function Set-Service {throw 'A not-yet-installed service must wait for reboot'}
+function Start-Service {throw 'The underlying hypervisor cannot prove this service is ready'}
+& ([ScriptBlock]::Create(($statements[$start..($statements.Count-1)] | ForEach-Object {$_.Extent.Text}) -join [Environment]::NewLine))`),{timeoutMs:10000});
+  const state=JSON.parse(await readFile(task,'utf8'));assert.equal(state.status,'completed');assert.equal(state.restartNeeded,true);assert.deepEqual(state.changed,['hyperv']);assert.equal(state.bootId,'nested-boot');
+ }finally{const target=path.resolve(directory);assert.equal(path.dirname(target),path.resolve(tmpdir()));assert.match(path.basename(target),/^mu-host-restart-/);await rm(target,{recursive:true,force:true});}
+});
+
 test('A later SSH failure preserves completed Hyper-V changes and the pending reboot, even if the final status query fails',{skip:process.platform!=='win32'},async()=>{
  for(const queryFails of [false,true]){
   const directory=await mkdtemp(path.join(tmpdir(),'mu-host-job-')),task=path.join(directory,'host-components','job-'+randomUUID()+'.json');

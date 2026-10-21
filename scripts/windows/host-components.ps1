@@ -58,7 +58,7 @@ try {
    Save-HostChange 'ssh-client' ([bool]$result.RestartNeeded)
   }
   $middle=Get-HostComponentStatus
-  if($middle.hypervisorPresent -and $middle.hyperV -eq 'enabled' -and -not $middle.vmmsRunning){
+  if(-not $state.restartNeeded -and -not $middle.restartRequired -and $middle.managementModule -and $middle.hypervisorPresent -and $middle.hyperV -eq 'enabled' -and -not $middle.vmmsRunning){
    $state.phase='start-service';Save-HostJob
    Set-Service vmms -StartupType Automatic -ErrorAction Stop;Start-Service vmms -ErrorAction Stop;Save-HostChange 'vmms' $false
   }

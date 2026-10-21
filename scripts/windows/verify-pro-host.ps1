@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','collect-stop')][string]$Phase)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $directoryPath = [IO.Path]::GetFullPath($Directory)
@@ -100,6 +100,13 @@ try {
         Save-ProProbe 'diagnosed' @{ host = $initial; details = $details }; exit 0
     }
     if (-not $initial.userOrdinary -or $initial.oobe -ne 0 -or $initial.setupInProgress -ne 0) { throw 'Ordinary Pro profile and completed system setup required' }
+    if ($Phase -in @('vmms-stage','vmms-run','vmms-recover','vmms-inspect')) {
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-vmms-operator.ps1'))))
+        Save-ProProbe 'running-vmms-check' $initial
+        $result = Invoke-ProVmmsPhase $session $Phase $guard $config.nonce
+        Save-ProProbe 'vmms-result' $result
+        if (-not $result.complete) { exit 1 }; exit 0
+    }
     if ($Phase -in @('package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main')) {
         . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-package-operator.ps1'))))
         Save-ProProbe 'running-package-check' $initial
@@ -175,7 +182,10 @@ try {
                 if ($listTask.Actions.Execute -ne (Join-Path $env:SystemRoot 'System32/control.exe') -or $listTask.Actions.Arguments -ne '/name Microsoft.ProgramsAndFeatures') { throw 'Unknown list task preserved' }
                 Unregister-ScheduledTask -TaskName MuPro-package-show-list -Confirm:$false
             }
-            return @{ nestedGuests = $count; privateSwitches = $switches; registrationCopiesEqual = $true; registeredGuests = 0; runtimeDirectories = 0; brokerSourceDigest = $meta.sourceDigest }
+            if ((Get-Service vmms).Status -ne 'Running') { throw 'Pro VMMS has not been restored' }
+            $moduleHashes = @{}
+            foreach ($name in @('broker','runtime','manager','session','service','config')) { $moduleHashes[$name] = (Get-FileHash -LiteralPath ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\' + $name + '.js') -Algorithm SHA256).Hash.ToLowerInvariant() }
+            return @{ nestedGuests = $count; privateSwitches = $switches; registrationCopiesEqual = $true; registeredGuests = 0; runtimeDirectories = 0; brokerSourceDigest = $meta.sourceDigest; backendModuleHashes = $moduleHashes; vmmsRunning = $true }
         }
         Remove-PSSession $session; $session = $null
         $vm = Assert-ProFixture; Stop-VM -VM $vm -TurnOff -Force

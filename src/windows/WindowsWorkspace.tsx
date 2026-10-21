@@ -6,6 +6,7 @@ import {Button,Field,Modal,Notice,SectionHeading,Status,dateLabel} from '../comp
 import './windows.css';
 import WindowsFilesPanel from './WindowsFilesPanel.tsx';
 import WindowsSetupPanel from './WindowsSetupPanel.tsx';
+import WindowsHostPanel from './WindowsHostPanel.tsx';
 const TerminalPanel=lazy(()=>import('../TerminalPanel.tsx'));
 const WindowsBrowserView=lazy(()=>import('./WindowsBrowserView.tsx'));
 
@@ -57,6 +58,7 @@ export default function WindowsWorkspace(){
    <div className="main-content">
     {error&&<Notice kind="error">{error}</Notice>}
     {snapshot?.system.hostNetwork?.issue&&<Notice kind="error">{snapshot.system.hostNetwork.issue}。请退出并重新打开预览后再启动环境。</Notice>}
+    {snapshot&&window.__MU_CONFIG__.capabilities?.hostSetup&&<WindowsHostPanel showReady={system} onChange={refresh}/>}
     {snapshot&&window.__MU_CONFIG__.capabilities?.setup&&!snapshot.system.runtime.available&&<WindowsSetupPanel onReady={refresh}/>}
     {!snapshot?<div className="loading-view">连接 Windows 本机服务…</div>:system?<>
      <header className="page-header"><div><div className="eyebrow">WINDOWS</div><h1>系统状态</h1><p>Hyper-V 管理预览</p></div></header>

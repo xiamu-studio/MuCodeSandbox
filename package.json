@@ -31,7 +31,7 @@
     "windows:isolation-lab": "node scripts/windows-isolation-lab.ts",
     "windows:service-lab": "node scripts/windows-service-lab.ts",
     "windows:browser-lab": "node scripts/windows-browser-lab.ts",
-    "test:windows": "node --test tests/windows-platform.test.ts tests/windows-fixtures.test.ts tests/windows-download.test.ts tests/windows-package-proxy.test.ts tests/windows-credentials.test.ts tests/windows-manager.test.ts tests/windows-service.test.ts tests/windows-terminal.test.ts tests/windows-terminal-process.test.ts tests/windows-browser-transport.test.ts tests/windows-broker-client.test.ts tests/windows-runtime-cleanup.test.ts tests/windows-packet-evidence.test.ts tests/windows-desktop.test.ts tests/windows-setup.test.ts",
+    "test:windows": "node --test tests/windows-platform.test.ts tests/windows-fixtures.test.ts tests/windows-download.test.ts tests/windows-package-proxy.test.ts tests/windows-credentials.test.ts tests/windows-manager.test.ts tests/windows-service.test.ts tests/windows-terminal.test.ts tests/windows-terminal-process.test.ts tests/windows-browser-transport.test.ts tests/windows-broker-client.test.ts tests/windows-runtime-cleanup.test.ts tests/windows-packet-evidence.test.ts tests/windows-desktop.test.ts tests/windows-setup.test.ts tests/windows-host-components.test.ts",
     "test:ui": "node scripts/verify-ui.mjs",
     "test:desktop": "node scripts/verify-desktop.mjs",
     "test:desktop-crash": "node scripts/verify-desktop-crash.ts --bridge-owner",
@@ -235,7 +235,8 @@
     "windows:desktop-lab": "node scripts/windows-desktop-lab.ts",
     "windows:install-lab": "node scripts/windows-install-lab.ts",
     "windows:setup-lab": "node scripts/windows-setup-lab.ts",
-    "windows:setup-package-lab": "node scripts/windows-setup-package-lab.ts"
+    "windows:setup-package-lab": "node scripts/windows-setup-package-lab.ts",
+    "windows:host-lab": "node scripts/windows-host-lab.ts"
   },
   "dependencies": {
     "@novnc/novnc": "1.7.0",

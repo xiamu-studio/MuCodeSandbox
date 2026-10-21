@@ -29,6 +29,7 @@ export class WindowsSetup {
   if(this.options.base){if(this.options.base.image.startsWith('mu-base:'))await this.runtime.verifySealedBase(this.options.base);else{if((await lstat(this.options.base.image)).isSymbolicLink()||await fileHash(this.options.base.image)!==this.options.base.imageSha256)throw Error('Prepared base changed');}this.state={...this.state,status:'ready',phase:'ready',canPrepare:false};}
  }
  snapshot():WindowsSetupState{return {...this.state,canPrepare:this.state.status!=='ready'&&!this.task&&this.options.canPrepare()};}
+ get running(){return !!this.task;}
  start(){if(this.task)throw new AppError('正在准备 Linux 组件',409,'SETUP_BUSY');if(this.state.status==='ready')return this.snapshot();if(!this.options.canPrepare())throw new AppError('请先停止环境；已有基盘引用需要单独修复',409,'SETUP_ENVIRONMENT_BUSY');this.controller=new AbortController();this.state={...this.state,status:'running',phase:'checking',message:null,completedBytes:0,totalBytes:0};this.task=this.prepare(this.controller.signal).catch(()=>{this.state={...this.state,status:'failed',message:'准备状态无法完整保存，请检查本机磁盘后重试。'};}).finally(()=>{this.task=undefined;this.controller=undefined;});return this.snapshot();}
  cancel(){this.controller?.abort();return this.snapshot();}
  async close(){this.controller?.abort();await this.task;}

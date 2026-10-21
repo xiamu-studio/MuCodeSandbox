@@ -32,6 +32,9 @@ test('Windows API requires its launch cookie, bearer token, valid Host and same 
   const bootstrap=JSON.parse((await page.text()).match(/window\.__MU_CONFIG__=(\{.*?\});/)![1]);
   assert.equal(bootstrap.platform,'win32');
   const headers={Cookie:sessionCookie,Authorization:'Bearer '+bootstrap.token,'Content-Type':'application/json'};
+  assert.equal((await fetch(service.url+'/api/windows/host',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,401);
+  assert.equal((await fetch(service.url+'/api/windows/host',{method:'POST',headers,body:JSON.stringify({features:['anything']})})).status,400);
+  assert.equal((await fetch(service.url+'/api/windows/host',{method:'POST',headers,body:'{}'})).status,409);
   assert.equal((await fetch(service.url+'/api/windows/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,401);
   assert.equal((await fetch(service.url+'/api/windows/setup',{method:'POST',headers,body:JSON.stringify({image:'C:\\outside.vhdx'})})).status,400);
   assert.equal((await fetch(service.url+'/api/windows/setup',{method:'POST',headers,body:'{}'})).status,409);

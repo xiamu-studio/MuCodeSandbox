@@ -22,6 +22,7 @@ import {clipboardText} from '../../guest-exchange.ts';
 import {windowsAppDirectory,windowsRuntimeDirectory} from './paths.ts';
 import {windowsBaseSchema} from './config.ts';
 import {WindowsSetup} from './setup.ts';
+import {WindowsHostComponents,hostReady} from './host-components.ts';
 
 export interface WindowsServiceOptions {
  rootDir:string;dataDir?:string;runtimeRoot?:string;port?:number;base?:WindowsBase;
@@ -36,7 +37,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
  const runtimeRoot=windowsRuntimeDirectory(options.runtimeRoot,dataDir);
  await secureWindowsDirectory(dataDir);
  const unlock=await acquireWindowsServiceLock(dataDir);
- let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined,setup:WindowsSetup|undefined;
+ let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined,setup:WindowsSetup|undefined,host:WindowsHostComponents|undefined;
  try{
   await secureWindowsDirectory(runtimeRoot);
   const runtime=options.runtime??new HyperVRuntime(runtimeRoot);
@@ -47,7 +48,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   }
   manager=new WindowsManager(await openWindowsStore(dataDir),runtime,{runtimeRoot,base,probe:options.probe});
   const controller=manager;
-  if(runtime instanceof HyperVRuntime&&runtime.broker){setup=new WindowsSetup(runtime,runtimeRoot,{base,canPrepare:()=>!controller.options.base&&!controller.tasks.size&&controller.store.list().every(e=>e.state==='not_created'),publish:value=>{controller.options.base=value;controller.profiles.clear();}});await setup.initialize();}
+  if(runtime instanceof HyperVRuntime&&runtime.broker){host=new WindowsHostComponents(runtime.broker,()=>!controller.tasks.size&&controller.store.list().every(e=>!['running','starting','creating','stopping'].includes(e.state))&&!setup?.running);await host.refresh();setup=new WindowsSetup(runtime,runtimeRoot,{base,canPrepare:()=>!!host&&hostReady(host.snapshot())&&!controller.options.base&&!controller.tasks.size&&controller.store.list().every(e=>e.state==='not_created'),publish:value=>{controller.options.base=value;controller.profiles.clear();}});await setup.initialize();}
   terminal=runtime.terminalLaunch?new WindowsTerminalServer(controller,{terminalLaunch:runtime.terminalLaunch.bind(runtime)},options.ptyFactory):undefined;
   const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>();
   const guest=runtime.guest?.bind(runtime),management=runtime.management?.bind(runtime);
@@ -60,7 +61,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   },management:async(e,command,runOptions)=>{await controller.assertAccess(e.id);return management(await controller.profile(e),command,runOptions);}},id=>controller.assertAccess(id)):undefined;
   controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
-  await controller.recover();
+  if(!host||host.snapshot().runtimeActive)await controller.recover();
   monitor=new WindowsHostMonitor(()=>runtime.fingerprint(),()=>{void controller.hostUnavailable('宿主网络发生变化、监测中断或电脑从休眠恢复').catch(()=>{});});
   await monitor.start();
   const watcher=monitor;
@@ -83,11 +84,11 @@ export async function createWindowsService(options:WindowsServiceOptions){
   });
   app.use(express.json({limit:'256kb'}));
   const id=(req:express.Request)=>z.uuid().parse(req.params.id);
-  app.get('/api/snapshot',async(_req,res)=>{const snapshot=await controller.snapshot();res.json({...snapshot,system:{...snapshot.system,application:{channel:'source-preview',buildId:'working-tree',builtAt:null}}});});
+  app.get('/api/snapshot',async(_req,res)=>{const snapshot=await controller.snapshot();if(host&&!hostReady(host.snapshot())){snapshot.system.runtime.available=false;snapshot.system.runtime.error='请完成 Windows 系统组件准备，按提示重启或重新打开软件';}res.json({...snapshot,system:{...snapshot.system,application:{channel:'source-preview',buildId:'working-tree',builtAt:null}}});});
   app.post('/api/environments',async(req,res)=>res.status(201).json(await controller.create(req.body)));
   app.put('/api/environments/:id',async(req,res)=>res.json(await controller.update(id(req),req.body)));
   app.post('/api/environments/:id/actions/delete',async(req,res)=>{const input=z.object({confirmation:z.string().min(1).max(60)}).strict().parse(req.body);res.status(202).json(await controller.remove(id(req),input.confirmation));});
-  app.post('/api/environments/:id/actions/:action',async(req,res)=>res.status(202).json(await controller.action(id(req),z.enum(['start','stop','restart']).parse(req.params.action))));
+  app.post('/api/environments/:id/actions/:action',async(req,res)=>{const action=z.enum(['start','stop','restart']).parse(req.params.action);if(action!=='stop'&&host&&!hostReady(await host.refresh()))throw new AppError('系统组件尚未就绪，请按系统准备提示处理',409,'HOST_REQUIREMENTS');res.status(202).json(await controller.action(id(req),action));});
   app.get('/api/environments/:id/network/protection',async(req,res)=>res.json(await controller.protection(id(req))));
   app.get('/api/logs',(req,res)=>res.json(controller.store.logs(req.query.environmentId?z.uuid().parse(req.query.environmentId):null,z.coerce.number().int().min(0).parse(req.query.after??0))));
   app.post('/api/jobs/:id/cancel',(req,res)=>{controller.cancel(id(req));res.json({ok:true});});
@@ -95,6 +96,9 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.get('/api/windows/setup',(_req,res)=>res.json(setupHost().snapshot()));
   app.post('/api/windows/setup',(req,res)=>{z.object({}).strict().parse(req.body??{});res.status(202).json(setupHost().start());});
   app.post('/api/windows/setup/cancel',(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(setupHost().cancel());});
+  const hostComponents=()=>{if(!host)throw new AppError('此入口不提供系统组件准备，请使用 Windows 桌面',409,'HOST_SETUP_UNAVAILABLE');return host;};
+  app.get('/api/windows/host',async(_req,res)=>res.json(await hostComponents().refresh()));
+  app.post('/api/windows/host',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.status(202).json(await hostComponents().prepare());});
   const browserHost=()=>{if(!guestBrowser)throw new AppError('Windows 浏览器运行组件不可用',409,'FEATURE_UNAVAILABLE');return guestBrowser;};
   app.get('/api/environments/:id/guest-browser',(req,res)=>res.json(browserHost().info(id(req))));
   app.post('/api/environments/:id/browser/open',async(req,res)=>{z.object({}).strict().parse(req.body??{});const envId=id(req),host=browserHost();res.status(202).json(await controller.submit(envId,'open-browser',options=>host.open(envId,options)));});
@@ -134,7 +138,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.post('/api/environments/:id/clipboard/read',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(await files().readClipboard(id(req)));});
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));
@@ -160,6 +164,6 @@ export async function createWindowsService(options:WindowsServiceOptions){
    watcher.stop();terminals?.close();guestBrowser?.dispose();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
    try{await setup?.close();await controller.close();}finally{await closed;await unlock();}
   })();
-  return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,exchange,setup,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};
+  return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,exchange,setup,host,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};
  }catch(error){monitor?.stop();terminal?.close();browser?.dispose();try{await setup?.close();await manager?.close();}finally{await unlock();}throw error;}
 }

@@ -37,6 +37,7 @@ public static partial class MuHyperVBroker {
     private static WindowsIdentity OwnerIdentity;
     private static string OwnerSid, UserRoot, Ledger, ScriptFile;
     private static volatile bool Stopping;
+    private static bool SetupOnly;
     [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetNamedPipeClientProcessId(IntPtr pipe, out uint pid);
     [DllImport("advapi32.dll", SetLastError=true)] private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
     [DllImport("advapi32.dll", SetLastError=true)] private static extern bool DuplicateToken(IntPtr token,int level,out IntPtr duplicate);
@@ -99,7 +100,7 @@ public static partial class MuHyperVBroker {
     }
     private static string Invoke(string action,Dictionary<string,object> parameters,int timeout,CancellationToken cancellation) {
         if(action!="stop"&&action!="recover-allocation"&&action!="delete-allocation"){cancellation.ThrowIfCancellationRequested();if(Stopping)throw new OperationCanceledException("Broker is closing");}
-        string system=Environment.GetFolderPath(Environment.SpecialFolder.Windows),script="$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);try { & '"+ScriptFile.Replace("'","''")+"' -Action '"+action+"' } catch { [Console]::Error.WriteLine($_.Exception.ToString());[Console]::Error.WriteLine($_.ScriptStackTrace);exit 1 }";
+        string system=Environment.GetFolderPath(Environment.SpecialFolder.Windows),script="$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';[Console]::InputEncoding=[Text.UTF8Encoding]::new($false);[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);try { & ([ScriptBlock]::Create([IO.File]::ReadAllText('"+ScriptFile.Replace("'","''")+"'))) -Action '"+action+"' } catch { [Console]::Error.WriteLine($_.Exception.ToString());[Console]::Error.WriteLine($_.ScriptStackTrace);exit 1 }";
         var info=new ProcessStartInfo(Path.Combine(system,"System32/WindowsPowerShell/v1.0/powershell.exe"),"-NoLogo -NoProfile -NonInteractive -EncodedCommand "+Convert.ToBase64String(Encoding.Unicode.GetBytes(script))){UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,WorkingDirectory=UserRoot,StandardOutputEncoding=Encoding.UTF8,StandardErrorEncoding=Encoding.UTF8};
         info.EnvironmentVariables.Clear();info.EnvironmentVariables["SystemRoot"]=system;info.EnvironmentVariables["WINDIR"]=system;info.EnvironmentVariables["SystemDrive"]=Path.GetPathRoot(system).TrimEnd('\\');info.EnvironmentVariables["COMPUTERNAME"]=Environment.MachineName;info.EnvironmentVariables["ProgramData"]=Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);info.EnvironmentVariables["ProgramFiles"]=Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);info.EnvironmentVariables["ComSpec"]=Path.Combine(system,"System32/cmd.exe");info.EnvironmentVariables["USERPROFILE"]=UserRoot;info.EnvironmentVariables["PATH"]=Path.Combine(system,"System32");info.EnvironmentVariables["PSModulePath"]=Path.Combine(system,"System32/WindowsPowerShell/v1.0/Modules");info.EnvironmentVariables["TEMP"]=UserRoot;info.EnvironmentVariables["TMP"]=UserRoot;
         using(var process=Process.Start(info)) {
@@ -165,9 +166,14 @@ public static partial class MuHyperVBroker {
     private static object Dispatch(NamedPipeServerStream pipe,Dictionary<string,object> request,CancellationToken cancellation) {
         string action=Text(request,"action",32);
         if(action=="hello"){ValidateKeys(request,"action");return new {version=1,ownerPid=Owner.Id,ownerSid=OwnerSid,elevated=true,protectedStorage=true,sourceDigest=SourceDigest};}
+        if(action=="host-status"){ValidateKeys(request,"action");return HostStatus();}
+        if(action=="prepare-host"){ValidateKeys(request,"action");return PrepareHost();}
+        if(action=="doctor"&&SetupOnly){ValidateKeys(request,"action");return Json().Serialize(new {available=false,issues=new[]{"请完成 Windows 系统组件准备后重新打开软件"}});}
         if(action=="doctor"||action=="fingerprint"){ValidateKeys(request,"action");return Invoke(action,null,10000,cancellation);}
         if(action=="shutdown"){ValidateKeys(request,"action");return "";}
         if(action=="base-status"){ValidateKeys(request,"action","imageSha256");string digest=Digest(request,"imageSha256");if(!File.Exists(Path.Combine(UserRoot,"bases",digest+".json")))return new {ready=false};ResolveSealedBase("mu-base:"+digest,digest);return BaseReceipt(digest);}
+        if(SetupOnly)throw new UnauthorizedAccessException("This session only prepares Windows components; reopen the application for virtual machines");
+        if((action=="disk"||action=="begin-base"||action=="create"||action=="start")&&HostServicingBusy())throw new InvalidOperationException("Windows component servicing is running");
         string id=Id(request);
         if(action=="seal-base"){ValidateKeys(request,"action","id");return SealBase(id,cancellation);}
         if(action=="discard-base-builder"){ValidateKeys(request,"action","id");lock(VmGate(id)){var builder=Owned(id);if(!builder.ContainsKey("baseBuilder")||!Convert.ToBoolean(builder["baseBuilder"]))throw new UnauthorizedAccessException("Only a marked base builder may be discarded by setup");return Dispatch(pipe,new Dictionary<string,object>{{"action","delete"},{"id",id}},cancellation);}}
@@ -266,11 +272,12 @@ public static partial class MuHyperVBroker {
         // Cancel privileged work directly, independently of client pipe EOF.
         Closing.Cancel();foreach(var pipe in closingPipes)ThreadPool.QueueUserWorkItem(_=>{try{pipe.Dispose();}catch{}});
         foreach(var record in ShutdownSnapshot())CloseChannel(Convert.ToString(record["id"]));
-        try{RequestsIdle.WaitOne(30000);foreach(var record in ShutdownSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);try{Invoke(record.ContainsKey("platformId")?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
+        try{RequestsIdle.WaitOne(30000);if(!SetupOnly)foreach(var record in ShutdownSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);try{Invoke(record.ContainsKey("platformId")?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
     }
     public static int Main(string[] args) {
+        if(args.Length>0&&args[0]=="--host-once")return HostJobMain(args);
         if(args.Length==1&&args[0]=="--self-test"){try{ValidateKeys(new Dictionary<string,object>{{"action","start"},{"command","bad"}},"action","id");return 1;}catch(ArgumentException){}Console.WriteLine("Broker request boundary verified");return 0;}
-        if(args.Length!=4||args[0]!="--owner"||args[2]!="--pipe")return 64;int ownerPid;if(!int.TryParse(args[1],out ownerPid)||ownerPid<=0||args[3].Length!=64||args[3].Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))return 64;
+        if((args.Length!=4&&args.Length!=5)||args[0]!="--owner"||args[2]!="--pipe"||(args.Length==5&&args[4]!="--setup-only"&&args[4]!="--detect-host"))return 64;bool detectHost=args.Length==5&&args[4]=="--detect-host";SetupOnly=args.Length==5;int ownerPid;if(!int.TryParse(args[1],out ownerPid)||ownerPid<=0||args[3].Length!=64||args[3].Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))return 64;
         if(!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator))return 77;
         try {
             Owner=Process.GetProcessById(ownerPid);OwnerSid=ProcessSid(Owner);var common=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),"MuCodeSandbox-HyperVBroker-v1");TrustedExecutable(common);PrivateDirectory(common);var users=Path.Combine(common,"users");PrivateDirectory(users);UserRoot=Path.Combine(users,OwnerSid);PrivateDirectory(UserRoot);Directory.SetCurrentDirectory(UserRoot);PrivateDirectory(Path.Combine(UserRoot,"images"));PrivateDirectory(Path.Combine(UserRoot,"vms"));
@@ -279,7 +286,8 @@ public static partial class MuHyperVBroker {
             var waiting=Stopwatch.StartNew();for(;;){if(Owner.HasExited)throw new OperationCanceledException("Application exited while waiting for storage");try{Held.Add(new FileStream(Path.Combine(UserRoot,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None));break;}catch(IOException){if(waiting.ElapsedMilliseconds>90000)throw;Thread.Sleep(100);}}
             Ledger=Path.Combine(UserRoot,"vms.json");if(File.Exists(Ledger)){var saved=Json().Deserialize<Dictionary<string,Dictionary<string,object>>>(File.ReadAllText(Ledger));foreach(var pair in saved)Records.Add(pair.Key,pair.Value);}
             byte[] scriptBytes=Convert.FromBase64String(HyperVScript);string scriptHash;using(var sha=SHA256.Create())scriptHash=BitConverter.ToString(sha.ComputeHash(scriptBytes)).Replace("-","").ToLowerInvariant();ScriptFile=Path.Combine(UserRoot,"hyperv-"+scriptHash+".ps1");if(File.Exists(ScriptFile)){if((File.GetAttributes(ScriptFile)&FileAttributes.ReparsePoint)!=0||HashFile(ScriptFile)!=scriptHash)throw new UnauthorizedAccessException("Protected script changed");}else{using(var scriptStream=new FileStream(ScriptFile,FileMode.CreateNew,FileAccess.Write,FileShare.None)){scriptStream.Write(scriptBytes,0,scriptBytes.Length);scriptStream.Flush(true);}}
-            foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
+            if(detectHost){var status=(Dictionary<string,object>)HostStatus();SetupOnly=!Convert.ToBoolean(status["ready"])||HostJobLive(HostJob());}
+            if(!SetupOnly)foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
             var watcher=new Thread(()=>{try{Owner.WaitForExit();}catch{}Shutdown();});watcher.IsBackground=true;watcher.Start();
             var security=new PipeSecurity();security.SetAccessRuleProtection(true,false);security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(OwnerSid),PipeAccessRights.ReadWrite,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(SystemSid,PipeAccessRights.FullControl,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(AdminSid,PipeAccessRights.FullControl,AccessControlType.Allow));
             while(!Stopping){NamedPipeServerStream pipe=null;try{pipe=new NamedPipeServerStream("MuCodeSandbox-Broker-"+args[3],PipeDirection.InOut,16,PipeTransmissionMode.Byte,PipeOptions.Asynchronous,65536,65536,security);lock(Gate)Pipes.Add(pipe);pipe.WaitForConnection();ThreadPool.QueueUserWorkItem(_=>Serve(pipe));}catch{if(pipe!=null){pipe.Dispose();lock(Gate)Pipes.Remove(pipe);}if(!Stopping)Thread.Sleep(100);}}

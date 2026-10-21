@@ -50,7 +50,7 @@ process.on('message',raw=>{void(async()=>{
   const root=windowsRuntimeDirectory();await secureWindowsDirectory(root);process.chdir(root);await secureWindowsDirectory(windowsAppDirectory());send({type:'status',phase:'checking'});
   let executable:string;
   try{executable=await installedBrokerPath();}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT'&&(error as {code?:string}).code!=='BROKER_UPDATE_REQUIRED')throw error;send({type:'status',phase:'installing'});await installBroker(root);executable=await installedBrokerPath();}
-  send({type:'status',phase:'authorizing'});broker=await startBroker(executable);runtime=new HyperVRuntime(root,undefined,broker);service=await createWindowsService({rootDir:value.rootDir,runtimeRoot:root,runtime});initializing=false;send({type:'ready',url:service.launchUrl(),pid:process.pid});
+  send({type:'status',phase:'authorizing'});broker=await startBroker(executable,{detectHost:true});runtime=new HyperVRuntime(root,undefined,broker);service=await createWindowsService({rootDir:value.rootDir,runtimeRoot:root,runtime});initializing=false;send({type:'ready',url:service.launchUrl(),pid:process.pid});
  }catch(error){initializing=false;await service?.close().catch(()=>{});await broker?.call('shutdown').catch(()=>{});await exitWithMessage({type:'error',message:error instanceof Error?error.message:'Windows 服务初始化失败'},1);}
  })().catch(()=>{send({type:'error',message:'无效的桌面管理请求'});process.exit(1);});});
 if(!process.connected)throw Error('Windows desktop worker requires its owning IPC channel');

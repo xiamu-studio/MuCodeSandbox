@@ -6,6 +6,8 @@ if($ChannelFile -notmatch '^hv-channel-[0-9a-f]{16}\.exe$'){throw 'Expected a fi
 if($SourceDigest -notmatch '^[a-f0-9]{64}$'){throw 'Expected a broker source digest'}
 $source=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../../native/windows/HyperVBroker.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../../native/windows/SealedBases.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs'))
 $script=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'hyperv.ps1'))))
-$source=$source.Replace('__HYPERV_SCRIPT_BASE64__',$script).Replace('__CHANNEL_FILE__',$ChannelFile).Replace('__BROKER_SOURCE_DIGEST__',$SourceDigest)
+$hostScript=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'host-components.ps1'))))
+$source=$source.Replace('__HYPERV_SCRIPT_BASE64__',$script).Replace('__HOST_COMPONENTS_SCRIPT_BASE64__',$hostScript).Replace('__CHANNEL_FILE__',$ChannelFile).Replace('__BROKER_SOURCE_DIGEST__',$SourceDigest)
 Add-Type -TypeDefinition $source -ReferencedAssemblies @('System.dll','System.Core.dll','System.Web.Extensions.dll') -OutputAssembly $Destination -OutputType ConsoleApplication

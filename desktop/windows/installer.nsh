@@ -64,10 +64,21 @@
   IfFileExists "$MuRemovalStaging" 0 +2
     Abort "Windows Preview removal staging already exists; files preserved"
   SetOutPath $TEMP
+  StrCpy $R6 0
+  muRemovalRetry:
   System::Call 'kernel32::MoveFileEx(t "$INSTDIR", t "$MuRemovalStaging", i 0)i.r4?e'
   Pop $5
   ${If} $4 == 0
     !insertmacro MuInstallTrace "remove-rename-failed=$5"
+    ${If} $R6 < 20
+      ${If} $5 == 5
+      ${OrIf} $5 == 32
+      ${OrIf} $5 == 33
+        IntOp $R6 $R6 + 1
+        Sleep 250
+        Goto muRemovalRetry
+      ${EndIf}
+    ${EndIf}
     Abort "Unable to move the closed Windows Preview installation; files preserved"
   ${EndIf}
   !insertmacro MuInstallTrace "remove-rename-ok"

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$Directory,[string]$Source,[ValidateSet('fresh','legacy','orphans','loss','corruption','interrupted','conflict','missing','schema','links','permissions')][string]$Case)
+param([string]$Directory,[string]$Source,[ValidateSet('fresh','legacy','orphans','loss','corruption','interrupted','conflict','missing','schema','links','permissions','limit')][string]$Case)
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Web.Extensions
 $header='using System;using System.IO;using System.Linq;using System.Text;using System.Collections.Generic;using System.Runtime.InteropServices;using System.Web.Script.Serialization;'
@@ -19,6 +19,10 @@ function Check-Copies {
  $a=[IO.File]::ReadAllText($primary);$b=[IO.File]::ReadAllText($backup);Check ($a -ceq $b) 'Replicated copies differ';$saved=$json.DeserializeObject($a);Check ($saved.version -eq 2 -and $saved.ownerSid -eq $sid -and $saved.records.Count -eq 1 -and $saved.records[$id].platformId -eq $vmId) 'Allocation identity changed';Check ([IO.File]::ReadAllText($canary) -ceq 'original guest bytes') 'Guest bytes changed'
 }
 switch($Case){
+ 'limit' {
+  Seed | Out-Null;$text=[IO.File]::ReadAllText($primary);$text=[regex]::Replace($text,'"revision":\d+','"revision":9223372036854775806');[IO.File]::WriteAllText($primary,$text);[IO.File]::WriteAllText($backup,$text)
+  $s=Store;$loaded=$s.Load();Reject {$s.Save($loaded)} 'IOException';Check ([IO.File]::ReadAllText($primary) -ceq $text -and [IO.File]::ReadAllText($backup) -ceq $text) 'Revision exhaustion changed a valid copy'
+ }
  'fresh' {
   $emptyRoot=Join-Path $root 'fresh';[IO.Directory]::CreateDirectory($emptyRoot) | Out-Null;$s=[MuProtectedLedger]::new($emptyRoot,$sid,$noop);$loaded=$s.Load();Check ($loaded.Count -eq 0) 'Fresh store contains allocations'
   $a=[IO.File]::ReadAllText((Join-Path $emptyRoot 'vms.json'));$b=[IO.File]::ReadAllText((Join-Path $emptyRoot 'vms.backup.json'));Check ($a -ceq $b -and $json.DeserializeObject($a).version -eq 2) 'Fresh replicas are incomplete'

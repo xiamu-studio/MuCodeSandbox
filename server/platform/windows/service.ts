@@ -103,6 +103,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.post('/api/windows/host',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.status(202).json(await hostComponents().prepare());});
   const storageHost=()=>{if(!storage)throw new AppError('此入口不提供受保护缓存管理，请使用 Windows 桌面',409,'STORAGE_UNAVAILABLE');return storage;};
   app.get('/api/windows/storage',async(_req,res)=>res.json(await storageHost().inspect()));
+  app.get('/api/windows/resources',async(_req,res)=>{if(!(runtime instanceof HyperVRuntime)||!runtime.broker)throw new AppError('此入口不提供受保护资源核验',409,'RESOURCE_UNAVAILABLE');res.json(await runtime.resources());});
   app.post('/api/windows/storage/prune',async(req,res)=>{const input=z.object({plan:z.string().regex(/^[a-f0-9]{64}$/)}).strict().parse(req.body);res.json(await storageHost().prune(input.plan));});
   const browserHost=()=>{if(!guestBrowser)throw new AppError('Windows 浏览器运行组件不可用',409,'FEATURE_UNAVAILABLE');return guestBrowser;};
   app.get('/api/environments/:id/guest-browser',(req,res)=>res.json(browserHost().info(id(req))));

@@ -15,6 +15,7 @@ import type { VmBackend } from '../contract.ts';
 import { windowsConfigSchema, windowsPaths, vmIdentity, RELAY_PORT, PROBE_PORT, isSealedBase, windowsBaseSchema, type WindowsConfig } from './config.ts';
 import { cloudInit, bootstrapScript, installAmd64TunnelScript, configureWindowsGuard, INSPECT_WINDOWS_GUARD, windowsEnvironment } from './guest.ts';
 import { WindowsNetworkSession } from './session.ts';
+import {windowsResourcesSchema,resourceError} from './resources.ts';
 import { measureEgress } from '../../egress.ts';
 import {AppError} from '../../errors.ts';
 import {GUEST_TASK_RUN,GUEST_TASK_CANCEL} from '../../guest-task.ts';
@@ -116,7 +117,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
       const request:Record<string,unknown>=c?{id:c.id}:{};
       if(action==='disk'&&c)Object.assign(request,{image:isSealedBase(c.image)?c.image:path.resolve(c.image),imageSha256:c.imageSha256,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB});
       if(action==='create'&&c)Object.assign(request,{seed:windowsPaths(this.root,c.id).seed,seedSha256:await fileHash(windowsPaths(this.root,c.id).seed)});
-      return String(await this.broker.call(action==='disk'&&c&&this.baseBuilders.has(c.id)?'begin-base':action as BrokerAction,request,{...options,timeoutMs:options.timeoutMs??45000}));
+      try{return String(await this.broker.call(action==='disk'&&c&&this.baseBuilders.has(c.id)?'begin-base':action as BrokerAction,request,{...options,timeoutMs:options.timeoutMs??45000}));}catch(error){throw resourceError(error);}
     }
     const p=c?windowsPaths(this.root,c.id):undefined;
     const value=c?{...vmIdentity(c.id),...p,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB,image:c.image,
@@ -249,7 +250,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   async start(c:WindowsConfig,options:RunOptions={}) {
     await access(windowsPaths(this.root,c.id).manifest);
     try {
-      const started=JSON.parse(await this.powershell('start',c,options));this.vmIds.set(c.id,z.uuid().parse(started.platformId));
+      const started=JSON.parse(await this.powershell('start',c,{...options,timeoutMs:options.timeoutMs??120000}));this.vmIds.set(c.id,z.uuid().parse(started.platformId));
       // First boot may expand the vendor filesystem. Management readiness has
       // a separate bounded wait; business traffic remains closed throughout.
       const deadline=Date.now()+(options.timeoutMs??600000);
@@ -260,6 +261,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
       }
     } catch(error) {await this.stop(c);throw error;}
   }
+  async resources(){return this.broker?windowsResourcesSchema.parse(await this.broker.call('resource-status')):null;}
   async stop(c:WindowsConfig,options:RunOptions={}) {
     // A stuck SSH child must never prevent the independent hypervisor stop.
     try{await this.disconnect(c.id);}catch{/* Hyper-V state is checked below. */}

@@ -10,7 +10,7 @@ import {powershellPath,powershellArgs,powershellScript,fileHash} from './runtime
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../../scripts/windows');
 const reply=z.discriminatedUnion('ok',[z.object({ok:z.literal(true),result:z.unknown()}).strict(),z.object({ok:z.literal(false),code:z.string(),error:z.string()}).strict()]);
-export type BrokerAction='hello'|'doctor'|'fingerprint'|'disk'|'create'|'start'|'stop'|'status'|'inspect'|'channel'|'close-channel'|'shutdown'|'allocation'|'recover'|'prepare'|'delete'|'absence'|'begin-base'|'seal-base'|'base-status'|'discard-base-builder'|'host-status'|'prepare-host'|'cache-status'|'cache-prune';
+export type BrokerAction='hello'|'doctor'|'fingerprint'|'disk'|'create'|'start'|'stop'|'status'|'inspect'|'channel'|'close-channel'|'shutdown'|'allocation'|'recover'|'prepare'|'delete'|'absence'|'begin-base'|'seal-base'|'base-status'|'discard-base-builder'|'host-status'|'prepare-host'|'cache-status'|'cache-prune'|'resource-status';
 
 export class HyperVBrokerClient{
  readonly pipe:string;
@@ -32,7 +32,7 @@ export class HyperVBrokerClient{
 }
 
 export async function brokerSourceDigest(){
- const files=['../../native/windows/HyperVBroker.cs','../../native/windows/SealedBases.cs','../../native/windows/HostComponents.cs','../../native/windows/ProtectedLedger.cs','../../native/windows/ImageCache.cs','../../native/windows/HyperVChannel.cs','hyperv.ps1','host-components.ps1','build-broker.ps1','install-broker.ps1'];const sha=createHash('sha256');for(const file of files){sha.update(file+'\0');sha.update(await readFile(path.resolve(scripts,file)));}return sha.digest('hex');
+ const files=['../../native/windows/HyperVBroker.cs','../../native/windows/SealedBases.cs','../../native/windows/HostComponents.cs','../../native/windows/ProtectedLedger.cs','../../native/windows/ImageCache.cs','../../native/windows/ResourceMetrics.cs','../../native/windows/Resources.cs','../../native/windows/HyperVChannel.cs','hyperv.ps1','host-components.ps1','build-broker.ps1','install-broker.ps1'];const sha=createHash('sha256');for(const file of files){sha.update(file+'\0');sha.update(await readFile(path.resolve(scripts,file)));}return sha.digest('hex');
 }
 
 export function cleanWindowsEnvironment(){

@@ -129,9 +129,10 @@ public static partial class MuHyperVBroker {
         FileStream input=null;pipe.RunAsClient(()=>input=new FileStream(source,FileMode.Open,FileAccess.Read,FileShare.Read,1048576,FileOptions.SequentialScan));
         try{if(GetFileType(input.SafeFileHandle.DangerousGetHandle())!=1||input.Length<1||input.Length>max)throw new ArgumentException("Input file exceeds bounds");var path=new StringBuilder(32768);if(GetFinalPathNameByHandle(input.SafeFileHandle.DangerousGetHandle(),path,(uint)path.Capacity,0)==0||path.ToString().StartsWith("\\\\?\\UNC\\",StringComparison.OrdinalIgnoreCase))throw new ArgumentException("Network input rejected");return input;}catch{input.Dispose();throw;}
     }
-    private static void CopyCaller(NamedPipeServerStream pipe,string source,string destination,string digest,long max,CancellationToken cancellation) {
+    private static void CopyCaller(NamedPipeServerStream pipe,string source,string destination,string digest,long max,CancellationToken cancellation,long reserve=0) {
         using(var input=CallerFile(pipe,source,max))using(var output=new FileStream(destination,FileMode.CreateNew,FileAccess.Write,FileShare.None,1048576))using(var sha=SHA256.Create()){
-            if(new DriveInfo(Path.GetPathRoot(destination)).AvailableFreeSpace<input.Length+2L*1024*1024*1024)throw new IOException("Insufficient protected storage space");
+            if(max>8L*1024*1024)CheckDiskRequest(checked(input.Length+reserve+(reserve>0&&digest==CanonicalBuilderDigest?input.Length:0)),cancellation);
+            else MuResourcePolicy.DiskRequest(MuResourceMetrics.Read(UserRoot).freeDisk,0,input.Length);
             var buffer=new byte[1048576];int count;while((count=input.Read(buffer,0,buffer.Length))>0){cancellation.ThrowIfCancellationRequested();sha.TransformBlock(buffer,0,count,null,0);output.Write(buffer,0,count);}sha.TransformFinalBlock(new byte[0],0,0);output.Flush(true);if(BitConverter.ToString(sha.Hash).Replace("-","").ToLowerInvariant()!=digest)throw new ArgumentException("Input checksum mismatch");
         }
     }
@@ -181,6 +182,7 @@ public static partial class MuHyperVBroker {
         string action=Text(request,"action",32);
         if(action=="hello"){ValidateKeys(request,"action");return new {version=1,ownerPid=Owner.Id,ownerSid=OwnerSid,elevated=true,protectedStorage=true,sourceDigest=SourceDigest};}
         if(action=="host-status"){ValidateKeys(request,"action");return HostStatus();}
+        if(action=="resource-status"){ValidateKeys(request,"action");return ResourceStatus();}
         if(action=="prepare-host"){ValidateKeys(request,"action");return PrepareHost();}
         if(action=="doctor"&&SetupOnly){ValidateKeys(request,"action");return Json().Serialize(new {available=false,issues=new[]{"请完成 Windows 系统组件准备后重新打开软件"}});}
         if(action=="doctor"||action=="fingerprint"){ValidateKeys(request,"action");return Invoke(action,null,10000,cancellation);}
@@ -192,6 +194,7 @@ public static partial class MuHyperVBroker {
             return CacheAction(action,keep,action=="cache-prune"?Digest(request,"plan"):null,cancellation);
         }
         if(SetupOnly)throw new UnauthorizedAccessException("This session only prepares Windows components; reopen the application for virtual machines");
+        if(ResourceIssue!=null&&(ResourceMutation(action)||action=="channel"))throw new MuStorageException("RESOURCE_FENCED","Host resource protection has closed this session; reopen the application");
         if((action=="disk"||action=="begin-base"||action=="create"||action=="start")&&HostServicingBusy())throw new InvalidOperationException("Windows component servicing is running");
         string id=Id(request);
         if(action=="seal-base"){ValidateKeys(request,"action","id");return SealBase(id,cancellation);}
@@ -215,16 +218,14 @@ public static partial class MuHyperVBroker {
                     lock(Gate){Records.Remove(id);try{Save();}catch{Records.Add(id,record);throw;}}return new {deleted=true,vmAbsent=true,switchAbsent=true,storageAbsent=true};
                 }
                 lock(Gate){record.Remove("platformId");record["stage"]="allocated";Save();}PrivateDirectory(Convert.ToString(Parameters(record)["directory"]),false);
+                lock(ImportGate)using(ImportReservation()){
                 string image=Convert.ToString(record["image"]);if(record.ContainsKey("sealedSource")){string reference=Text(request,"image",4096);if(reference!=Convert.ToString(record["sealedSource"]))throw new ArgumentException("Sealed source changed");ResolveSealedBase(reference,Convert.ToString(record["imageSha256"]));}if(!File.Exists(image)){
-                    lock(ImportGate){if(!File.Exists(image)){
-                        using(var reservation=new FileStream(Path.Combine(Directory.GetParent(Directory.GetParent(UserRoot).FullName).FullName,"import.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None)){
                         long remaining=64L*1024*1024*1024-Directory.GetFiles(Path.Combine(UserRoot,"images")).Sum(file=>new FileInfo(file).Length);if(remaining<1)throw new IOException("Image cache quota reached");
-                        string next=image+"."+Guid.NewGuid().ToString("N")+".next";try{CopyCaller(pipe,Text(request,"image",4096),next,Convert.ToString(record["imageSha256"]),remaining,cancellation);File.Move(next,image);}finally{if(File.Exists(next))File.Delete(next);}
-                        }
-                    }}
+                        string next=image+"."+Guid.NewGuid().ToString("N")+".next";try{CopyCaller(pipe,Text(request,"image",4096),next,Convert.ToString(record["imageSha256"]),remaining,cancellation,MuResourceMetrics.DiskFootprint(Convert.ToInt64(record["diskGiB"])*MuResourcePolicy.GiB));File.Move(next,image);}finally{if(File.Exists(next))File.Delete(next);}
                 }
                 if(HashFile(Convert.ToString(record["image"]))!=Convert.ToString(record["imageSha256"]))throw new UnauthorizedAccessException("Protected image changed");
-                Invoke("disk",Parameters(record),1200000,cancellation);lock(Gate){record["stage"]="disk-ready";Save();}return new {state="Off",present=false,ready=false};
+                CheckNewDisk(record,cancellation);Invoke("disk",Parameters(record),1200000,cancellation);lock(Gate){record["stage"]="disk-ready";Save();}return new {state="Off",present=false,ready=false};
+                }
             }
         }
         if(action=="disk"||action=="begin-base") {
@@ -235,22 +236,20 @@ public static partial class MuHyperVBroker {
                 string dir=Path.Combine(UserRoot,"vms",id),image=Path.Combine(UserRoot,"images",digest+extension);
                 var record=new Dictionary<string,object>{{"id",id},{"ownerSid",OwnerSid},{"image",image},{"imageSha256",digest},{"cpus",cpu},{"memoryGiB",memory},{"diskGiB",disk},{"stage","allocated"}};
                 if(action=="begin-base")record["baseBuilder"]=true;if(sealedSource)record["sealedSource"]=source;
-                lock(ImportGate){
+                lock(ImportGate)using(ImportReservation()){
                 if(sealedSource)ResolveSealedBase(source,digest);
                 // Persist ownership before creating any allocation files. Failed
                 // source reads and cancelled imports remain discoverable/removable.
-                lock(Gate){if(Records.ContainsKey(id)||Records.Count>=32)throw new InvalidOperationException("VM allocation refused");if(HasStorage(dir))throw new UnauthorizedAccessException("Unregistered allocation storage is preserved; it cannot be replaced by a new VM");Records.Add(id,record);Save();}
+                var memoryMetrics=MuResourceMetrics.Read(UserRoot);MuResourcePolicy.MemoryRequest(memoryMetrics.totalMemory,memoryMetrics.totalMemory,(long)memory*MuResourcePolicy.GiB);
+                lock(Gate){if(Records.ContainsKey(id)||Records.Count>=32)throw new InvalidOperationException("VM allocation refused");if(HasStorage(dir))throw new UnauthorizedAccessException("Unregistered allocation storage is preserved; it cannot be replaced by a new VM");MuResourcePolicy.Quota(Records.Values.Sum(value=>Convert.ToInt64(value["diskGiB"])),disk);Records.Add(id,record);Save();}
                 PrivateDirectory(dir,false);
-                lock(ImportGate){if(!File.Exists(image)){
-                    string importLock=Path.Combine(Directory.GetParent(Directory.GetParent(UserRoot).FullName).FullName,"import.lock");
-                    using(var reservation=new FileStream(importLock,FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None)){
+                if(!File.Exists(image)){
                         long remaining=64L*1024*1024*1024-Directory.GetFiles(Path.Combine(UserRoot,"images")).Sum(file=>new FileInfo(file).Length);if(remaining<1)throw new IOException("Image cache quota reached");
-                        string next=image+"."+Guid.NewGuid().ToString("N")+".next";try{CopyCaller(pipe,source,next,digest,remaining,cancellation);File.Move(next,image);}finally{if(File.Exists(next))File.Delete(next);}
-                    }
+                        string next=image+"."+Guid.NewGuid().ToString("N")+".next";try{CopyCaller(pipe,source,next,digest,remaining,cancellation,MuResourceMetrics.DiskFootprint((long)disk*MuResourcePolicy.GiB));File.Move(next,image);}finally{if(File.Exists(next))File.Delete(next);}
                 }
-                else if((File.GetAttributes(image)&FileAttributes.ReparsePoint)!=0||HashFile(image)!=digest)throw new UnauthorizedAccessException("Protected image changed");}
+                else if((File.GetAttributes(image)&FileAttributes.ReparsePoint)!=0||HashFile(image)!=digest)throw new UnauthorizedAccessException("Protected image changed");
+                CheckNewDisk(record,cancellation);Invoke("disk",Parameters(record),1200000,cancellation);lock(Gate){record["stage"]="disk-ready";Save();}return "";
                 }
-                Invoke("disk",Parameters(record),1200000,cancellation);lock(Gate){record["stage"]="disk-ready";Save();}return "";
             }
         }
         if(action=="register-channel"){ValidateKeys(request,"action","id");return Invoke(action,Parameters(Owned(id)),15000,cancellation);}
@@ -272,23 +271,30 @@ public static partial class MuHyperVBroker {
                 if(!owned.ContainsKey("platformId")||action=="start"&&Convert.ToString(owned["stage"])!="ready")throw new InvalidOperationException("VM is not ready");
                 if(action=="start"&&owned.ContainsKey("baseSealedDigest"))throw new InvalidOperationException("A sealed builder cannot be started again");
                 if(action=="start")lock(Gate)StartedHere.Add(id);
-                if(action=="stop")CloseChannel(id);try{return Invoke(action,Parameters(owned),30000,action=="stop"?CancellationToken.None:cancellation);}finally{if(action=="start"&&cancellation.IsCancellationRequested){CloseChannel(id);try{Invoke("stop",Parameters(owned),30000,CancellationToken.None);}catch{}}}
+                if(action=="stop")CloseChannel(id);try{
+                    if(action=="start"){
+                        var state=Json().Deserialize<Dictionary<string,object>>(Invoke("status",Parameters(owned),15000,cancellation));if(Convert.ToString(state["state"])=="Running")return Invoke("inspect",Parameters(owned),15000,cancellation);
+                        string started=null;StartWithResources(owned,cancellation,()=>{started=Invoke("start",Parameters(owned),30000,cancellation);});return started;
+                    }
+                    return Invoke(action,Parameters(owned),30000,action=="stop"?CancellationToken.None:cancellation);
+                }finally{if(action=="start"&&cancellation.IsCancellationRequested){CloseChannel(id);try{Invoke("stop",Parameters(owned),30000,CancellationToken.None);}catch{}}}
             }
         }
         throw new ArgumentException("Operation is not permitted");
     }
     private static void Serve(NamedPipeServerStream pipe) {
-        var cancel=new CancellationTokenSource();var closingRegistration=Closing.Token.Register(()=>cancel.Cancel());bool counted=false;try {
+        var cancel=new CancellationTokenSource();var closingRegistration=Closing.Token.Register(()=>cancel.Cancel());var resourceRegistration=default(CancellationTokenRegistration);bool counted=false,resourceCounted=false;try {
             using(var timeout=new Timer(_=>{try{pipe.Dispose();}catch{}},null,10000,Timeout.Infinite)){
                 var bytes=new List<byte>();int value;while((value=pipe.ReadByte())!=10){if(value<0||bytes.Count>=65536)throw new ArgumentException("Request exceeds bounds");bytes.Add((byte)value);}timeout.Change(Timeout.Infinite,Timeout.Infinite);
                 uint pid;if(!GetNamedPipeClientProcessId(pipe.SafePipeHandle.DangerousGetHandle(),out pid)||pid!=Owner.Id||OwnerExited)throw new UnauthorizedAccessException("Application process rejected");
                 string sid=null;pipe.RunAsClient(()=>sid=WindowsIdentity.GetCurrent(true).User.Value);if(sid!=OwnerSid)throw new UnauthorizedAccessException("Application user rejected");
                 var watching=new Thread(()=>{try{pipe.ReadByte();}catch{}cancel.Cancel();});watching.IsBackground=true;watching.Start();
                 lock(Gate){if(Stopping)throw new OperationCanceledException("Broker is closing");ActiveRequests++;RequestsIdle.Reset();counted=true;}
-                var request=Json().Deserialize<Dictionary<string,object>>(new UTF8Encoding(false,true).GetString(bytes.ToArray()));object result=Dispatch(pipe,request,cancel.Token);byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=true,result=result})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();if(Convert.ToString(request["action"])=="shutdown"){try{pipe.WaitForPipeDrain();}catch{}ThreadPool.QueueUserWorkItem(_=>Shutdown());}
+                var request=Json().Deserialize<Dictionary<string,object>>(new UTF8Encoding(false,true).GetString(bytes.ToArray()));if(ResourceMutation(Convert.ToString(request["action"]))){resourceRegistration=ResourceCancellation.Token.Register(()=>cancel.Cancel());lock(Gate){ResourceMutations++;resourceCounted=true;}}
+                object result=Dispatch(pipe,request,cancel.Token);byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=true,result=result})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();if(Convert.ToString(request["action"])=="shutdown"){try{pipe.WaitForPipeDrain();}catch{}ThreadPool.QueueUserWorkItem(_=>Shutdown());}
             }
         }catch(Exception error){try{byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=false,code=error is MuStorageException?((MuStorageException)error).Code:error is UnauthorizedAccessException?"DENIED":error is ArgumentException?"INVALID_REQUEST":error is OperationCanceledException?"CANCELLED":"BROKER_FAILED",error=error is ArgumentException||error is UnauthorizedAccessException||error is MuStorageException?error.Message:"Privileged VM operation failed"})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();}catch{}try{File.AppendAllText(Path.Combine(UserRoot,"broker-errors.log"),DateTime.UtcNow.ToString("o")+" "+error.ToString()+Environment.NewLine);}catch{}}
-        finally{closingRegistration.Dispose();cancel.Cancel();pipe.Dispose();lock(Gate){Pipes.Remove(pipe);if(counted){ActiveRequests--;if(ActiveRequests==0)RequestsIdle.Set();}}}
+        finally{resourceRegistration.Dispose();closingRegistration.Dispose();cancel.Cancel();pipe.Dispose();lock(Gate){Pipes.Remove(pipe);if(resourceCounted)ResourceMutations--;if(counted){ActiveRequests--;if(ActiveRequests==0)RequestsIdle.Set();}}}
     }
     private static void Shutdown(){bool producer=false;NamedPipeServerStream[] closingPipes=null;lock(Gate){if(!Stopping){Stopping=true;producer=true;closingPipes=Pipes.ToArray();}}if(!producer){ShutdownComplete.WaitOne();return;}
         // A synchronous pipe read/dispose must not hold Gate or delay force-off.
@@ -312,6 +318,7 @@ public static partial class MuHyperVBroker {
             if(detectHost){var status=(Dictionary<string,object>)HostStatus();SetupOnly=!Convert.ToBoolean(status["ready"])||HostJobLive(HostJob());}
             if(!SetupOnly)foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
             var watcher=new Thread(()=>{WaitForSingleObject(OwnerHandle,0xffffffff);Shutdown();});watcher.IsBackground=true;watcher.Start();
+            StartResourceGuardian();
             var security=new PipeSecurity();security.SetAccessRuleProtection(true,false);security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(OwnerSid),PipeAccessRights.ReadWrite,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(SystemSid,PipeAccessRights.FullControl,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(AdminSid,PipeAccessRights.FullControl,AccessControlType.Allow));
             while(!Stopping){NamedPipeServerStream pipe=null;try{pipe=new NamedPipeServerStream("MuCodeSandbox-Broker-"+args[3],PipeDirection.InOut,16,PipeTransmissionMode.Byte,PipeOptions.Asynchronous,65536,65536,security);lock(Gate)Pipes.Add(pipe);pipe.WaitForConnection();ThreadPool.QueueUserWorkItem(_=>Serve(pipe));}catch{if(pipe!=null){pipe.Dispose();lock(Gate)Pipes.Remove(pipe);}if(!Stopping)Thread.Sleep(100);}}
             return 0;

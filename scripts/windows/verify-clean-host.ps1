@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -34,6 +34,14 @@ function Connect-LabGuest {
 }
 try{
  $selected=Assert-LabVM
+ if($Phase -eq 'resource-prepare'){
+  if($selected.State -ne 'Off'){throw 'Capacity fixture expansion requires the evaluation VM Off'}
+  $disk=[IO.Path]::GetFullPath((Join-Path $directoryPath 'trace-artifacts/windows.vhdx'));$vhd=Get-VHD -Path $disk
+  if($vhd.ParentPath -or $vhd.Size -notin @(96GB,160GB)){throw 'Expected the known standalone evaluation VHDX'}
+  if([IO.DriveInfo]::new([IO.Path]::GetPathRoot($disk)).AvailableFreeSpace -lt 176GB){throw 'Host free space is insufficient for the bounded 160 GiB pressure fixture'}
+  if($vhd.Size -lt 160GB){Resize-VHD -Path $disk -SizeBytes 160GB}
+  Start-VM -VM $selected | Out-Null
+ }
  if($Phase -in @('ssh-inspect','network-prepare','ledger-seed','ledger-logon') -and $selected.State -eq 'Off'){Start-VM -VM $selected | Out-Null}
  Save-Probe 'connecting'
  $session=Connect-LabGuest
@@ -41,6 +49,26 @@ try{
   if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Synthetic guest administrator required'}
   if(-not (Test-Path -LiteralPath C:\MuLab\public\provisioned.json)){throw 'Guest bootstrap is incomplete'}
   [ordered]@{bootId=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');hypervisor=[bool](Get-CimInstance Win32_ComputerSystem).HypervisorPresent;edition=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID}
+ }
+ if($Phase -eq 'resource-prepare'){
+  $result=Invoke-Command -Session $session -ScriptBlock {
+   if($env:COMPUTERNAME -ne 'MU-CLEAN-LAB' -or @(Get-VM).Count){throw 'Only the empty evaluation guest volume may be extended'}
+   $partition=Get-Partition -DriveLetter C;$supported=Get-PartitionSupportedSize -DriveLetter C
+   if($supported.SizeMax -gt $partition.Size){Resize-Partition -DriveLetter C -Size $supported.SizeMax | Out-Null}
+   @{guestVolumeExtended=$true;guestVolumeBytes=(Get-Volume -DriveLetter C).Size;nestedGuests=0}
+  }
+  Save-Probe 'capacity-evaluation-volume-ready' $result;exit 0
+ }
+ if($Phase.StartsWith('resource-')){
+  $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-resource-operator.ps1')).Replace('__METRICS_SOURCE__',[Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot '../../native/windows/ResourceMetrics.cs'))))
+  if($Phase -eq 'resource-inspect'){$value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action inspect -Nonce ('0'*64)};Save-Probe 'resource-progress-inspected' $value;exit 0}
+  if($Phase -eq 'resource-collect'){
+   $evidence=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action collect -Nonce ('0'*64)}
+   Assert-LabVM | Out-Null;Save-Probe 'resource-evidence-collected' $evidence
+   try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+   Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
+   do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'resources-complete-and-evaluation-vm-off' $evidence;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown not confirmed'};Start-Sleep -Seconds 2}while($true)
+  }
  }
  if($Phase -eq 'cache-inspect'){
   $evidence=Invoke-Command -Session $session -ScriptBlock {
@@ -313,17 +341,23 @@ try{
  }
  Save-Probe 'preparing-standard-user-probe'
  if($Phase -eq 'network'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-network-client.mjs') -Destination C:\MuLab\network-client.mjs -ToSession $session -Force}
- if($Phase.StartsWith('ledger-') -or $Phase -in @('cache','cache-ui')){
+ if($Phase.StartsWith('ledger-') -or $Phase.StartsWith('resource-') -or $Phase -in @('cache','cache-ui')){
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-ledger-client.mjs') -Destination C:\MuLab\ledger-client.mjs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ProtectedLedger.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HostComponents.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ImageCache.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ImageCache.cs -ToSession $session -Force
+  foreach($name in @('ResourceMetrics.cs','Resources.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-broker.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-broker.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/broker.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js -ToSession $session -Force
   if($Phase -in @('cache','cache-ui')){
    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-cache-client.mjs') -Destination C:\MuLab\cache-client.mjs -ToSession $session -Force
    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'hyperv.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\hyperv.ps1 -ToSession $session -Force
    foreach($name in @('storage.js','service.js')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../dist-server/server/platform/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\'+$name) -ToSession $session -Force}
+  }
+  if($Phase.StartsWith('resource-')){
+   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-resource-client.mjs') -Destination C:\MuLab\resource-client.mjs -ToSession $session -Force
+   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'hyperv.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\hyperv.ps1 -ToSession $session -Force
+   foreach($name in @('resources.js','runtime.js')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../dist-server/server/platform/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\'+$name) -ToSession $session -Force}
   }
  }
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-client.mjs') -Destination C:\MuLab\client.mjs -ToSession $session -Force
@@ -337,7 +371,7 @@ try{
   $manifest=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json
   if((Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.nodeSha256){throw 'Packaged Node digest changed'}
   if((Get-FileHash -LiteralPath C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.hostScriptSha256){throw 'Packaged servicing script changed'}
-  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny')){
+  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny') -or $phase.StartsWith('resource-')){
    $build=@'
 import {buildBroker} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/broker.js';
 import {writeFile} from 'node:fs/promises';
@@ -428,6 +462,12 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
       $request=Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
       if($request.nonce -eq $nonce){if($request.action -ne $action){throw 'Unexpected cache operator request'};& ([ScriptBlock]::Create($operatorSource)) -Action $action -Nonce $nonce | Out-Null;$handled[$name]=$true}
      }
+    }
+   }
+   if($phase.StartsWith('resource-')){
+    foreach($action in @('hold-start','disk','memory')){
+     $name='resource-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'
+     if(-not $handled.ContainsKey($name) -and (Test-Path -LiteralPath $file)){$request=Get-Content -LiteralPath $file -Raw | ConvertFrom-Json;if($request.nonce -eq $nonce){if($request.action -ne $action){throw 'Unexpected pressure operator action'};& ([ScriptBlock]::Create($operatorSource)) -Action $action -Nonce $nonce | Out-Null;$handled[$name]=$true}}
     }
    }
    if($phase -in @('ledger-check','ledger-final') -and -not $ledgerInspected -and (Test-Path -LiteralPath C:\MuLab\public\ledger-inspect-request.json)){

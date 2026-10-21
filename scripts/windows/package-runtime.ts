@@ -23,7 +23,7 @@ export async function prepareWindowsPackage(){
  await cp(path.join(root,'desktop/windows'),path.join(app,'desktop/windows'),{recursive:true});await cp(path.join(root,'dist'),path.join(app,'dist'),{recursive:true});await cp(path.join(root,'dist-server'),path.join(app,'dist-server'),{recursive:true});
  await mkdir(path.join(app,'dist-server/scripts/windows'),{recursive:true});await mkdir(path.join(app,'dist-server/native/windows'),{recursive:true});
  for(const file of ['hyperv.ps1','host-components.ps1','seed-iso.ps1','build-channel.ps1','build-broker.ps1','install-broker.ps1','clean-runtime-metadata.ps1'])await copyFile(path.join(root,'scripts/windows',file),path.join(app,'dist-server/scripts/windows',file));
- for(const file of ['HyperVBroker.cs','SealedBases.cs','HostComponents.cs','ProtectedLedger.cs','ImageCache.cs','HyperVChannel.cs','RuntimeMetadataCleanup.cs'])await copyFile(path.join(root,'native/windows',file),path.join(app,'dist-server/native/windows',file));
+ for(const file of ['HyperVBroker.cs','SealedBases.cs','HostComponents.cs','ProtectedLedger.cs','ImageCache.cs','ResourceMetrics.cs','Resources.cs','HyperVChannel.cs','RuntimeMetadataCleanup.cs'])await copyFile(path.join(root,'native/windows',file),path.join(app,'dist-server/native/windows',file));
  for(const file of ['THIRD_PARTY_NOTICES.md','build-info.json'])await copyFile(path.join(root,file),path.join(app,file));
  await mkdir(path.join(app,'assets'));await copyFile(path.join(root,'assets/icon.png'),path.join(app,'assets/icon.png'));
  const nodeInfo={version:WINDOWS_NODE.version,sha256:await fileHash(path.join(node,'node.exe')),archiveSha256:WINDOWS_NODE.sha256,source:WINDOWS_NODE.url};

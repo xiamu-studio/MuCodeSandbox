@@ -27,6 +27,7 @@ public static partial class MuHyperVBroker {
                     string digest;
                     try{
                         using(var input=new FileStream(source,FileMode.Open,FileAccess.Read,FileShare.Read,1048576))using(var output=new FileStream(next,FileMode.CreateNew,FileAccess.Write,FileShare.None,1048576))using(var sha=SHA256.Create()){
+                            CheckDiskRequest(input.Length,cancellation);
                             if(input.Length<1||input.Length>remaining||new DriveInfo(Path.GetPathRoot(next)).AvailableFreeSpace<input.Length+2L*1024*1024*1024)throw new IOException("Insufficient protected base storage");
                             byte[] buffer=new byte[1048576];int count;while((count=input.Read(buffer,0,buffer.Length))>0){cancellation.ThrowIfCancellationRequested();sha.TransformBlock(buffer,0,count,null,0);output.Write(buffer,0,count);}sha.TransformFinalBlock(new byte[0],0,0);output.Flush(true);digest=BitConverter.ToString(sha.Hash).Replace("-","").ToLowerInvariant();
                         }

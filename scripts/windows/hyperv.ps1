@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies')][string]$Action)
+param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies','resource-inventory')][string]$Action)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -26,6 +26,37 @@ if (-not $isAdmin) { throw 'Administrator PowerShell is required for this previe
 Import-Module Hyper-V
 $inputText = [Console]::In.ReadToEnd()
 $c = $inputText | ConvertFrom-Json
+if($Action -eq 'resource-inventory'){
+ $root=[IO.Path]::GetFullPath([string]$c.resourceRoot).TrimEnd('\');$users=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'MuCodeSandbox-HyperVBroker-v1/users'))
+ $sid=[IO.Path]::GetFileName($root);if([IO.Path]::GetDirectoryName($root) -ne $users -or ([Security.Principal.SecurityIdentifier]::new($sid)).Value -ne $sid){throw 'Fixed protected resource root required'}
+ $source=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__RESOURCE_METRICS_BASE64__'))
+ Add-Type -TypeDefinition ('using System;using System.IO;using System.Text;using System.Runtime.InteropServices;'+[Environment]::NewLine+$source)
+ $volume=[MuResourceMetrics]::Volume($root);$paths=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+ [long]$assignedMemory=0
+ foreach($vm in @(Get-VM -ErrorAction Stop)){if($assignedMemory -gt [long]::MaxValue-[long]$vm.MemoryAssigned){throw 'Assigned memory total overflow'};$assignedMemory+=[long]$vm.MemoryAssigned;foreach($drive in @(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop)){if($drive.Path){[void]$paths.Add([string]$drive.Path)}}}
+ foreach($user in @(Get-ChildItem -LiteralPath $users -Directory -ErrorAction Stop)){
+  if($user.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Protected user storage reparse point rejected'}
+  $vms=Join-Path $user.FullName 'vms';if(-not (Test-Path -LiteralPath $vms)){continue}
+  if((Get-Item -LiteralPath $vms).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Protected disk directory reparse point rejected'}
+  foreach($allocation in @(Get-ChildItem -LiteralPath $vms -Directory)){
+   if($allocation.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Protected disk allocation reparse point rejected'}
+   $disk=Join-Path $allocation.FullName 'disk.vhdx';if(Test-Path -LiteralPath $disk){[void]$paths.Add($disk)}
+  }
+ }
+ if($paths.Count -gt 2048){throw 'Disk reservation inventory exceeds its fixed bound'}
+ [long]$growth=0;[int]$count=0
+ foreach($path in $paths){
+  $full=[IO.Path]::GetFullPath($path)
+  # Remote volumes do not consume this local volume. Never open a remote path.
+  if($full -notmatch '^[a-zA-Z]:\\' -or [IO.DriveInfo]::new([IO.Path]::GetPathRoot($full)).DriveType -eq 'Network'){continue}
+  $cursor=[IO.Path]::GetPathRoot($full)
+  foreach($part in $full.Substring($cursor.Length).Split('\')){$cursor=Join-Path $cursor $part;if([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint){throw 'Local disk reservation reparse point rejected'}}
+  if([MuResourceMetrics]::Volume($full) -ne $volume){continue}
+  $disk=Get-VHD -Path $full -ErrorAction Stop;$allocated=[MuResourceMetrics]::AllocatedBytes($full);$extra=[Math]::Max([long]0,([MuResourceMetrics]::DiskFootprint([long]$disk.Size)-$allocated))
+  if($growth -gt [long]::MaxValue-$extra){throw 'Disk reservation total overflow'};$growth+=$extra;$count++
+ }
+ @{reservedGrowthBytes=$growth;disks=$count;assignedMemoryBytes=$assignedMemory} | ConvertTo-Json -Compress;exit 0
+}
 if($Action -eq 'cache-dependencies'){
  $root=[IO.Path]::GetFullPath([string]$c.cacheRoot).TrimEnd('\');$users=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'MuCodeSandbox-HyperVBroker-v1/users'))
  $sid=[IO.Path]::GetFileName($root)

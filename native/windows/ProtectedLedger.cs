@@ -100,6 +100,7 @@ public sealed class MuProtectedLedger {
     }
     public void Save(Dictionary<string,Dictionary<string,object>> records){
         if(records.Count>32)throw new UnauthorizedAccessException("Registry allocation limit changed");foreach(var pair in records)ValidateRecord(pair.Key,pair.Value);
+        if(revision>=long.MaxValue-1)throw new IOException("Registry revision limit reached; existing copies were preserved");
         revision=checked(revision+1);string text=Serializer().Serialize(new {version=2,ownerSid=sid,revision=revision,records=records});byte[] bytes=Encoding.UTF8.GetBytes(text);if(bytes.Length>MaxBytes)throw new IOException("Registry limit exceeded");
         // Publish the new backup first. No VM operation may proceed until both
         // copies are durable. A newer backup is recoverable after interruption.

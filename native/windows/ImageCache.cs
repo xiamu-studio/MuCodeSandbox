@@ -97,7 +97,7 @@ public static partial class MuHyperVBroker {
                     if(reason!=null)throw new MuStorageException("CACHE_NOT_READY","Cache cleanup is disabled: "+reason);
                     return cache.Prune(references,currentBase,dependencies,expected,cancellation);
                 }
-                return new {imageBytes=view.imageBytes,temporaryBytes=view.temporaryBytes,catalogueBytes=view.catalogueBytes,reclaimableBytes=reason==null?view.reclaimableBytes:0,retainedBytes=reason==null?view.retainedBytes:view.imageBytes+view.temporaryBytes+view.catalogueBytes,imageCount=view.imageCount,reclaimableFiles=reason==null?view.reclaimableFiles:0,unrecognizedEntries=view.unrecognizedEntries,quotaBytes=64L*1024*1024*1024,freeBytes=new DriveInfo(Path.GetPathRoot(UserRoot)).AvailableFreeSpace,allocatedDiskGiB=allocatedGiB,unregisteredStorage=unregistered,plan=view.plan,canPrune=reason==null&&view.reclaimableFiles>0,reason=reason};
+                return new {imageBytes=view.imageBytes,temporaryBytes=view.temporaryBytes,catalogueBytes=view.catalogueBytes,reclaimableBytes=reason==null?view.reclaimableBytes:0,retainedBytes=reason==null?view.retainedBytes:view.imageBytes+view.temporaryBytes+view.catalogueBytes,imageCount=view.imageCount,reclaimableFiles=reason==null?view.reclaimableFiles:0,unrecognizedEntries=view.unrecognizedEntries,quotaBytes=64L*1024*1024*1024,freeBytes=MuResourceMetrics.Read(UserRoot).freeDisk,allocatedDiskGiB=allocatedGiB,unregisteredStorage=unregistered,plan=view.plan,canPrune=reason==null&&view.reclaimableFiles>0,reason=reason};
             }
         }finally{Monitor.Exit(ImportGate);}
     }

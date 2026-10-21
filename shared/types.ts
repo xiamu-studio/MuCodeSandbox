@@ -69,6 +69,7 @@ export interface SystemInfo {
   browser: { available: boolean; engine: string; native: boolean };
   application?: { channel: 'desktop-test' | 'source-preview'; buildId: string; builtAt: string | null };
   hostNetwork?: { state: 'starting' | 'ready' | 'failed'; issue: string | null };
+  hostResourceIssue?: string | null;
 }
 export interface Metrics {
   cpuPercent: number;

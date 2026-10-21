@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-loss','adoption-review','adoption-approve','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -68,6 +68,22 @@ try{
    try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
    Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
    do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'resources-complete-and-evaluation-vm-off' $evidence;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown not confirmed'};Start-Sleep -Seconds 2}while($true)
+  }
+ }
+ if($Phase.StartsWith('adoption-')){
+  $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-adoption-operator.ps1'))
+  if($Phase -eq 'adoption-inspect'){
+   $value=Invoke-Command -Session $session -ScriptBlock {@{vms=@(Get-VM|Select-Object Name,@{Name='state';Expression={[string]$_.State}});clients=@(Get-CimInstance Win32_Process -Filter "Name='node.exe'"|Where-Object{$_.CommandLine -like '*client.mjs*adoption-*'}|Select-Object ProcessId,CreationDate);results=@(Get-ChildItem -LiteralPath C:\MuLab\public -File -Filter 'adoption-*-result.json'|ForEach-Object{Get-Content -LiteralPath $_.FullName -Raw|ConvertFrom-Json});errors=@(Get-ChildItem -LiteralPath C:\MuLab\private -File -Filter 'adoption-*-broker-stderr.log'|ForEach-Object{@{name=$_.Name;bytes=$_.Length;text=$(if($_.Length){try{Get-Content -LiteralPath $_.FullName -Raw}catch{'log is still open by a running process'}}else{''})}})}}
+   $value.storageAcl=Invoke-Command -Session $session -ScriptBlock {$seed=Get-Content -LiteralPath C:\MuLab\approved\adoption-seed-result.json -Raw|ConvertFrom-Json;$sid=(Get-LocalUser MuLabUser).SID.Value;$dir=Join-Path $env:ProgramData ('MuCodeSandbox-HyperVBroker-v1/users/'+$sid+'/vms/'+$seed.nested.config.id);foreach($file in @($dir,(Join-Path $dir disk.vhdx),(Join-Path $dir seed.iso))){if(Test-Path -LiteralPath $file){$acl=Get-Acl -LiteralPath $file;@{file=[IO.Path]::GetFileName($file);owner=$acl.Owner;rules=@($acl.Access|ForEach-Object{@{principal=$_.IdentityReference.Value;rights=[string]$_.FileSystemRights;type=[string]$_.AccessControlType}})}}}}
+   Save-Probe 'adoption-progress-inspected' $value;exit 0
+  }
+  if($Phase -eq 'adoption-loss'){$value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action loss};Save-Probe 'synthetic-copies-removed-for-explicit-adoption' $value;exit 0}
+  if($Phase -eq 'adoption-collect'){
+   $value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action collect}
+   Assert-LabVM | Out-Null;Save-Probe 'adoption-evidence-collected' $value
+   try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+   Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
+   do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'adoption-complete-and-evaluation-vm-off' $value;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown not confirmed'};Start-Sleep -Seconds 2}while($true)
   }
  }
  if($Phase -eq 'cache-inspect'){
@@ -340,13 +356,18 @@ try{
   }
  }
  Save-Probe 'preparing-standard-user-probe'
+ if($Phase.StartsWith('adoption-')){
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-adoption-client.mjs') -Destination C:\MuLab\adoption-client.mjs -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/recovery.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\recovery.js -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'hyperv.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\hyperv.ps1 -ToSession $session -Force
+ }
  if($Phase -eq 'network'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-network-client.mjs') -Destination C:\MuLab\network-client.mjs -ToSession $session -Force}
- if($Phase.StartsWith('ledger-') -or $Phase.StartsWith('resource-') -or $Phase -in @('cache','cache-ui')){
+ if($Phase.StartsWith('ledger-') -or $Phase.StartsWith('resource-') -or $Phase.StartsWith('adoption-') -or $Phase -in @('cache','cache-ui')){
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-ledger-client.mjs') -Destination C:\MuLab\ledger-client.mjs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ProtectedLedger.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HostComponents.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ImageCache.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ImageCache.cs -ToSession $session -Force
-  foreach($name in @('ResourceMetrics.cs','Resources.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
+  foreach($name in @('ResourceMetrics.cs','Resources.cs','Recovery.cs','RecoveryPermissions.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-broker.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-broker.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/broker.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js -ToSession $session -Force
   if($Phase -in @('cache','cache-ui')){
@@ -371,7 +392,7 @@ try{
   $manifest=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json
   if((Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.nodeSha256){throw 'Packaged Node digest changed'}
   if((Get-FileHash -LiteralPath C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.hostScriptSha256){throw 'Packaged servicing script changed'}
-  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny') -or $phase.StartsWith('resource-')){
+  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny') -or $phase.StartsWith('resource-') -or $phase.StartsWith('adoption-')){
    $build=@'
 import {buildBroker} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/broker.js';
 import {writeFile} from 'node:fs/promises';
@@ -415,6 +436,13 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
   $bin=Join-Path $env:ProgramData 'MuCodeSandbox-HyperVBroker-v1/bin';$meta=Get-Content -LiteralPath (Join-Path $bin 'current.json') -Raw | ConvertFrom-Json
   $broker=Join-Path $bin $meta.brokerFile
   if((Get-FileHash -LiteralPath $broker -Algorithm SHA256).Hash.ToLowerInvariant() -ne $meta.brokerSha256){throw 'Protected broker digest mismatch'}
+  if($phase -eq 'adoption-review'){
+   $start=[Diagnostics.ProcessStartInfo]::new($broker,('--owner '+$ownerPid+' --pipe '+$nonce+' --detect-host'));$start.WorkingDirectory=$bin;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardError=$true;$start.RedirectStandardOutput=$true
+   $ordinary=[Diagnostics.Process]::Start($start);if(-not $ordinary.WaitForExit(30000)){throw 'Normal startup did not refuse missing registration copies'};$failure=$ordinary.StandardError.ReadToEnd()
+   [IO.File]::WriteAllText('C:\MuLab\private\adoption-default-denied.log',$failure)
+   if($ordinary.ExitCode -ne 1 -or $failure -notlike '*Unregistered VM storage remains*'){throw 'Normal startup failed for an unexpected reason'}
+   [IO.File]::WriteAllText('C:\MuLab\approved\adoption-default-denied.json',(@{nonce=$nonce;normalStartupRejected=$true}|ConvertTo-Json -Compress))
+  }
   if($phase -eq 'ledger-deny'){
    # Retain the actual process handle when startup is expected to exit quickly.
    $start=[Diagnostics.ProcessStartInfo]::new($broker,('--owner '+$ownerPid+' --pipe '+$nonce+' --detect-host'));$start.WorkingDirectory=$bin;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardError=$true;$start.RedirectStandardOutput=$true
@@ -423,7 +451,7 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
    $brokerFailure=$agent.StandardError.ReadToEnd();[IO.File]::WriteAllText('C:\MuLab\private\ledger-deny-broker-stderr.log',$brokerFailure)
    if($agent.ExitCode -ne 1 -or $brokerFailure -notlike '*Unregistered VM storage remains*'){throw ('The broker failed for an unexpected reason (exit '+$agent.ExitCode+'): '+$brokerFailure)}
    & ([ScriptBlock]::Create($operatorSource)) -Action deny -Nonce $nonce | Out-Null
-  }else{$agent=Start-Process -FilePath $broker -ArgumentList @('--owner',[string]$ownerPid,'--pipe',$nonce,'--detect-host') -WorkingDirectory $bin -WindowStyle Hidden -RedirectStandardOutput ('C:\MuLab\private\'+$phase+'-broker-stdout.log') -RedirectStandardError ('C:\MuLab\private\'+$phase+'-broker-stderr.log') -PassThru}
+  }else{$agent=Start-Process -FilePath $broker -ArgumentList @('--owner',[string]$ownerPid,'--pipe',$nonce,$(if($phase -in @('adoption-review','adoption-approve')){'--recover-storage'}else{'--detect-host'})) -WorkingDirectory $bin -WindowStyle Hidden -RedirectStandardOutput ('C:\MuLab\private\'+$phase+'-broker-stdout.log') -RedirectStandardError ('C:\MuLab\private\'+$phase+'-broker-stderr.log') -PassThru}
   $handled=@{}
   function Invoke-SyntheticNetworkRequests {
    $record=Get-Content -LiteralPath C:\MuLab\approved\network-adapter.json -Raw | ConvertFrom-Json
@@ -455,6 +483,12 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
    if($agent.HasExited -and $phase -ne 'ledger-deny'){throw ('Protected broker exited: '+[IO.File]::ReadAllText(('C:\MuLab\private\'+$phase+'-broker-stderr.log')))}
    if($probeClock.ElapsedMilliseconds -gt 3900000){throw 'Servicing or the client is still running; no process or VM was stopped'}
    if($phase -eq 'network'){Invoke-SyntheticNetworkRequests}
+   if($phase -in @('adoption-review','adoption-approve')){
+    foreach($action in @('inspect-plan','change-seed','restore-seed','break-acl','restore-acl','break-permissions','restore-permissions','add-dependency','remove-dependency','inspect-adopted')){
+     $name='adoption-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'
+     if(-not $handled.ContainsKey($name) -and (Test-Path -LiteralPath $file)){$request=Get-Content -LiteralPath $file -Raw|ConvertFrom-Json;if($request.nonce -eq $nonce){if($request.action -ne $action){throw 'Unexpected adoption operator action'};& ([ScriptBlock]::Create($operatorSource)) -Action $action -Nonce $nonce|Out-Null;$handled[$name]=$true}}
+    }
+   }
    if($phase -in @('cache','cache-ui')){
     foreach($action in @('seed','change','hold','remove-control','ui-seed','ui-change','permissions')){
      $name='cache-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'

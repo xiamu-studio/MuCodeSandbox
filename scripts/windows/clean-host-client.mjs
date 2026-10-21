@@ -9,7 +9,7 @@ import {HyperVBrokerClient,brokerSourceDigest} from 'file:///C:/MuLab/product/re
 import {HyperVRuntime} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/runtime.js';
 import {windowsConfigSchema} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/config.js';
 
-const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','cache','cache-ui','ledger-seed','ledger-check','ledger-deny','ledger-final'].includes(phase));
+const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','adoption-seed','adoption-review','adoption-approve','adoption-final','cache','cache-ui','ledger-seed','ledger-check','ledger-deny','ledger-final'].includes(phase));
 const directory='C:/MuLab/public',nonce=randomBytes(32).toString('hex'),client=new HyperVBrokerClient(nonce);
 let complete=false;const checks=[];let before,after,error,nested;
 const pass=name=>checks.push({name,passed:true});
@@ -20,9 +20,15 @@ try{
  }else{
  const deadline=performance.now()+120000;
  for(;;){try{const hello=await client.hello();assert.equal(hello.sourceDigest,await brokerSourceDigest());pass('The protected production broker is bound to this standard-user process and the packaged source');break;}catch(failure){if(failure.code!=='BROKER_UNAVAILABLE'||performance.now()>deadline)throw failure;await delay(500);}}
+ if(['adoption-review','adoption-approve'].includes(phase)){
+  const {adoptionAcceptance}=await import('file:///C:/MuLab/adoption-client.mjs');nested=await adoptionAcceptance(phase,client,nonce,pass);
+ }else{
  before=await client.call('host-status',{}, {timeoutMs:90000});
  assert.equal(before.supported,true);assert.equal(before.firmwareVirtualization,true);assert.equal(before.slat,true);
- if(phase.startsWith('resource-')){
+ if(phase.startsWith('adoption-')){
+  assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);
+  const {adoptionAcceptance}=await import('file:///C:/MuLab/adoption-client.mjs');nested=await adoptionAcceptance(phase,client,nonce,pass);
+ }else if(phase.startsWith('resource-')){
   assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);
   const {resourceAcceptance}=await import('file:///C:/MuLab/resource-client.mjs');nested=await resourceAcceptance(phase,client,nonce,pass);
  }else if(phase==='cache-ui'){
@@ -94,6 +100,7 @@ try{
    await runtime.remove(config);assert.deepEqual(await client.call('allocation',{id:config.id}),{registered:false});nested.removed=true;
   }
   pass('The nested Linux test VM, its private switch and its runtime files are removed after confirmed stop');
+ }
  }
  }
  complete=true;

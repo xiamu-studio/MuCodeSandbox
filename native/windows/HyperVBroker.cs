@@ -181,6 +181,7 @@ public static partial class MuHyperVBroker {
     private static object Dispatch(NamedPipeServerStream pipe,Dictionary<string,object> request,CancellationToken cancellation) {
         string action=Text(request,"action",32);
         if(action=="hello"){ValidateKeys(request,"action");return new {version=1,ownerPid=Owner.Id,ownerSid=OwnerSid,elevated=true,protectedStorage=true,sourceDigest=SourceDigest};}
+        if(RecoveryOnly&&action!="shutdown")return RecoveryAction(action,request,cancellation);
         if(action=="host-status"){ValidateKeys(request,"action");return HostStatus();}
         if(action=="resource-status"){ValidateKeys(request,"action");return ResourceStatus();}
         if(action=="prepare-host"){ValidateKeys(request,"action");return PrepareHost();}
@@ -301,24 +302,24 @@ public static partial class MuHyperVBroker {
         // Cancel privileged work directly, independently of client pipe EOF.
         Closing.Cancel();foreach(var pipe in closingPipes)ThreadPool.QueueUserWorkItem(_=>{try{pipe.Dispose();}catch{}});
         foreach(var record in ShutdownSnapshot())CloseChannel(Convert.ToString(record["id"]));
-        try{RequestsIdle.WaitOne(30000);if(!SetupOnly)foreach(var record in ShutdownSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);try{Invoke(record.ContainsKey("platformId")?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
+        try{RequestsIdle.WaitOne(30000);if(!SetupOnly&&!RecoveryOnly)foreach(var record in ShutdownSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);try{Invoke(record.ContainsKey("platformId")?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
     }
     public static int Main(string[] args) {
         if(args.Length>0&&args[0]=="--host-once")return HostJobMain(args);
         if(args.Length==1&&args[0]=="--self-test"){try{ValidateKeys(new Dictionary<string,object>{{"action","start"},{"command","bad"}},"action","id");return 1;}catch(ArgumentException){}Console.WriteLine("Broker request boundary verified");return 0;}
-        if((args.Length!=4&&args.Length!=5)||args[0]!="--owner"||args[2]!="--pipe"||(args.Length==5&&args[4]!="--setup-only"&&args[4]!="--detect-host"))return 64;bool detectHost=args.Length==5&&args[4]=="--detect-host";SetupOnly=args.Length==5;int ownerPid;if(!int.TryParse(args[1],out ownerPid)||ownerPid<=0||args[3].Length!=64||args[3].Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))return 64;
+        if((args.Length!=4&&args.Length!=5)||args[0]!="--owner"||args[2]!="--pipe"||(args.Length==5&&args[4]!="--setup-only"&&args[4]!="--detect-host"&&args[4]!="--recover-storage"))return 64;bool detectHost=args.Length==5&&args[4]=="--detect-host";RecoveryOnly=args.Length==5&&args[4]=="--recover-storage";SetupOnly=args.Length==5&&!RecoveryOnly;int ownerPid;if(!int.TryParse(args[1],out ownerPid)||ownerPid<=0||args[3].Length!=64||args[3].Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))return 64;
         if(!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator))return 77;
         try {
             Owner=Process.GetProcessById(ownerPid);OwnerSid=ProcessSid(Owner);var common=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),"MuCodeSandbox-HyperVBroker-v1");TrustedExecutable(common);PrivateDirectory(common);var users=Path.Combine(common,"users");PrivateDirectory(users);UserRoot=Path.Combine(users,OwnerSid);PrivateDirectory(UserRoot);Directory.SetCurrentDirectory(UserRoot);PrivateDirectory(Path.Combine(UserRoot,"images"));PrivateDirectory(Path.Combine(UserRoot,"vms"));
             // The previous owner can exit before its agent finishes VM cleanup.
             // Wait for that sealed store to be released, never bypass its lock.
             var waiting=Stopwatch.StartNew();for(;;){if(OwnerExited)throw new OperationCanceledException("Application exited while waiting for storage");try{Held.Add(new FileStream(Path.Combine(UserRoot,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None));break;}catch(IOException){if(waiting.ElapsedMilliseconds>90000)throw;Thread.Sleep(100);}}
-            LedgerStore=new MuProtectedLedger(UserRoot,OwnerSid,ValidateLedgerFile);foreach(var pair in LedgerStore.Load())Records.Add(pair.Key,pair.Value);
+            LedgerStore=new MuProtectedLedger(UserRoot,OwnerSid,ValidateLedgerFile);foreach(var pair in (RecoveryOnly?LedgerStore.InspectRecovery():LedgerStore.Load()))Records.Add(pair.Key,pair.Value);if(RecoveryOnly)RecoveryLedgerFingerprint=LedgerStore.RecoveryFingerprint();
             byte[] scriptBytes=Convert.FromBase64String(HyperVScript);string scriptHash;using(var sha=SHA256.Create())scriptHash=BitConverter.ToString(sha.ComputeHash(scriptBytes)).Replace("-","").ToLowerInvariant();ScriptFile=Path.Combine(UserRoot,"hyperv-"+scriptHash+".ps1");if(File.Exists(ScriptFile)){if((File.GetAttributes(ScriptFile)&FileAttributes.ReparsePoint)!=0||HashFile(ScriptFile)!=scriptHash)throw new UnauthorizedAccessException("Protected script changed");}else{using(var scriptStream=new FileStream(ScriptFile,FileMode.CreateNew,FileAccess.Write,FileShare.None)){scriptStream.Write(scriptBytes,0,scriptBytes.Length);scriptStream.Flush(true);}}
             if(detectHost){var status=(Dictionary<string,object>)HostStatus();SetupOnly=!Convert.ToBoolean(status["ready"])||HostJobLive(HostJob());}
-            if(!SetupOnly)foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
+            if(!SetupOnly&&!RecoveryOnly)foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
             var watcher=new Thread(()=>{WaitForSingleObject(OwnerHandle,0xffffffff);Shutdown();});watcher.IsBackground=true;watcher.Start();
-            StartResourceGuardian();
+            if(!RecoveryOnly)StartResourceGuardian();
             var security=new PipeSecurity();security.SetAccessRuleProtection(true,false);security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(OwnerSid),PipeAccessRights.ReadWrite,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(SystemSid,PipeAccessRights.FullControl,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(AdminSid,PipeAccessRights.FullControl,AccessControlType.Allow));
             while(!Stopping){NamedPipeServerStream pipe=null;try{pipe=new NamedPipeServerStream("MuCodeSandbox-Broker-"+args[3],PipeDirection.InOut,16,PipeTransmissionMode.Byte,PipeOptions.Asynchronous,65536,65536,security);lock(Gate)Pipes.Add(pipe);pipe.WaitForConnection();ThreadPool.QueueUserWorkItem(_=>Serve(pipe));}catch{if(pipe!=null){pipe.Dispose();lock(Gate)Pipes.Remove(pipe);}if(!Stopping)Thread.Sleep(100);}}
             return 0;

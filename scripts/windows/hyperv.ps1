@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies','resource-inventory')][string]$Action)
+param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies','resource-inventory','review-allocation')][string]$Action)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -146,6 +146,37 @@ function StopAllocation {
   return $v
 }
 switch ($Action) {
+  'review-allocation' {
+    # Read-only admission for an explicit recovery session. No missing or changed
+    # resource is repaired here and a running guest is never stopped implicitly.
+    $v=AllocationVM
+    if(-not $v -or $v.State -ne 'Off' -or $v.Generation -ne 1 -or [string]$v.CheckpointType -ne 'Disabled' -or [string]$v.AutomaticStopAction -ne 'TurnOff'){throw 'Only an intact stopped preview VM can be adopted'}
+    InspectVM | Out-Null
+    if(@(Get-VMSnapshot -VM $v -ErrorAction Stop).Count){throw 'Snapshot recovery requires a separate reviewed migration'}
+    $memory=Get-VMMemory -VM $v -ErrorAction Stop;$processor=Get-VMProcessor -VM $v -ErrorAction Stop
+    $disk=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($memory.DynamicMemoryEnabled -or $memory.Startup % 1GB -or $disk.Size % 1GB -or $disk.ParentPath -or [string]$disk.VhdType -eq 'Differencing' -or $processor.ExposeVirtualizationExtensions){throw 'Recovery VM resource boundary changed'}
+    $nic=@(Get-VMNetworkAdapter -VM $v -ErrorAction Stop)[0]
+    if($nic.DynamicMacAddressEnabled -or $nic.MacAddress -ne $c.mac -or [string]$nic.MacAddressSpoofing -ne 'Off' -or [string]$nic.DhcpGuard -ne 'On' -or [string]$nic.RouterGuard -ne 'On'){throw 'Recovery VM adapter policy changed'}
+    $dvd=@(Get-VMDvdDrive -VM $v -ErrorAction Stop)
+    if($dvd.Count -ne 1 -or [IO.Path]::GetFullPath([string]$dvd[0].Path) -ne [IO.Path]::GetFullPath($c.seed)){throw 'Recovery VM seed identity changed'}
+    $references=@(Get-VM -ErrorAction Stop | Get-VMHardDiskDrive -ErrorAction Stop | Where-Object{$_.Path -and [IO.Path]::GetFullPath($_.Path) -eq [IO.Path]::GetFullPath($c.disk)})
+    if($references.Count -ne 1 -or [string]$references[0].VMId -ne [string]$v.Id){throw 'Recovery disk is shared with another VM'}
+    $paths=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);$drives=@()
+    foreach($other in @(Get-VM -ErrorAction Stop)){
+      foreach($drive in @(Get-VMHardDiskDrive -VM $other -ErrorAction Stop)){$drives+=@{path=[string]$drive.Path;owner=[string]$other.Id;snapshot=$false}}
+      foreach($snapshot in @(Get-VMSnapshot -VM $other -ErrorAction Stop)){foreach($drive in @(Get-VMHardDiskDrive -VMSnapshot $snapshot -ErrorAction Stop)){$drives+=@{path=[string]$drive.Path;owner=[string]$other.Id;snapshot=$true}}}
+      if($drives.Count -gt 1024){throw 'Recovery dependency inventory exceeds its fixed bound'}
+    }
+    foreach($drive in $drives){$path=$drive.path;$depth=0;while($path){
+      if(++$depth -gt 32){throw 'Recovery parent chain exceeds its fixed bound'};$full=[IO.Path]::GetFullPath($path)
+      if($full -notmatch '^[a-zA-Z]:\\' -or [IO.DriveInfo]::new([IO.Path]::GetPathRoot($full)).DriveType -eq 'Network'){throw 'Remote recovery dependencies cannot be inspected'}
+      $cursor=[IO.Path]::GetPathRoot($full);foreach($part in $full.Substring($cursor.Length).Split('\')){$cursor=Join-Path $cursor $part;if([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint){throw 'Recovery dependency reparse point rejected'}}
+      if($full -eq [IO.Path]::GetFullPath($c.disk) -and ($depth -ne 1 -or $drive.owner -ne [string]$v.Id -or $drive.snapshot)){throw 'Another disk or snapshot depends on the recovery disk'}
+      if(-not $paths.Add($full)){break};$parent=Get-VHD -Path $full -ErrorAction Stop;$path=[string]$parent.ParentPath
+    }}
+    @{platformId=[string]$v.Id;cpus=[int]$processor.Count;memoryGiB=[int]($memory.Startup/1GB);diskGiB=[int]($disk.Size/1GB)} | ConvertTo-Json -Compress
+  }
   'allocation-absence' {
     if(-not $c.brokerResourceLimit){throw 'Allocation absence checks require the protected broker'}
     $matches=@(Get-VM -ErrorAction Stop | Where-Object {$_.Name -eq $c.name -or ($c.expectedPlatformId -and [string]$_.Id -eq [string]$c.expectedPlatformId)})

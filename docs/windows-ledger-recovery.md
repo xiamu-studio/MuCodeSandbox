@@ -36,4 +36,4 @@ Windows 自动测试 95 项通过，其中 11 项直接运行登记存储代码�
 
 本机忽略文件 `.mu-data/windows-run/clean-host-ledger-complete.json` 指向完整私有回执；`windows-ledger-audit.ts` 提供当前用户受保护登记的只读诊断，不调用登记修复或 VM 操作。
 
-本轮未实现没有可信副本时的通用资源接管，也未替代旧管理员环境迁移、共享缓存回收、完整容量/并发审查或跨版本安装升级。这些项目继续保留在工作清单中。
+后续已增加 [当前用户完整受保护 VM 的显式登记恢复](windows-explicit-recovery.md)、[缓存回收](windows-cache-reclamation.md) 和 [资源临界保护](windows-resource-protection.md)。旧管理员环境迁移、更广泛的资源接管、完整容量/并发回归与跨版本升级继续保留在工作清单中。

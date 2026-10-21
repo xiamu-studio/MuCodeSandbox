@@ -1,0 +1,51 @@
+[CmdletBinding()]
+param([ValidateSet('loss','inspect-plan','change-seed','restore-seed','break-acl','restore-acl','break-permissions','restore-permissions','add-dependency','remove-dependency','inspect-adopted','collect')][string]$Action,[string]$Nonce)
+$ErrorActionPreference='Stop'
+if($env:COMPUTERNAME -ne 'MU-CLEAN-LAB' -or (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID -ne 'IoTEnterpriseSEval' -or -not (Test-Path -LiteralPath C:\MuLab\public\provisioned.json)){throw 'Only the isolated Windows evaluation guest may run this operator'}
+if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Synthetic administrator required'}
+$sid=(Get-LocalUser -Name MuLabUser).SID.Value
+if(@(Get-LocalGroupMember -SID 'S-1-5-32-544'|Where-Object{$_.SID.Value -eq $sid}).Count){throw 'Application user must remain ordinary'}
+$seed=Get-Content -LiteralPath C:\MuLab\approved\adoption-seed-result.json -Raw|ConvertFrom-Json
+if(-not $seed.complete -or -not $seed.nested.stopped){throw 'The real synthetic guest must be seeded and stopped first'}
+$id=[string]$seed.nested.config.id;if($id -notmatch '^[a-f0-9-]{36}$' -or ([guid]$id).ToString('D') -cne $id){throw 'Synthetic allocation identity changed'}
+$root=Join-Path $env:ProgramData ('MuCodeSandbox-HyperVBroker-v1/users/'+$sid);$primary=Join-Path $root vms.json;$backup=Join-Path $root vms.backup.json;$disk=Join-Path $root ('vms/'+$id+'/disk.vhdx');$iso=Join-Path $root ('vms/'+$id+'/seed.iso');$name='mu-win-'+$id.Replace('-','')
+function Receipt($value){if($Nonce -notmatch '^[a-f0-9]{64}$'){throw 'Bound client nonce required'};$value.nonce=$Nonce;[IO.File]::WriteAllText(('C:\MuLab\approved\adoption-'+$Action+'.json'),($value|ConvertTo-Json -Depth 8 -Compress));return $value}
+function Original {
+ $vms=@(Get-VM -ErrorAction Stop);if($Action -eq 'remove-dependency'){$control=Get-Content -LiteralPath C:\MuLab\private\adoption-dependency.json -Raw|ConvertFrom-Json;$vms=@($vms|Where-Object{[string]$_.Id -ne $control.platformId})};if($vms.Count -ne 1 -or [string]$vms[0].Id -ne $seed.nested.platformId -or $vms[0].State -ne 'Off' -or $vms[0].Name -ne $name){throw 'Only the original stopped fixture VM may remain'}
+ $drives=@(Get-VMHardDiskDrive -VM $vms[0]);if($drives.Count -ne 1 -or [IO.Path]::GetFullPath($drives[0].Path) -ne [IO.Path]::GetFullPath($disk)){throw 'Original disk attachment changed'};return $vms[0]
+}
+if($Action -eq 'collect'){
+ $results=@{};foreach($phase in @('adoption-seed','adoption-review','adoption-approve','adoption-final')){$r=Get-Content -LiteralPath ('C:\MuLab\approved\'+$phase+'-result.json') -Raw|ConvertFrom-Json;if(-not $r.complete){throw ('Incomplete recovery phase: '+$phase)};$results[$phase]=$r}
+ if(-not $results['adoption-final'].nested.removed -or @(Get-VM).Count -or (Test-Path -LiteralPath (Split-Path $disk))){throw 'Synthetic resources were not removed'}
+ $a=[IO.File]::ReadAllText($primary);if($a -cne [IO.File]::ReadAllText($backup) -or @((ConvertFrom-Json $a).records.PSObject.Properties).Count){throw 'Final registration copies must agree and be empty'}
+ $winlogon='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon';if((Get-ItemProperty -LiteralPath $winlogon).DefaultUserName -ne 'MuLabUser'){throw 'Synthetic logon identity changed'};Remove-ItemProperty -LiteralPath $winlogon -Name DefaultPassword -ErrorAction SilentlyContinue;Set-ItemProperty -LiteralPath $winlogon -Name AutoAdminLogon -Value '0' -Type String;Set-ItemProperty -LiteralPath $winlogon -Name AutoLogonCount -Value 0 -Type DWord
+ $hashes=@{};foreach($file in @('C:\MuLab\client.mjs','C:\MuLab\adoption-client.mjs','C:\MuLab\product\resources\app\dist-server\native\windows\HyperVBroker.cs','C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs','C:\MuLab\product\resources\app\dist-server\native\windows\Recovery.cs','C:\MuLab\product\resources\app\dist-server\native\windows\RecoveryPermissions.cs','C:\MuLab\product\resources\app\dist-server\scripts\windows\hyperv.ps1','C:\MuLab\product\resources\app\dist-server\server\platform\windows\recovery.js','C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js')){$hashes[$file]=(Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant()}
+ return @{results=$results;sourceHashes=$hashes;originalCanaryPreserved=$true;nestedGuestsRemaining=0;syntheticAutologonDisabled=$true;aiWebsitesVisited=0}
+}
+$vm=Original
+if($Action -eq 'loss'){
+ $lock=[IO.File]::Open((Join-Path $root session.lock),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+ try{$a=[IO.File]::ReadAllText($primary);if($a -cne [IO.File]::ReadAllText($backup)){throw 'Source copies differ'};$state=$a|ConvertFrom-Json;if(@($state.records.PSObject.Properties).Count -ne 1 -or $state.records.$id.platformId -ne $seed.nested.platformId){throw 'Only the synthetic registration may be removed'};$receipt=[guid]::NewGuid().ToString('N');[IO.File]::Move($primary,('C:\MuLab\private\adoption-'+$receipt+'-primary.json'));[IO.File]::Move($backup,('C:\MuLab\private\adoption-'+$receipt+'-backup.json'));[IO.File]::Copy($iso,('C:\MuLab\private\adoption-'+$id+'-seed.iso'),$false);return @{copiesRemoved=$true;diskSha256=(Get-FileHash -LiteralPath $disk).Hash.ToLowerInvariant()}}finally{$lock.Dispose()}
+}
+switch($Action){
+ 'inspect-plan' {if((Test-Path -LiteralPath $primary) -or (Test-Path -LiteralPath $backup)){throw 'Read-only recovery published a registry'};Receipt @{registryAbsent=$true;diskSha256=(Get-FileHash -LiteralPath $disk).Hash.ToLowerInvariant()}}
+ 'change-seed' {$stream=[IO.File]::Open($iso,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::None);try{$stream.WriteByte(0);$stream.Flush($true)}finally{$stream.Dispose()};Receipt @{changed=$true}}
+ 'restore-seed' {[IO.File]::Copy(('C:\MuLab\private\adoption-'+$id+'-seed.iso'),$iso,$true);if((Test-Path -LiteralPath $primary) -or (Test-Path -LiteralPath $backup)){throw 'Stale review published a registry'};Receipt @{restored=$true;registryAbsent=$true}}
+ 'break-acl' {$rules=@(Get-VMNetworkAdapterExtendedAcl -VM $vm | Where-Object{[string]$_.Direction -eq 'Outbound'});if($rules.Count -ne 1 -or [string]$rules[0].Action -ne 'Deny' -or $rules[0].Weight -ne 1){throw 'Expected original outbound deny'};Remove-VMNetworkAdapterExtendedAcl -VM $vm -Direction Outbound -Weight 1;Receipt @{changed=$true}}
+ 'restore-acl' {if(@(Get-VMNetworkAdapterExtendedAcl -VM $vm|Where-Object{[string]$_.Direction -eq 'Outbound'}).Count){throw 'Recovery must not repair ACLs implicitly'};Add-VMNetworkAdapterExtendedAcl -VM $vm -Action Deny -Direction Outbound -LocalIPAddress ANY -RemoteIPAddress ANY -Weight 1;Receipt @{restored=$true}}
+ 'break-permissions' {[IO.File]::WriteAllBytes(('C:\MuLab\private\adoption-'+$id+'-seed-acl.bin'),[IO.File]::GetAccessControl($iso).GetSecurityDescriptorBinaryForm());$acl=[IO.File]::GetAccessControl($iso);$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),[Security.AccessControl.FileSystemRights]::Read,[Security.AccessControl.AccessControlType]::Allow));[IO.File]::SetAccessControl($iso,$acl);Receipt @{changed=$true}}
+ 'restore-permissions' {$acl=[IO.File]::GetAccessControl($iso);if(-not @($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])|Where-Object{$_.IdentityReference.Value -eq $sid}).Count){throw 'Recovery must not repair permissions implicitly'};$acl.SetSecurityDescriptorBinaryForm([IO.File]::ReadAllBytes(('C:\MuLab\private\adoption-'+$id+'-seed-acl.bin')));[IO.File]::SetAccessControl($iso,$acl);Receipt @{restored=$true}}
+ 'add-dependency' {
+  $controlId=[guid]::NewGuid().ToString('N');$child='C:\MuLab\private\adoption-dependency-'+$controlId+'.vhdx';$controlName='mu-adoption-dependency-'+$controlId
+  [IO.File]::WriteAllBytes(('C:\MuLab\private\adoption-'+$id+'-disk-acl.bin'),[IO.File]::GetAccessControl($disk).GetSecurityDescriptorBinaryForm());New-VHD -Path $child -ParentPath $disk -Differencing|Out-Null
+  $control=New-VM -Name $controlName -Generation 1 -MemoryStartupBytes 2GB -VHDPath $child -Path C:\MuLab\private;Set-VM -VM $control -Notes 'MuCodeSandbox synthetic adoption dependency' -AutomaticStartAction Nothing -AutomaticStopAction TurnOff -CheckpointType Disabled
+  [IO.File]::WriteAllText('C:\MuLab\private\adoption-dependency.json',(@{platformId=[string]$control.Id;name=$controlName;disk=$child;original=$id}|ConvertTo-Json -Compress));Receipt @{created=$true;controlOff=([string]$control.State -eq 'Off')}
+ }
+ 'remove-dependency' {
+  $control=Get-Content -LiteralPath C:\MuLab\private\adoption-dependency.json -Raw|ConvertFrom-Json;$other=Get-VM -Id ([guid]$control.platformId);$expected='C:\MuLab\private\adoption-dependency-'+$control.name.Substring('mu-adoption-dependency-'.Length)+'.vhdx';$drives=@(Get-VMHardDiskDrive -VM $other)
+  if($control.original -ne $id -or $other.Name -ne $control.name -or $other.Name -notmatch '^mu-adoption-dependency-[a-f0-9]{32}$' -or $other.Notes -ne 'MuCodeSandbox synthetic adoption dependency' -or $other.State -ne 'Off' -or $drives.Count -ne 1 -or [IO.Path]::GetFullPath($drives[0].Path) -ne $expected -or [IO.Path]::GetFullPath($control.disk) -ne $expected -or (Get-VHD -Path $expected).ParentPath -ne $disk){throw 'Synthetic dependency identity changed'}
+  Remove-VM -VM $other -Force;if(@(Get-VM|Where-Object{[string]$_.Id -eq $control.platformId}).Count){throw 'Synthetic dependency removal not confirmed'};[IO.File]::Delete($expected)
+  $acl=[IO.File]::GetAccessControl($disk);$acl.SetSecurityDescriptorBinaryForm([IO.File]::ReadAllBytes(('C:\MuLab\private\adoption-'+$id+'-disk-acl.bin')));[IO.File]::SetAccessControl($disk,$acl);Receipt @{removed=$true}
+ }
+ 'inspect-adopted' {$a=[IO.File]::ReadAllText($primary);$r=$a|ConvertFrom-Json;if($a -cne [IO.File]::ReadAllText($backup) -or @($r.records.PSObject.Properties).Count -ne 1 -or $r.records.$id.platformId -ne $seed.nested.platformId){throw 'Adopted registry identity changed'};Receipt @{registryMatches=$true;diskSha256=(Get-FileHash -LiteralPath $disk).Hash.ToLowerInvariant()}}
+}

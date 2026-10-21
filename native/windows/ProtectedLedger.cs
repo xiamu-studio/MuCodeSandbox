@@ -98,6 +98,35 @@ public sealed class MuProtectedLedger {
         else{if(a==null||!a.Bytes.SequenceEqual(chosen.Bytes))Write(primary,chosen.Bytes);if(b==null||!b.Bytes.SequenceEqual(chosen.Bytes))Write(backup,chosen.Bytes);}
         return chosen.Records;
     }
+    // Recovery inspection never initializes/repairs a store. File trust failures
+    // still reject even when the other copy is usable or both JSON files broke.
+    public Dictionary<string,Dictionary<string,object>> InspectRecovery(){
+        Snapshot a=null,b=null;string primary=Path.Combine(root,"vms.json"),backup=Path.Combine(root,"vms.backup.json");
+        if(Exists(primary))try{a=Read(primary);}catch(InvalidDataException){}
+        if(Exists(backup))try{b=Read(backup);}catch(InvalidDataException){}
+        if(a!=null&&b!=null&&a.Revision==b.Revision&&!a.Bytes.SequenceEqual(b.Bytes))throw new InvalidDataException("Conflicting protected copies require administrator diagnosis");
+        Snapshot chosen=a==null?b:b==null?a:a.Revision>=b.Revision?a:b;revision=chosen==null?0:chosen.Revision;
+        var records=chosen==null?new Dictionary<string,Dictionary<string,object>>():chosen.Records;CheckStorage(records,false);return records;
+    }
+    public string RecoveryFingerprint(){
+        var identity=new StringBuilder();
+        foreach(string name in new[]{"vms.json","vms.backup.json"}){
+            string file=Path.Combine(root,name);identity.Append(name).Append(':');
+            if(!Exists(file)){identity.Append("missing\n");continue;}ValidateFile(file);
+            using(var input=new FileStream(file,FileMode.Open,FileAccess.Read,FileShare.Read)){
+                if(input.Length>MaxBytes)throw new IOException("Registry exceeds recovery bounds");
+                using(var sha=System.Security.Cryptography.SHA256.Create())identity.Append(Convert.ToBase64String(sha.ComputeHash(input))).Append('\n');
+            }
+        }
+        using(var sha=System.Security.Cryptography.SHA256.Create())return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(identity.ToString()))).Replace("-","").ToLowerInvariant();
+    }
+    public void SaveRecovery(Dictionary<string,Dictionary<string,object>> records,string expectedFingerprint){
+        if(RecoveryFingerprint()!=expectedFingerprint)throw new IOException("Registry changed after recovery review");
+        if(records.Count>32||revision>=long.MaxValue-1)throw new IOException("Recovery registration limit reached");foreach(var pair in records)ValidateRecord(pair.Key,pair.Value);
+        string receipt=Guid.NewGuid().ToString("N");
+        foreach(string name in new[]{"vms.json","vms.backup.json"}){string file=Path.Combine(root,name);if(Exists(file)){ValidateFile(file);File.Copy(file,Path.Combine(root,"vms.before-recovery-"+receipt+"-"+name),false);}}
+        Save(records);CheckStorage(records,false);
+    }
     public void Save(Dictionary<string,Dictionary<string,object>> records){
         if(records.Count>32)throw new UnauthorizedAccessException("Registry allocation limit changed");foreach(var pair in records)ValidateRecord(pair.Key,pair.Value);
         if(revision>=long.MaxValue-1)throw new IOException("Registry revision limit reached; existing copies were preserved");

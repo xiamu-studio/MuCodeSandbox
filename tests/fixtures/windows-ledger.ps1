@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$Directory,[string]$Source,[ValidateSet('fresh','legacy','orphans','loss','corruption','interrupted','conflict','missing','schema','links','permissions','limit')][string]$Case)
+param([string]$Directory,[string]$Source,[ValidateSet('fresh','legacy','orphans','loss','corruption','interrupted','conflict','missing','schema','links','permissions','limit','recovery-missing','recovery-corrupt','recovery-stale','recovery-trust')][string]$Case)
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Web.Extensions
 $header='using System;using System.IO;using System.Linq;using System.Text;using System.Collections.Generic;using System.Runtime.InteropServices;using System.Web.Script.Serialization;'
@@ -19,6 +19,22 @@ function Check-Copies {
  $a=[IO.File]::ReadAllText($primary);$b=[IO.File]::ReadAllText($backup);Check ($a -ceq $b) 'Replicated copies differ';$saved=$json.DeserializeObject($a);Check ($saved.version -eq 2 -and $saved.ownerSid -eq $sid -and $saved.records.Count -eq 1 -and $saved.records[$id].platformId -eq $vmId) 'Allocation identity changed';Check ([IO.File]::ReadAllText($canary) -ceq 'original guest bytes') 'Guest bytes changed'
 }
 switch($Case){
+ 'recovery-missing' {
+  $s=Store;$loaded=$s.InspectRecovery();Check ($loaded.Count -eq 0 -and $s.UnregisteredStorageCount -eq 1) 'Recovery silently adopted orphan data';Check (-not [IO.File]::Exists($primary) -and -not [IO.File]::Exists($backup)) 'Read-only recovery initialized a registry'
+  Reject {(Store).Load() | Out-Null} 'UnauthorizedAccessException';$fingerprint=$s.RecoveryFingerprint();$s.SaveRecovery($records,$fingerprint);Check-Copies;Check ((Store).Load().Count -eq 1) 'Explicit recovered registration could not reopen normally'
+ }
+ 'recovery-corrupt' {
+  [IO.File]::WriteAllText($primary,'{"version":');[IO.File]::WriteAllBytes($backup,[byte[]]@(255,254));$s=Store;$loaded=$s.InspectRecovery();Check ($loaded.Count -eq 0 -and [IO.File]::ReadAllText($primary) -ceq '{"version":') 'Recovery inspection changed corrupt bytes'
+  $s.SaveRecovery($records,$s.RecoveryFingerprint());Check-Copies;$archives=@(Get-ChildItem -LiteralPath $root -Filter 'vms.before-recovery-*.json');Check ($archives.Count -eq 2) 'Both damaged originals must be retained';Check (@($archives|Where-Object{[Convert]::ToBase64String([IO.File]::ReadAllBytes($_.FullName)) -ceq [Convert]::ToBase64String([byte[]]@(255,254))}).Count -eq 1) 'Original malformed UTF-8 was lost'
+ }
+ 'recovery-stale' {
+  Seed | Out-Null;$s=Store;$s.InspectRecovery()|Out-Null;$fingerprint=$s.RecoveryFingerprint();$original=[IO.File]::ReadAllText($primary);[IO.File]::WriteAllText($primary,$original+' ')
+  Reject {$s.SaveRecovery($records,$fingerprint)} 'IOException';Check ([IO.File]::ReadAllText($primary) -ceq ($original+' ') -and [IO.File]::ReadAllText($backup) -ceq $original) 'Stale recovery rewrote evidence';Check (@(Get-ChildItem -LiteralPath $root -Filter 'vms.before-recovery-*.json').Count -eq 0) 'Stale review archived before rejection'
+ }
+ 'recovery-trust' {
+  Seed | Out-Null;$validator=[Action[string]]{param($file) if($file -eq $primary){throw [UnauthorizedAccessException]::new('Synthetic trust refusal')}};$s=[MuProtectedLedger]::new($root,$sid,$validator)
+  Reject {$s.InspectRecovery()|Out-Null} 'UnauthorizedAccessException';Reject {$s.RecoveryFingerprint()|Out-Null} 'UnauthorizedAccessException';Check-Copies
+ }
  'limit' {
   Seed | Out-Null;$text=[IO.File]::ReadAllText($primary);$text=[regex]::Replace($text,'"revision":\d+','"revision":9223372036854775806');[IO.File]::WriteAllText($primary,$text);[IO.File]::WriteAllText($backup,$text)
   $s=Store;$loaded=$s.Load();Reject {$s.Save($loaded)} 'IOException';Check ([IO.File]::ReadAllText($primary) -ceq $text -and [IO.File]::ReadAllText($backup) -ceq $text) 'Revision exhaustion changed a valid copy'

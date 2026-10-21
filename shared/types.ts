@@ -70,6 +70,7 @@ export interface SystemInfo {
   application?: { channel: 'desktop-test' | 'source-preview'; buildId: string; builtAt: string | null };
   hostNetwork?: { state: 'starting' | 'ready' | 'failed'; issue: string | null };
   hostResourceIssue?: string | null;
+  hostPowerIssue?: string | null;
 }
 export interface Metrics {
   cpuPercent: number;

@@ -16,6 +16,7 @@ import { windowsConfigSchema, windowsPaths, vmIdentity, RELAY_PORT, PROBE_PORT, 
 import { cloudInit, bootstrapScript, installAmd64TunnelScript, configureWindowsGuard, INSPECT_WINDOWS_GUARD, windowsEnvironment } from './guest.ts';
 import { WindowsNetworkSession } from './session.ts';
 import {windowsResourcesSchema,resourceError} from './resources.ts';
+import {windowsPowerSchema,powerError} from './power.ts';
 import { measureEgress } from '../../egress.ts';
 import {AppError} from '../../errors.ts';
 import {GUEST_TASK_RUN,GUEST_TASK_CANCEL} from '../../guest-task.ts';
@@ -58,7 +59,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   private intentionalDisconnect=new Set<string>();
   private transportFailures=new Map<string,()=>void>();
   private vmIds=new Map<string,string>();
-  private channels=new Map<string,{child:ChildProcessWithoutNullStreams;port:number}>();
+  private channels=new Map<string,{child:ChildProcessWithoutNullStreams;port:number;heartbeat:ReturnType<typeof setInterval>}>();
   private serviceStreams=new Map<string,Set<Duplex>>();
   private baseBuilders=new Set<string>();
   readonly root:string;
@@ -117,7 +118,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
       const request:Record<string,unknown>=c?{id:c.id}:{};
       if(action==='disk'&&c)Object.assign(request,{image:isSealedBase(c.image)?c.image:path.resolve(c.image),imageSha256:c.imageSha256,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB});
       if(action==='create'&&c)Object.assign(request,{seed:windowsPaths(this.root,c.id).seed,seedSha256:await fileHash(windowsPaths(this.root,c.id).seed)});
-      try{return String(await this.broker.call(action==='disk'&&c&&this.baseBuilders.has(c.id)?'begin-base':action as BrokerAction,request,{...options,timeoutMs:options.timeoutMs??45000}));}catch(error){throw resourceError(error);}
+      try{return String(await this.broker.call(action==='disk'&&c&&this.baseBuilders.has(c.id)?'begin-base':action as BrokerAction,request,{...options,timeoutMs:options.timeoutMs??45000}));}catch(error){throw powerError(resourceError(error));}
     }
     const p=c?windowsPaths(this.root,c.id):undefined;
     const value=c?{...vmIdentity(c.id),...p,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB,image:c.image,
@@ -130,7 +131,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   async state(c:WindowsConfig){return JSON.parse(await this.powershell('status',c));}
   async channelHelper() {
     const source=path.resolve(scripts,'../../native/windows/HyperVChannel.cs');
-    const hash=createHash('sha256').update(await readFile(source)).digest('hex').slice(0,16);
+    const digest=createHash('sha256');for(const file of [source,path.resolve(scripts,'../../native/windows/PowerWatch.cs'),path.join(scripts,'build-channel.ps1')]){digest.update(await readFile(file));digest.update('\\0');}const hash=digest.digest('hex').slice(0,16);
     const directory=path.join(this.root,'tools');await mkdir(directory,{recursive:true});
     const target=path.join(directory,`hv-channel-${hash}.exe`);
     try{await access(target);}catch{
@@ -155,6 +156,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     if(this.broker)return z.object({port:z.number().int().min(1).max(65535)}).strict().parse(await this.broker.call('channel',{id})).port;
     const existing=this.channels.get(id);if(existing&&existing.child.exitCode===null&&!existing.child.killed)return existing.port;
     const helper=await this.channelHelper();const child=spawn(helper,['--listen',platformId,String(process.pid)],{stdio:['pipe','pipe','pipe'],windowsHide:true});
+    child.stdin.on('error',()=>{});child.stdin.write('.');const heartbeat=setInterval(()=>{if(!child.stdin.destroyed)child.stdin.write('.');},500);heartbeat.unref();child.once('exit',()=>clearInterval(heartbeat));
     let details='';child.stderr.on('data',b=>{details=(details+b).slice(-2048);});
     try{
       const port=await new Promise<number>((resolve,reject)=>{let line='';const timer=setTimeout(()=>reject(Error('Hyper-V loopback channel did not start')),10000);
@@ -162,10 +164,10 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
           try{const data=z.object({port:z.number().int().min(1).max(65535)}).strict().parse(JSON.parse(line.split('\n')[0]));clearTimeout(timer);resolve(data.port);}catch(error){clearTimeout(timer);reject(error);}});
         child.once('error',error=>{clearTimeout(timer);reject(error);});child.once('exit',()=>{clearTimeout(timer);reject(Error('Hyper-V loopback channel closed: '+details));});
       });
-      this.channels.set(id,{child,port});return port;
-    }catch(error){child.kill();throw error;}
+      this.channels.set(id,{child,port,heartbeat});return port;
+    }catch(error){clearInterval(heartbeat);child.kill();throw error;}
   }
-  private closeChannel(id:string){for(const stream of this.serviceStreams.get(id)??[])stream.destroy();this.serviceStreams.delete(id);if(this.broker)void this.broker.call('close-channel',{id}).catch(()=>{});const channel=this.channels.get(id);this.channels.delete(id);if(channel){channel.child.stdin.end();channel.child.kill();}}
+  private closeChannel(id:string){for(const stream of this.serviceStreams.get(id)??[])stream.destroy();this.serviceStreams.delete(id);if(this.broker)void this.broker.call('close-channel',{id}).catch(()=>{});const channel=this.channels.get(id);this.channels.delete(id);if(channel){clearInterval(channel.heartbeat);channel.child.stdin.end();channel.child.kill();}}
   async serviceStreamFactory(c:WindowsConfig,service:'vnc'|'cdp'){
     const target=service==='vnc'?5900:service==='cdp'?9222:0;if(!target)throw Error('Unknown guest service');
     const args=await this.ssh(c),destination=args.pop()!,file=path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe');
@@ -262,6 +264,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     } catch(error) {await this.stop(c);throw error;}
   }
   async resources(){return this.broker?windowsResourcesSchema.parse(await this.broker.call('resource-status')):null;}
+  async power(){return this.broker?windowsPowerSchema.parse(await this.broker.call('power-status')):null;}
   async stop(c:WindowsConfig,options:RunOptions={}) {
     // A stuck SSH child must never prevent the independent hypervisor stop.
     try{await this.disconnect(c.id);}catch{/* Hyper-V state is checked below. */}

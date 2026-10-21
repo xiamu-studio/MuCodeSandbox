@@ -9,6 +9,7 @@ import WindowsSetupPanel from './WindowsSetupPanel.tsx';
 import WindowsHostPanel from './WindowsHostPanel.tsx';
 import WindowsStoragePanel from './WindowsStoragePanel.tsx';
 import WindowsResourcesPanel from './WindowsResourcesPanel.tsx';
+import WindowsPowerPanel from './WindowsPowerPanel.tsx';
 import WindowsRecoveryWorkspace from './WindowsRecoveryWorkspace.tsx';
 const TerminalPanel=lazy(()=>import('../TerminalPanel.tsx'));
 const WindowsBrowserView=lazy(()=>import('./WindowsBrowserView.tsx'));
@@ -66,6 +67,7 @@ function WindowsNormalWorkspace(){
     {error&&<Notice kind="error">{error}</Notice>}
     {snapshot?.system.hostNetwork?.issue&&<Notice kind="error">{snapshot.system.hostNetwork.issue}。请退出并重新打开预览后再启动环境。</Notice>}
     {snapshot?.system.hostResourceIssue&&<Notice kind="error">{snapshot.system.hostResourceIssue}。请处理资源压力后重新打开软件。</Notice>}
+    {snapshot?.system.hostPowerIssue&&<Notice kind="error">{snapshot.system.hostPowerIssue}。请重新打开软件后再启动。</Notice>}
     {snapshot&&window.__MU_CONFIG__.capabilities?.hostSetup&&<WindowsHostPanel showReady={system} onChange={refresh}/>}
     {snapshot&&window.__MU_CONFIG__.capabilities?.setup&&!snapshot.system.runtime.available&&<WindowsSetupPanel onReady={refresh}/>}
     {!snapshot?<div className="loading-view">连接 Windows 本机服务…</div>:system?<>
@@ -75,6 +77,7 @@ function WindowsNormalWorkspace(){
      <Notice>当前可管理 Linux 环境，使用交互式终端、文件传输和独立 Linux 浏览器。共享、快照和完整系统准备仍在开发。</Notice>
      {window.__MU_CONFIG__.capabilities?.storage&&<WindowsStoragePanel/>}
      {window.__MU_CONFIG__.capabilities?.storage&&<WindowsResourcesPanel/>}
+     {window.__MU_CONFIG__.capabilities?.storage&&<WindowsPowerPanel/>}
     </>:selected?<>
      <header className="page-header environment-header"><div><div className="eyebrow">HYPER-V · LINUX</div><h1>{selected.name}</h1><p>{selected.description}</p></div><div className="environment-header-actions"><Status state={selected.state}/><Button disabled={!connected||!!active||selected.state!=='running'} onClick={()=>void action('restart')} icon={<RefreshCw size={15}/>}>重启</Button><Button className="primary" loading={!!active} disabled={!connected} onClick={()=>void action(selected.state==='running'?'stop':'start')}>{active?'处理中':selected.state==='running'?'停止':'启动'}</Button></div></header>
      {selected.lastError&&<Notice kind="error">{displayIssue(selected.lastError)}</Notice>}

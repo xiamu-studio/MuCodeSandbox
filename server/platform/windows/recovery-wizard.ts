@@ -2,7 +2,7 @@ import {AppError} from '../../errors.ts';
 import type {HyperVBrokerClient} from './broker.ts';
 import {reviewProtectedStorage,adoptProtectedStorage} from './recovery.ts';
 import type {WindowsRecoverySnapshot,WindowsRecoveryCandidate} from '../../../shared/windows-recovery.ts';
-const messages:Record<string,string>={RECOVERY_REVIEW_CHANGED:'原环境或登记已变化，请重新核验后确认。',DENIED:'原环境身份或文件权限不符合恢复条件，原盘已保留。',BROKER_FAILED:'无法确认原虚拟机完整且已停止，原盘已保留。',BROKER_UNAVAILABLE:'恢复组件已关闭，请退出后重新进入恢复模式。',BROKER_TIMEOUT:'核验未及时完成，原盘已保留，请重新进入恢复模式。'};
+const messages:Record<string,string>={POWER_FENCED:'电源或原生监测状态已变化，请重新进入恢复模式后核验。',RECOVERY_REVIEW_CHANGED:'原环境或登记已变化，请重新核验后确认。',DENIED:'原环境身份或文件权限不符合恢复条件，原盘已保留。',BROKER_FAILED:'无法确认原虚拟机完整且已停止，原盘已保留。',BROKER_UNAVAILABLE:'恢复组件已关闭，请退出后重新进入恢复模式。',BROKER_TIMEOUT:'核验未及时完成，原盘已保留，请重新进入恢复模式。'};
 export class WindowsRecoveryWizard {
  private value:WindowsRecoverySnapshot={phase:'idle',candidates:[],issue:null,selectedId:null,review:null,message:'请选择需要恢复登记的原环境。',canCancel:false};
  private operation:Promise<void>|undefined;private abort:AbortController|undefined;private closing=false;

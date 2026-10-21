@@ -48,25 +48,30 @@ public static class MuHyperVChannel {
     // Only the exact VM is reachable and no IP-network fallback is possible.
     private static int Listen(Guid vm,int ownerId) {
         IntPtr startup=Marshal.AllocHGlobal(512);var listener=new TcpListener(IPAddress.Loopback,0);
-        var links=new List<Link>();var capacity=new Semaphore(32,32);bool closed=false;
-        Action stop=()=>{lock(links){if(closed)return;closed=true;listener.Stop();foreach(var link in links)link.Close();}};
+        var links=new List<Link>();var capacity=new Semaphore(32,32);bool closed=false;long lastBeat=0;
+        var authorityReady=new ManualResetEvent(false);MuPowerWatch power=null;
+        Action stop=()=>{lock(links){if(closed)return;closed=true;authorityReady.Set();listener.Stop();foreach(var link in links)link.Close();}};
+        Action check=()=>{power.Check();long beat=Interlocked.Read(ref lastBeat);if(beat==0||MuPowerWatch.Tick-beat>MuPowerContinuity.AuthorityTimeoutMs){power.AuthorityLost();throw new IOException("Transport authority expired");}};
         try {
             if(WSAStartup(0x0202,startup)!=0)throw new IOException("WinSock initialization failed");
-            var owner=Process.GetProcessById(ownerId);listener.Start(32);
+            var owner=Process.GetProcessById(ownerId);
             var watchdog=new Thread(()=>{try{owner.WaitForExit();}catch{}stop();});watchdog.IsBackground=true;watchdog.Start();
-            var inputWatch=new Thread(()=>{try{var input=Console.OpenStandardInput();var b=new byte[32];while(input.Read(b,0,b.Length)>0){}}catch{}finally{stop();}});inputWatch.IsBackground=true;inputWatch.Start();
+            var inputWatch=new Thread(()=>{try{var input=Console.OpenStandardInput();int value=input.ReadByte();if(value==239){if(input.ReadByte()!=187||input.ReadByte()!=191)throw new IOException("Invalid authority encoding");value=input.ReadByte();}while(value>=0){if(value!=46)throw new IOException("Invalid transport authority");Interlocked.Exchange(ref lastBeat,MuPowerWatch.Tick);authorityReady.Set();value=input.ReadByte();}}catch{}finally{stop();}});inputWatch.IsBackground=true;inputWatch.Start();
+            if(!authorityReady.WaitOne(10000)||closed)throw new IOException("Transport authority is unavailable");
+            power=new MuPowerWatch(stop,()=>{long beat=Interlocked.Read(ref lastBeat);if(beat==0||MuPowerWatch.Tick-beat>MuPowerContinuity.AuthorityTimeoutMs)power.AuthorityLost();});
+            check();listener.Start(32);
             Console.WriteLine("{\"port\":"+((IPEndPoint)listener.LocalEndpoint).Port+"}");Console.Out.Flush();
             while(!closed){TcpClient client;try{client=listener.AcceptTcpClient();}catch(SocketException){break;}
                 if(!capacity.WaitOne(0)){client.Close();continue;}var link=new Link{Client=client};lock(links){links.Add(link);}
                 ThreadPool.QueueUserWorkItem(_=>{try{
-                    link.Guest=OpenGuest(vm);var stream=client.GetStream();
-                    var up=new Thread(()=>{try{var b=new byte[65536];int n;while((n=stream.Read(b,0,b.Length))>0){int offset=0;var pin=GCHandle.Alloc(b,GCHandleType.Pinned);try{while(offset<n){int sent=send(link.Guest,IntPtr.Add(pin.AddrOfPinnedObject(),offset),n-offset,0);if(sent<=0)throw new IOException("Guest closed");offset+=sent;}}finally{pin.Free();}}}catch{}finally{link.Close();}});up.IsBackground=true;up.Start();
-                    var output=new byte[65536];int count;while((count=recv(link.Guest,output,output.Length,0))>0){stream.Write(output,0,count);stream.Flush();}
+                    check();var guest=OpenGuest(vm);lock(links){if(closed){shutdown(guest,2);closesocket(guest);throw new IOException("Transport closed");}link.Guest=guest;}check();var stream=client.GetStream();
+                    var up=new Thread(()=>{try{var b=new byte[65536];int n;while((n=stream.Read(b,0,b.Length))>0){int offset=0;var pin=GCHandle.Alloc(b,GCHandleType.Pinned);try{while(offset<n){check();int sent=send(link.Guest,IntPtr.Add(pin.AddrOfPinnedObject(),offset),n-offset,0);if(sent<=0)throw new IOException("Guest closed");offset+=sent;}}finally{pin.Free();}}}catch{}finally{link.Close();}});up.IsBackground=true;up.Start();
+                    var output=new byte[65536];int count;while((count=recv(link.Guest,output,output.Length,0))>0){check();stream.Write(output,0,count);stream.Flush();}
                 }catch{}finally{link.Close();lock(links){links.Remove(link);}capacity.Release();}});
             }
             return 0;
         }catch(Exception error){Console.Error.WriteLine("Hyper-V loopback channel: "+error.Message);return 1;}
-        finally{stop();WSACleanup();Marshal.FreeHGlobal(startup);}
+        finally{stop();if(power!=null)power.Dispose();WSACleanup();Marshal.FreeHGlobal(startup);}
     }
     public static int Main(string[] args) {
         Guid vm;

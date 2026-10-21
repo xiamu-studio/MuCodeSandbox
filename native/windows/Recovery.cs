@@ -44,7 +44,7 @@ public static partial class MuHyperVBroker {
                 string plan;using(var sha=SHA256.Create())plan=BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(Json().Serialize(reviewed)))).Replace("-","").ToLowerInvariant();
                 if(action=="recovery-review")return new {review=reviewed,plan=plan,registered=false,state="Off",diskPreserved=true};
                 if(Digest(request,"plan")!=plan||Text(request,"confirmName",64)!=name)throw new MuStorageException("RECOVERY_REVIEW_CHANGED","Recovery review changed or confirmation does not match; review again");
-                cancellation.ThrowIfCancellationRequested();lock(Gate){RecoveryPublicationAttempted=true;Records.Add(id,record);try{LedgerStore.SaveRecovery(Records,fingerprint);}catch{Records.Remove(id);throw;}}
+                cancellation.ThrowIfCancellationRequested();CheckPower();lock(Gate){RecoveryPublicationAttempted=true;Records.Add(id,record);try{LedgerStore.SaveRecovery(Records,fingerprint);}catch{Records.Remove(id);throw;}}
                 return new {registered=true,id=id,platformId=platform,state="Off",diskPreserved=true,reopenRequired=true};
             }
         }

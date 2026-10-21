@@ -9,7 +9,7 @@ import {HyperVBrokerClient,brokerSourceDigest} from 'file:///C:/MuLab/product/re
 import {HyperVRuntime} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/runtime.js';
 import {windowsConfigSchema} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/config.js';
 
-const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','adoption-seed','adoption-review','adoption-approve','adoption-ui','adoption-final','cache','cache-ui','ledger-seed','ledger-check','ledger-deny','ledger-final'].includes(phase));
+const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network','power-discard-failed','power-clear-failed','power-run','power-recover','resource-seed','resource-disk','resource-memory','resource-recover','adoption-seed','adoption-review','adoption-approve','adoption-ui','adoption-final','cache','cache-ui','ledger-seed','ledger-check','ledger-deny','ledger-final'].includes(phase));
 const directory='C:/MuLab/public',nonce=randomBytes(32).toString('hex'),client=new HyperVBrokerClient(nonce);
 let complete=false;const checks=[];let before,after,error,nested;
 const pass=name=>checks.push({name,passed:true});
@@ -26,7 +26,9 @@ try{
  }else{
  before=await client.call('host-status',{}, {timeoutMs:90000});
  assert.equal(before.supported,true);assert.equal(before.firmwareVirtualization,true);assert.equal(before.slat,true);
- if(phase.startsWith('adoption-')){
+ if(phase.startsWith('power-')){
+  assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);const {powerAcceptance}=await import('file:///C:/MuLab/power-client.mjs');nested=await powerAcceptance(phase,client,nonce,pass);
+ }else if(phase.startsWith('adoption-')){
   assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);
   const {adoptionAcceptance}=await import('file:///C:/MuLab/adoption-client.mjs');nested=await adoptionAcceptance(phase,client,nonce,pass);
  }else if(phase.startsWith('resource-')){

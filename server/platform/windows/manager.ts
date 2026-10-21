@@ -14,9 +14,10 @@ import {HyperVRuntime} from './runtime.ts';
 import {windowsConfigSchema,windowsPaths,vmIdentity,isSealedBase,type WindowsConfig} from './config.ts';
 import type {WindowsNetworkSession} from './session.ts';
 import {resourceIssue} from './resources.ts';
+import {powerIssue} from './power.ts';
 
 export interface WindowsBase {image:string;imageSha256:string}
-export type WindowsBackend=Pick<HyperVRuntime,'info'|'create'|'start'|'stop'|'state'|'session'|'connect'|'inspectGuard'>&Partial<Pick<HyperVRuntime,'remove'|'recoverCreation'|'deletionAvailable'|'resources'>>;
+export type WindowsBackend=Pick<HyperVRuntime,'info'|'create'|'start'|'stop'|'state'|'session'|'connect'|'inspectGuard'>&Partial<Pick<HyperVRuntime,'remove'|'recoverCreation'|'deletionAvailable'|'resources'|'power'>>;
 export interface WindowsManagerOptions {runtimeRoot:string;base?:WindowsBase;probe?:(config:WindowsConfig)=>()=>Promise<{receiver:string;ip:string}[]>}
 
 // Windows owns its lifecycle and storage integration. The shipping Mac
@@ -31,6 +32,7 @@ export class WindowsManager {
  browserRunning:((id:string)=>boolean)|undefined;
  browserAvailable=false;
  private resourceIssue:string|null=null;
+ private powerIssue:string|null=null;
  private lifecycleIds=new Set<string>();
  private timer:ReturnType<typeof setInterval>;private monitorTask:Promise<void>|undefined;private closeTask:Promise<void>|undefined;private closing=false;private hostIssue:string|null=null;
  constructor(store:Store,runtime:WindowsBackend,options:WindowsManagerOptions){
@@ -82,10 +84,10 @@ export class WindowsManager {
  async snapshot():Promise<Snapshot>{
   const info=await this.runtime.info();
   return {environments:this.store.list().map(e=>this.view(e)),jobs:this.store.jobs(),system:{platform:'win32',arch:process.arch,hostname:hostname(),cpus:cpus().length,memoryGiB:Math.round(totalmem()/2**30),freeMemoryGiB:Math.round(freemem()/2**30),dataDir:this.store.dataDir,version:VERSION,
-   runtime:{available:info.available&&!!this.options.base,path:info.available?'Hyper-V':null,version:'Windows Hyper-V',error:info.issues.join('；')||(!this.options.base?'请先准备空白受保护基盘':null)},browser:{available:this.browserAvailable,engine:this.browserAvailable?'Linux AMD64 Chrome':'Linux 客体浏览器（组件待准备）',native:false},hostNetwork:{state:this.hostIssue?'failed':'ready',issue:this.hostIssue},hostResourceIssue:this.resourceIssue}};
+   runtime:{available:info.available&&!!this.options.base,path:info.available?'Hyper-V':null,version:'Windows Hyper-V',error:info.issues.join('；')||(!this.options.base?'请先准备空白受保护基盘':null)},browser:{available:this.browserAvailable,engine:this.browserAvailable?'Linux AMD64 Chrome':'Linux 客体浏览器（组件待准备）',native:false},hostNetwork:{state:this.hostIssue?'failed':'ready',issue:this.hostIssue},hostResourceIssue:this.resourceIssue,hostPowerIssue:this.powerIssue}};
  }
  async action(id:string,action:'start'|'stop'|'restart'){
-  if(this.closing)throw new AppError('应用正在退出',409,'CLOSING');if(action!=='stop'&&this.resourceIssue)throw new AppError(this.resourceIssue+'；请处理资源压力后重新打开软件',409,'RESOURCE_FENCED');if(action!=='stop'&&this.hostIssue)throw new AppError(this.hostIssue+'；请退出并重新打开 Windows 预览',409,'HOST_NETWORK_CHANGED');if(this.active.has(id))throw new AppError('环境正在执行其他操作',409,'ENVIRONMENT_BUSY');
+  if(this.closing)throw new AppError('应用正在退出',409,'CLOSING');if(action!=='stop'&&this.powerIssue)throw new AppError(this.powerIssue+'；请重新打开软件后再启动',409,'POWER_FENCED');if(action!=='stop'&&this.resourceIssue)throw new AppError(this.resourceIssue+'；请处理资源压力后重新打开软件',409,'RESOURCE_FENCED');if(action!=='stop'&&this.hostIssue)throw new AppError(this.hostIssue+'；请退出并重新打开 Windows 预览',409,'HOST_NETWORK_CHANGED');if(this.active.has(id))throw new AppError('环境正在执行其他操作',409,'ENVIRONMENT_BUSY');
   const e=this.store.get(id),job=this.store.newJob(id,action),controller=new AbortController();this.active.set(id,job.id);
   this.lifecycleIds.add(id);
   const promise=this.lifecycle(e,action,controller.signal).then(()=>{this.store.finishJob(job.id,'succeeded','操作完成');},error=>{
@@ -142,6 +144,8 @@ export class WindowsManager {
  monitor(){
   if(this.monitorTask)return this.monitorTask;if(this.closing)return Promise.resolve();
   return this.monitorTask=(async()=>{
+   try{const status=await this.runtime.power?.();if(status?.fenced||status&&!status.monitoring){await this.powerUnavailable(powerIssue(status.issue));return;}}
+   catch{await this.powerUnavailable('电源防护状态无法确认');return;}
    try{const status=await this.runtime.resources?.();if(status?.fenced){await this.resourcesUnavailable(resourceIssue(status.issue));return;}}
    catch{await this.resourcesUnavailable('宿主资源状态无法确认');return;}
    await Promise.all([...this.sessions].map(async([id,session])=>{if(this.lifecycleIds.has(id))return;try{await session.tick();if(this.sessions.get(id)===session&&session.state==='active')await this.inspectAdditionalProtection?.(id);}catch(error){if(this.sessions.get(id)===session)await this.quarantine(id,redact(errorMessage(error)));}}));
@@ -156,6 +160,7 @@ export class WindowsManager {
  }
  async hostUnavailable(reason:string){this.hostIssue=reason;for(const task of this.tasks.values())task.controller.abort();await Promise.all(this.store.list().filter(e=>['running','starting','creating'].includes(e.state)).map(e=>this.quarantine(e.id,reason)));}
  async resourcesUnavailable(reason:string){this.resourceIssue=reason;for(const task of this.tasks.values())task.controller.abort();await Promise.all(this.store.list().filter(e=>['running','starting','creating'].includes(e.state)||this.sessions.has(e.id)).map(e=>this.quarantine(e.id,reason)));}
+ async powerUnavailable(reason:string){this.powerIssue=reason;for(const task of this.tasks.values())task.controller.abort();await Promise.all(this.store.list().filter(e=>['running','starting','creating'].includes(e.state)||this.sessions.has(e.id)).map(e=>this.quarantine(e.id,reason)));}
  failProtection(id:string,reason:string){return this.quarantine(id,reason);}
  cancel(jobId:string){if(this.deletions.has(jobId))throw new AppError('删除已开始，请等待清理结果',409,'DELETE_IN_PROGRESS');this.tasks.get(jobId)?.controller.abort();}
  async wait(jobId:string){await this.tasks.get(jobId)?.promise;}

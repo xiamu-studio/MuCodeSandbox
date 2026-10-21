@@ -125,7 +125,7 @@ test('The loopback transport exits when its owning controller is killed',{skip:p
   const directory=await mkdtemp(path.join(tmpdir(),'mu-channel-owner-'));let owner:ReturnType<typeof spawn>|undefined,helperPid=0;
   try{
     const helper=await new HyperVRuntime(directory).channelHelper();
-    const code=`const {spawn}=require('node:child_process');const c=spawn(${JSON.stringify(helper)},['--listen','12345678-1234-4234-8234-123456789012',String(process.pid)],{stdio:['pipe','pipe','pipe']});c.stdout.once('data',b=>process.stdout.write(JSON.stringify({pid:c.pid,port:JSON.parse(b.toString()).port})+'\\n'));setInterval(()=>{},1000);`;
+    const code=`const {spawn}=require('node:child_process');const c=spawn(${JSON.stringify(helper)},['--listen','12345678-1234-4234-8234-123456789012',String(process.pid)],{stdio:['pipe','pipe','pipe']});c.stdin.write('.');c.stdout.once('data',b=>process.stdout.write(JSON.stringify({pid:c.pid,port:JSON.parse(b.toString()).port})+'\\n'));setInterval(()=>{},1000);`;
     owner=spawn(process.execPath,['-e',code],{stdio:['pipe','pipe','pipe']});
     const ready=await new Promise<{pid:number;port:number}>((resolve,reject)=>{const timer=setTimeout(()=>reject(Error('Controller fixture did not start')),5000);owner!.stdout!.once('data',b=>{clearTimeout(timer);try{resolve(JSON.parse(b.toString()));}catch(e){reject(e);}});owner!.once('error',reject);});
     helperPid=ready.pid;assert.ok(ready.port>0);owner.kill('SIGKILL');

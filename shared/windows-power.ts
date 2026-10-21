@@ -1,0 +1,1 @@
+export interface WindowsPowerStatus {session:string;monitoring:boolean;fenced:boolean;issue:'suspend'|'resume'|'monitor-gap'|'clock-change'|'monitor-unavailable'|'authority-stalled'|null;cleanupRunning:boolean;stopsConfirmed:boolean}

@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-loss','adoption-review','adoption-approve','adoption-ui','adoption-ui-stage','adoption-ui-collect','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','power-inspect','power-discard-failed','power-clear-failed','power-prepare-reset','power-run','power-recover','power-progress','power-collect','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-loss','adoption-review','adoption-approve','adoption-ui','adoption-ui-stage','adoption-ui-collect','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -42,7 +42,7 @@ try{
   if($vhd.Size -lt 160GB){Resize-VHD -Path $disk -SizeBytes 160GB}
   Start-VM -VM $selected | Out-Null
  }
- if($Phase -in @('ssh-inspect','network-prepare','ledger-seed','ledger-logon') -and $selected.State -eq 'Off'){Start-VM -VM $selected | Out-Null}
+ if($Phase -in @('ssh-inspect','network-prepare','ledger-seed','ledger-logon','power-inspect') -and $selected.State -eq 'Off'){Start-VM -VM $selected | Out-Null}
  Save-Probe 'connecting'
  $session=Connect-LabGuest
  $initial=Invoke-Command -Session $session -ScriptBlock {
@@ -58,6 +58,30 @@ try{
    @{guestVolumeExtended=$true;guestVolumeBytes=(Get-Volume -DriveLetter C).Size;nestedGuests=0}
   }
   Save-Probe 'capacity-evaluation-volume-ready' $result;exit 0
+ }
+ if($Phase -eq 'power-inspect'){
+  $value=Invoke-Command -Session $session -ScriptBlock {
+   if($env:COMPUTERNAME -ne 'MU-CLEAN-LAB' -or (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID -ne 'IoTEnterpriseSEval' -or @(Get-VM -ErrorAction Stop).Count){throw 'Power inspection requires the empty isolated evaluation guest'}
+   $power=Join-Path $env:SystemRoot System32/powercfg.exe;$states=(& $power /a 2>&1|Out-String);if($LASTEXITCODE -ne 0){throw 'Power capabilities query failed'}
+   $settings=Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power'
+   @{availableStates=$states;hibernateEnabled=$settings.HibernateEnabled;hiberbootEnabled=$settings.HiberbootEnabled;bootId=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');nestedGuests=0;settingsChanged=$false}
+  }
+  Assert-LabVM|Out-Null;Save-Probe 'power-capabilities-inspected' $value
+  try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+  Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
+  do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'power-capabilities-inspected-and-evaluation-vm-off' $value;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown not confirmed'};Start-Sleep -Seconds 2}while($true)
+ }
+ if($Phase.StartsWith('power-')){
+  $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-power-operator.ps1'))
+  if($Phase -eq 'power-prepare-reset'){$value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action prepare-reset};Save-Probe 'failed-synthetic-power-allocations-identified' $value;exit 0}
+  if($Phase -eq 'power-progress'){$value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action inspect};Save-Probe 'native-power-progress-inspected' $value;exit 0}
+  if($Phase -eq 'power-collect'){
+   $value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action collect}
+   Assert-LabVM|Out-Null;Save-Probe 'native-power-evidence-collected' $value
+   try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+   Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
+   do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'native-power-complete-and-evaluation-vm-off' $value;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown not confirmed'};Start-Sleep -Seconds 2}while($true)
+  }
  }
  if($Phase.StartsWith('resource-')){
   $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-resource-operator.ps1')).Replace('__METRICS_SOURCE__',[Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot '../../native/windows/ResourceMetrics.cs'))))
@@ -359,6 +383,11 @@ try{
   }
  }
  Save-Probe 'preparing-standard-user-probe'
+ if($Phase.StartsWith('power-')){
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-power-client.mjs') -Destination C:\MuLab\power-client.mjs -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-channel.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-channel.ps1 -ToSession $session -Force
+  foreach($name in @('runtime.js','manager.js','service.js','power.js')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../dist-server/server/platform/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\'+$name) -ToSession $session -Force}
+ }
  if($Phase.StartsWith('adoption-')){
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-adoption-client.mjs') -Destination C:\MuLab\adoption-client.mjs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/recovery.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\recovery.js -ToSession $session -Force
@@ -366,12 +395,13 @@ try{
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'hyperv.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\hyperv.ps1 -ToSession $session -Force
  }
  if($Phase -eq 'network'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-network-client.mjs') -Destination C:\MuLab\network-client.mjs -ToSession $session -Force}
- if($Phase.StartsWith('ledger-') -or $Phase.StartsWith('resource-') -or $Phase.StartsWith('adoption-') -or $Phase -in @('cache','cache-ui')){
+ if($Phase.StartsWith('ledger-') -or $Phase.StartsWith('resource-') -or $Phase.StartsWith('adoption-') -or $Phase.StartsWith('power-') -or $Phase -in @('cache','cache-ui')){
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-ledger-client.mjs') -Destination C:\MuLab\ledger-client.mjs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ProtectedLedger.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HostComponents.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ImageCache.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ImageCache.cs -ToSession $session -Force
-  foreach($name in @('ResourceMetrics.cs','Resources.cs','Recovery.cs','RecoveryPermissions.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
+  foreach($name in @('ResourceMetrics.cs','Resources.cs','Recovery.cs','RecoveryPermissions.cs','PowerWatch.cs','PowerProtection.cs','HyperVChannel.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-channel.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-channel.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-broker.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-broker.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/broker.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js -ToSession $session -Force
   if($Phase -in @('cache','cache-ui')){
@@ -396,7 +426,7 @@ try{
   $manifest=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json
   if((Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.nodeSha256){throw 'Packaged Node digest changed'}
   if((Get-FileHash -LiteralPath C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.hostScriptSha256){throw 'Packaged servicing script changed'}
-  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny') -or $phase.StartsWith('resource-') -or $phase.StartsWith('adoption-')){
+  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','resource-seed','resource-disk','resource-memory','resource-recover','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny') -or $phase.StartsWith('resource-') -or $phase.StartsWith('adoption-') -or $phase.StartsWith('power-')){
    $build=@'
 import {buildBroker} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/broker.js';
 import {writeFile} from 'node:fs/promises';
@@ -487,6 +517,9 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
    if($agent.HasExited -and $phase -ne 'ledger-deny'){throw ('Protected broker exited: '+[IO.File]::ReadAllText(('C:\MuLab\private\'+$phase+'-broker-stderr.log')))}
    if($probeClock.ElapsedMilliseconds -gt 3900000){throw 'Servicing or the client is still running; no process or VM was stopped'}
    if($phase -eq 'network'){Invoke-SyntheticNetworkRequests}
+   if($phase -eq 'power-run' -and -not $handled.ContainsKey('native-pause') -and (Test-Path -LiteralPath C:\MuLab\public\power-pause-request.json)){
+    $request=Get-Content -LiteralPath C:\MuLab\public\power-pause-request.json -Raw|ConvertFrom-Json;if($request.nonce -eq $nonce){& ([ScriptBlock]::Create($operatorSource)) -Action broker-pause -Nonce $nonce -OwnerPid $ownerPid|Out-Null;$handled['native-pause']=$true}
+   }
    if($phase -in @('adoption-review','adoption-approve','adoption-ui')){
     foreach($action in @('inspect-plan','change-seed','restore-seed','break-acl','restore-acl','break-permissions','restore-permissions','add-dependency','remove-dependency','inspect-adopted')){
      $name='adoption-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'

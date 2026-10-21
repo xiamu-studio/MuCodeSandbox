@@ -62,7 +62,8 @@
 - [x] 隔离 Windows 11 IoT LTSC 评估 VM 中真实安装缺失 Hyper-V、仅重启测试 VM，以普通用户及另一管理员身份验证后端，再运行嵌套 Linux 并清理（3+5 项）；OpenSSH 在系统镜像中预装，详见 [全新 Windows 验收](windows-clean-host-validation.md)。
 - [x] 缺失 OpenSSH 客户端的真实移除、断网失败关闭、微软 FoD 源实际安装及重新检测后嵌套 Linux 启动（3+5 项）；修复无效 DISM 参数及未就绪时错误完成的路径，详见 [OpenSSH 验收](windows-openssh-validation.md)。
 - [x] 独立 Windows 预览版号、跨版本安装/修复/受支持版本降级拒绝；8 项安装链路、18 项真实 VM/原盘数据检查及 139 项自动测试，详见 [升级验收](windows-upgrade-validation.md)。
-- [ ] 第二台 Windows 11 Pro、控制面板/交互式向导，以及安装中断恢复与更多历史升级矩阵。
+- [x] 安装进程中断后的原程序/登记恢复、首次安装和旧版升级重试、未完成文件保留及原 DPAPI/SQLite 配置读回，详见 [安装中断恢复](windows-installer-recovery.md)。
+- [ ] 第二台 Windows 11 Pro、控制面板/交互式向导、真实断电恢复及更多历史升级矩阵。
 - [ ] Windows 实机全流程及第二环境回归。
 - [ ] Mac 共享接口变化的真实回归；无 Mac 实机时不得声称已通过。
 - [ ] 如需正式签名，用户提供代码签名身份后执行；测试包和正式发行分开标注。

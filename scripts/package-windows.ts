@@ -16,5 +16,11 @@ const versionScript=path.join(stage.directory,'check-install-version.ps1');await
 const versionLoader="$ErrorActionPreference='Stop';try{& ([ScriptBlock]::Create([IO.File]::ReadAllText($env:MU_WINDOWS_VERSION_SCRIPT)))}catch{exit 5}";
 const nsisVersionPath=versionScript.split('$').join('$$').split('"').join('$\\"');
 await writeFile(include,template.replace('@MU_WINDOWS_RUNNING_CHECK@',Buffer.from(check,'utf16le').toString('base64')).replace('@MU_WINDOWS_VERSION_CHECK@',Buffer.from(versionLoader,'utf16le').toString('base64')).replace('@MU_WINDOWS_VERSION_CHECK_FILE@',()=>nsisVersionPath));
+const transactionScript=path.join(stage.directory,'install-transaction.ps1');
+await writeFile(transactionScript,await readFile(path.join(root,'desktop/windows/install-transaction.ps1'),'utf8'));
+const transactionLoader="$ErrorActionPreference='Stop';try{& ([ScriptBlock]::Create([IO.File]::ReadAllText($env:MU_WINDOWS_TRANSACTION_SCRIPT)))}catch{exit 6}";
+const stagedInclude=await readFile(include,'utf8');
+if(stagedInclude.split('@MU_WINDOWS_TRANSACTION_LOADER@').length!==2||stagedInclude.split('@MU_WINDOWS_TRANSACTION_FILE@').length!==2)throw Error('Installer transaction placeholders changed');
+await writeFile(include,stagedInclude.replace('@MU_WINDOWS_TRANSACTION_LOADER@',Buffer.from(transactionLoader,'utf16le').toString('base64')).replace('@MU_WINDOWS_TRANSACTION_FILE@',()=>transactionScript.split('$').join('$$').split('"').join('$\\"')));
 const result=await build({projectDir:stage.app,targets:Platform.WINDOWS.createTarget([target],Arch.x64),config:{...base,buildVersion:stage.release.fileVersion,directories:{app:stage.app,output},electronVersion:stage.electronVersion,electronDist:path.dirname(stage.electron),win:{...base.win,icon:path.join(root,'assets/icon.png')},nsis:{...base.nsis,include},extraResources:[{from:stage.node,to:'node',filter:['node.exe','LICENSE']},{from:stage.manifest,to:'windows-runtime-manifest.json'}],publish:null}});
 await writeFile(path.resolve('.mu-data/windows-run/desktop-package.json'),JSON.stringify({stage,output,artifacts:result},null,2));console.log(JSON.stringify({output,artifacts:result}));

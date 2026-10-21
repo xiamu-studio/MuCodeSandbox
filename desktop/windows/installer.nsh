@@ -16,6 +16,35 @@
   ClearErrors
 !macroend
 
+!macro customInit
+  ; The old uninstaller removes its registration. The separate locator lets
+  ; a retry without /D find the interrupted target rather than a new default.
+  ReadRegStr $R7 HKCU "Software\MuCodeSandbox\WindowsPreviewInstaller\${APP_GUID}" TransactionRoot
+  ${If} $R7 != ""
+    !insertmacro GetDParameter $R0
+    ${If} $R0 == ""
+      StrCpy $INSTDIR $R7
+    ${EndIf}
+  ${EndIf}
+  SetOutPath $TEMP
+!macroend
+
+!macro MuInstallTransaction ACTION
+  System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_TRANSACTION_ACTION", t "${ACTION}")'
+  DetailPrint "Windows Preview installation: ${ACTION}"
+  nsExec::ExecToStack /TIMEOUT=600000 '"$PowerShellPath" -NoLogo -NoProfile -NonInteractive -EncodedCommand @MU_WINDOWS_TRANSACTION_LOADER@'
+  Pop $R9
+  Pop $R8
+  !insertmacro MuInstallTrace "transaction-${ACTION}=$R9"
+  ${If} $R9 != 0
+    ${IfNot} ${Silent}
+      MessageBox MB_OK|MB_ICONEXCLAMATION "Installation recovery could not be verified. Close the application and retry this installer in the same directory. Existing backups and user data were preserved."
+    ${EndIf}
+    SetErrorLevel 6
+    Quit
+  ${EndIf}
+!macroend
+
 !macro customCheckAppRunning
   ; Check the selected installation only. Never terminate the management
   ; worker from an installer: its IPC shutdown must confirm VM stop first.
@@ -38,6 +67,14 @@
     Quit
   ${EndIf}
   !ifndef BUILD_UNINSTALLER
+    InitPluginsDir
+    SetOutPath $PLUGINSDIR
+    File "/oname=mu-install-transaction.ps1" "@MU_WINDOWS_TRANSACTION_FILE@"
+    System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_TRANSACTION_SCRIPT", t "$PLUGINSDIR\mu-install-transaction.ps1")'
+    System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_APP_GUID", t "${APP_GUID}")'
+    System::Call 'kernel32::GetCurrentProcessId()i.r4'
+    System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_INSTALL_PID", t "$4")'
+    !insertmacro MuInstallTransaction "recover"
     ; Check the installed and selected roots before the old uninstaller runs.
     ReadRegStr $R7 HKCU "${INSTALL_REGISTRY_KEY}" InstallLocation
     System::Call 'kernel32::SetEnvironmentVariable(t "MU_WINDOWS_REGISTERED_ROOT", t "$R7")'
@@ -63,10 +100,25 @@
       ${EndIf}
       Quit
     ${EndIf}
+    ; The directory page can select a new parent after .onInit. Create only the
+    ; already verified empty target before writing its sibling journal.
+    ClearErrors
+    CreateDirectory "$INSTDIR"
+    ${If} ${Errors}
+      SetErrorLevel 6
+      Quit
+    ${EndIf}
+    !insertmacro MuInstallTransaction "prepare"
   !endif
   ; The parent installer also held $INSTDIR as its working directory. Release
   ; that directory before its child uninstaller attempts the sibling rename.
   SetOutPath $TEMP
+!macroend
+
+!macro customInstall
+  ; Commit only after extraction and registration; interrupted cleanup cannot
+  ; roll back a successfully installed release.
+  !insertmacro MuInstallTransaction "commit"
 !macroend
 
 !macro customRemoveFiles

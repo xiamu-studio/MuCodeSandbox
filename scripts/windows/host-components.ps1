@@ -35,33 +35,41 @@ function Save-HostJob {
  try{$file.Write($bytes,0,$bytes.Length);$file.Flush($true)}finally{$file.Dispose()}
  [IO.File]::Replace($next,$TaskFile,[NullString]::Value)
 }
+function Save-HostChange([string]$name,[bool]$restartNeeded) {
+ $state.changed=@($state.changed)+$name
+ $state.restartNeeded=[bool]($state.restartNeeded -or $restartNeeded)
+ Save-HostJob
+}
 $lock=$null
 try {
  $lockFile=Join-Path $env:ProgramData 'MuCodeSandbox-HyperVBroker-v1/host-components.lock'
  $lock=[IO.File]::Open($lockFile,[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
  $before=Get-HostComponentStatus;$state.snapshot=$before;Save-HostJob
  if(-not $before.supported -or $before.firmwareVirtualization -ne $true -or $before.slat -ne $true){throw 'Unsupported host requirements'}
- $changed=@();$restart=$false
  if(-not $before.ready -and -not $before.restartRequired){
   if($before.hyperV -ne 'enabled' -or -not $before.managementModule){
    $state.phase='enable-hyperv';Save-HostJob
    $result=Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All -All -NoRestart -ErrorAction Stop
-   $restart=$restart -or [bool]$result.RestartNeeded;$changed+='hyperv'
+   Save-HostChange 'hyperv' ([bool]$result.RestartNeeded)
   }
   if(-not $before.sshClientPresent){
    $state.phase='install-ssh';Save-HostJob
    $result=Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0' -NoRestart -ErrorAction Stop
-   $restart=$restart -or [bool]$result.RestartNeeded;$changed+='ssh-client'
+   Save-HostChange 'ssh-client' ([bool]$result.RestartNeeded)
   }
   $middle=Get-HostComponentStatus
   if($middle.hypervisorPresent -and $middle.hyperV -eq 'enabled' -and -not $middle.vmmsRunning){
    $state.phase='start-service';Save-HostJob
-   Set-Service vmms -StartupType Automatic -ErrorAction Stop;Start-Service vmms -ErrorAction Stop;$changed+='vmms'
+   Set-Service vmms -StartupType Automatic -ErrorAction Stop;Start-Service vmms -ErrorAction Stop;Save-HostChange 'vmms' $false
   }
  }
- $after=Get-HostComponentStatus;$restart=$restart -or $after.restartRequired
- $state.snapshot=$after;$state.changed=@($changed);$state.restartNeeded=[bool]$restart;$state.bootId=$after.bootId;$state.status='completed';$state.phase='complete';$state.errorCode=$null;Save-HostJob
+ $after=Get-HostComponentStatus
+ $state.snapshot=$after;$state.restartNeeded=[bool]($state.restartNeeded -or $after.restartRequired);$state.bootId=$after.bootId;$state.status='completed';$state.phase='complete';$state.errorCode=$null;Save-HostJob
 }catch {
- try{[IO.File]::WriteAllText($TaskFile+'.error.log',($_.Exception.ToString()+[Environment]::NewLine+$_.ScriptStackTrace),[Text.UTF8Encoding]::new($false))}catch{}
- $state.status='failed';$state.phase='failed';$state.errorCode=[int]$_.Exception.HResult;Save-HostJob;exit 1
+ $failure=$_
+ # Servicing can finish one component before a later component fails. Preserve
+ # those durable receipts even when a fresh status query is also unavailable.
+ try{$after=Get-HostComponentStatus;$state.snapshot=$after;$state.restartNeeded=[bool]($state.restartNeeded -or $after.restartRequired)}catch{}
+ try{[IO.File]::WriteAllText($TaskFile+'.error.log',($failure.Exception.ToString()+[Environment]::NewLine+$failure.ScriptStackTrace),[Text.UTF8Encoding]::new($false))}catch{}
+ $state.status='failed';$state.phase='failed';$state.errorCode=[int]$failure.Exception.HResult;Save-HostJob;exit 1
 }finally{if($lock){$lock.Dispose()}}

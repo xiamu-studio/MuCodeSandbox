@@ -125,13 +125,34 @@ VNC 和 CDP 通过固定目标的 SSH stdio 流进入客体回环端口，Window
 
 图形验收命令为 `npm run windows:browser-lab -- --interactive`，会创建全新的空白 VM 并使用本地测试页。运行数据、测试 CA/NSS 数据库、截图和一次性启动链接均保存在受限的忽略目录中，不提交 Git。交互模式输出的本地查看信息位于 `.mu-data/windows-run/browser-lab-view.json`；完成画面和中文粘贴操作后，在其中 `marker` 指定的位置写入标记，脚本会核查实际客体文字，再执行故障与停机检查。
 
-当前已通过 52 项 Windows 本地测试、14 项共享显示/沙箱检查及 12 项真实浏览器验收：双本地出口、安装临时接口清理、导航前沙箱、原生语言/时区、受信任测试 CA 的 HTTPS、Canvas/Worker、真实画面尺寸、认证画面连接、浏览器上传/下载、手动中文剪贴板、故障撤销与确认停机。管理员入口及可选权限代理入口均已完成真实浏览器矩阵，报告绑定当次源码，测试期间源码未变，控制进程正常退出。
+当前已通过 57 项 Windows 本地测试、14 项共享显示/沙箱检查及 12 项真实浏览器验收：双本地出口、安装临时接口清理、导航前沙箱、原生语言/时区、受信任测试 CA 的 HTTPS、Canvas/Worker、真实画面尺寸、认证画面连接、浏览器上传/下载、手动中文剪贴板、故障撤销与确认停机。管理员入口及可选权限代理入口均已完成真实浏览器矩阵，报告绑定当次源码，测试期间源码未变，控制进程正常退出。
 
 测试曾出现一次本地 DNS/代理探测中断并触发确认停机，该次原因尚未复现定位。故障诊断会先断开业务出口，再保存本地日志。长期稳定性仍需后续验收，不能用几分钟的实测代替。
 
 组件来源：[Google Linux 签名密钥说明](https://www.google.com/linuxrepositories/)、[Google stable Release](https://dl.google.com/linux/chrome/deb/dists/stable/Release)、[TurboVNC 3.3.1](https://github.com/TurboVNC/turbovnc/releases/tag/3.3.1)。
 
 ## 验证与剩余项
+
+### 独立包级验收
+
+```powershell
+npm run windows:packet-lab
+npm run windows:verify-packets -- <运行数据根下的packet-lab任务目录>
+```
+
+需要已准备的 `protected-base.json`。普通用户控制器通过现有代理创建两个新的空白 VM；单独的诊断脚本经过 UAC 提权，仅操作本轮的 VM GUID、专属交换机和 Pktmon 会话，不加入产品权限代理的可调用操作，也不安装开机服务。已有 Pktmon 会话或筛选器时实验退出并保留原状态。
+
+宿主按被测 VM 的唯一 MAC 采集；另一个空白 VM 临时接入同一 Private 交换机，使用原始以太网套接字独立接收，交换机没有宿主端口或物理上联。两端均在被测 VM 开机前就绪。实测启动 DHCP 包在宿主被拒绝，接收端没有收到启动 IPv4/IPv6。之后直接注入绕过客体 IP 防火墙的 IPv4/IPv6 TCP、UDP、ICMP 帧，目标使用虚拟链路地址和文档保留地址，没有访问真实 LAN 或 AI 服务。
+
+核验前、业务许可开放时、恢复规则后三个阶段的 54 个带独立标识的 IP 帧，均在宿主丢弃记录中找到，接收端为零。业务许可开放时，本地 HTTPS 和受控 DoH 继续正常工作。允许对照先撤销业务许可和上游通道，只在这个无上联的实验交换机内临时移除被测 VM 的 IP ACL，接收端随即收到全部 21 个对照帧；恢复 ACL 后再次阻断。对照完成后恢复独立拓扑并删除本轮 VM，宿主网络指纹保持一致。
+
+本机 Pktmon 文件模式曾出现计数与输出不一致，验收固定使用 32 MiB 内存缓冲。诊断器保存独立 ETW 会话身份，停止前核验身份和自身筛选器；宿主 ETW 丢失计数及接收端套接字丢失计数必须为零。采集及转换在固定句柄保护的管理员目录完成，结束后才归还用户权限。原始 ETL、PCAP、接口元数据和报告仅保存在本机忽略目录，不提交 Git。
+
+10 项实机检查通过，独立解码器另外检查了 546 个实际记录的测试帧，核查 IP 及传输层校验和。日志包含同一包在多个组件的快照，快照数不等于送达数量；送达与否由接收端 PCAP 及逐包标识共同核验。原始数据和生产者源码摘要记录在任务目录，离线校验另保存输入文件及校验器摘要。
+
+此实验验证当前镜像与 Hyper-V 配置的启动/原始出站边界；真实网络切换、睡眠唤醒及其他 Windows 机器仍须单独验收。
+
+参考：[Microsoft Pktmon](https://learn.microsoft.com/en-us/windows-server/networking/technologies/pktmon/pktmon-syntax)、[ETW 会话属性](https://learn.microsoft.com/en-us/windows/desktop/ETW/event-trace-properties)、[pcapng 格式](https://datatracker.ietf.org/doc/draft-ietf-opsawg-pcapng/)、[Internet 校验和](https://www.rfc-editor.org/info/rfc1071/)。
 
 ```powershell
 npm run test:windows
@@ -148,7 +169,7 @@ npm run windows:service-lab -- <空白受保护基盘.vhdx> <SHA-256>
 
 浏览器界面操作检查使用合成后端，覆盖中文粘贴、上传和下载，不替代真实 VM 实验。旧的宿主 Python 文件往返测试在 Windows 上失败，原始 `main` 的独立副本同样失败；共享文件实现只调整运行时类型边界，其 Linux 实际行为通过 Hyper-V 客体验证。没有为旧测试修改 Mac 文件处理行为；真实 Mac 回归仍待安排。
 
-首包/逐包证据、真实切网/睡眠、完整日常功能与安装包仍须单独验收，不能由单测代替。例行关闭先断开出口，再限时同步客体磁盘并确认 Hyper-V 状态 Off；同步失败不能阻止强制停机。
+真实切网/睡眠、完整日常功能、安装包及跨机器包级回归仍须单独验收，不能由单测代替。例行关闭先断开出口，再限时同步客体磁盘并确认 Hyper-V 状态 Off；同步失败不能阻止强制停机。
 
 原有六组网络测试在 Windows 上为 27/39，原始 `main` 独立副本同为 27/39，失败项目一致，涉及 Unix curl 路径、目录 fsync 和旧的 4 秒超时断言。没有为掩盖这些基线失败修改 Mac 行为；真实 Mac 回归未进行。
 

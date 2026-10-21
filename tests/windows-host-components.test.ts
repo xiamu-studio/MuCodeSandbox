@@ -60,8 +60,8 @@ function Enable-WindowsOptionalFeature {
  [pscustomobject]@{RestartNeeded=$true}
 }
 function Add-WindowsCapability {
- [CmdletBinding()]param([switch]$Online,[string]$Name,[switch]$NoRestart)
- if(-not $Online -or -not $NoRestart -or $Name -ne 'OpenSSH.Client~~~~0.0.1.0'){throw 'Unexpected servicing operation'}
+ [CmdletBinding()]param([switch]$Online,[string]$Name)
+ if(-not $Online -or $Name -ne 'OpenSSH.Client~~~~0.0.1.0'){throw 'Unexpected servicing operation'}
  $saved=[IO.File]::ReadAllText($TaskFile) | ConvertFrom-Json
  [IO.File]::WriteAllText($TaskFile+'.before-ssh.json',($saved | ConvertTo-Json -Depth 8))
  throw [InvalidOperationException]::new('Synthetic SSH servicing failure')
@@ -74,4 +74,33 @@ function Add-WindowsCapability {
    if(!queryFails){assert.equal(after.snapshot.hyperV,'pending');assert.equal(after.snapshot.restartRequired,true);}
   }finally{const target=path.resolve(directory);assert.equal(path.dirname(target),path.resolve(tmpdir()));assert.match(path.basename(target),/^mu-host-job-/);await rm(target,{recursive:true,force:true});}
  }
+});
+
+test('Production servicing arguments exist on the installed Windows DISM cmdlets',{skip:process.platform!=='win32'},async()=>{
+ await run(powershellPath(),powershellArgs(`$ErrorActionPreference='Stop'
+$tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile('${path.resolve('scripts/windows/host-components.ps1').replaceAll("'","''")}',[ref]$tokens,[ref]$errors)
+if($errors.Count){throw 'Invalid servicing source'}
+$commands=@($ast.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -in @('Enable-WindowsOptionalFeature','Add-WindowsCapability')},$true))
+if($commands.Count -ne 2){throw 'Expected both fixed servicing operations'}
+foreach($command in $commands){
+ $metadata=Get-Command -Name $command.GetCommandName() -Module Dism -CommandType Cmdlet
+ foreach($parameter in @($command.CommandElements | Where-Object {$_ -is [Management.Automation.Language.CommandParameterAst]})){
+  if(-not $metadata.Parameters.ContainsKey($parameter.ParameterName)){throw ('Unsupported DISM argument: '+$metadata.Name+' -'+$parameter.ParameterName)}
+ }
+}`),{timeoutMs:15000});
+});
+
+test('A silent capability installation failure cannot produce a completed preparation receipt',{skip:process.platform!=='win32'},async()=>{
+ const directory=await mkdtemp(path.join(tmpdir(),'mu-host-incomplete-')),task=path.join(directory,'host-components','job-'+randomUUID()+'.json');
+ try{
+  await mkdir(path.dirname(task));await mkdir(path.join(directory,'MuCodeSandbox-HyperVBroker-v1'));
+  await writeFile(task,JSON.stringify({status:'starting',phase:'checking',processId:0,processStart:'',snapshot:null,changed:[],restartNeeded:false,bootId:'unchanged-boot',errorCode:null}));
+  await assert.rejects(run(powershellPath(),powershellArgs(`$ErrorActionPreference='Stop';$env:ProgramData='${directory.replaceAll("'","''")}';$TaskFile='${task.replaceAll("'","''")}';$Action='prepare'
+$tokens=$null;$errors=$null;$ast=[Management.Automation.Language.Parser]::ParseFile('${path.resolve('scripts/windows/host-components.ps1').replaceAll("'","''")}',[ref]$tokens,[ref]$errors);if($errors.Count){throw 'Invalid servicing source'}
+$statements=@($ast.EndBlock.Statements);$start=-1;for($i=0;$i -lt $statements.Count;$i++){if($statements[$i].Extent.Text.StartsWith('if($Action -eq ''status'')')){$start=$i;break}};if($start -lt 0){throw 'Preparation entry missing'}
+function Get-HostComponentStatus {[ordered]@{supported=$true;firmwareVirtualization=$true;slat=$true;ready=$false;restartRequired=$false;hyperV='enabled';managementModule=$true;sshClientPresent=$false;sshCapability='missing';hypervisorPresent=$true;vmmsRunning=$true;bootId='unchanged-boot'}}
+function Add-WindowsCapability {[CmdletBinding()]param([switch]$Online,[string]$Name);[pscustomobject]@{RestartNeeded=$false}}
+& ([ScriptBlock]::Create(($statements[$start..($statements.Count-1)] | ForEach-Object {$_.Extent.Text}) -join [Environment]::NewLine))`),{timeoutMs:10000}),{code:'PROCESS_FAILED'});
+  const state=JSON.parse(await readFile(task,'utf8'));assert.equal(state.status,'failed');assert.equal(state.restartNeeded,false);assert.equal(state.snapshot.sshClientPresent,false);assert.equal(state.bootId,'unchanged-boot');
+ }finally{const target=path.resolve(directory);assert.equal(path.dirname(target),path.resolve(tmpdir()));assert.match(path.basename(target),/^mu-host-incomplete-/);await rm(target,{recursive:true,force:true});}
 });

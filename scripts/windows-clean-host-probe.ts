@@ -6,7 +6,7 @@ import {powershellPath,powershellArgs} from '../server/platform/windows/runtime.
 import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 
 const phase=process.argv[2];
-assert.ok(['before-reboot','after-reboot','inspect','oobe','reset-hyperv','collect-stop','pe-boot','pe-resume','console','oobe-enter'].includes(phase),'Choose an explicit clean-host diagnostic phase');
+assert.ok(['before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','oobe','reset-hyperv','collect-stop','pe-boot','pe-resume','console','oobe-enter'].includes(phase),'Choose an explicit clean-host diagnostic phase');
 const lab=JSON.parse(await readFile('.mu-data/windows-run/clean-host-lab.json','utf8')),directory=path.resolve(lab.directory);
 assert.equal(path.dirname(directory),path.resolve(windowsRuntimeDirectory()));
 assert.match(path.basename(directory),/^clean-host-[a-f0-9-]{36}$/);

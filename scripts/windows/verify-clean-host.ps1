@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -33,12 +33,147 @@ function Connect-LabGuest {
  }while($true)
 }
 try{
- Assert-LabVM | Out-Null;Save-Probe 'connecting'
+ $selected=Assert-LabVM
+ if($Phase -in @('ssh-inspect','network-prepare') -and $selected.State -eq 'Off'){Start-VM -VM $selected | Out-Null}
+ Save-Probe 'connecting'
  $session=Connect-LabGuest
  $initial=Invoke-Command -Session $session -ScriptBlock {
   if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Synthetic guest administrator required'}
   if(-not (Test-Path -LiteralPath C:\MuLab\public\provisioned.json)){throw 'Guest bootstrap is incomplete'}
   [ordered]@{bootId=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');hypervisor=[bool](Get-CimInstance Win32_ComputerSystem).HypervisorPresent;edition=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID}
+ }
+ if($Phase -eq 'network-inspect'){
+  $evidence=Invoke-Command -Session $session -ScriptBlock {$outer=Get-NetAdapter | Where-Object {$_.InterfaceDescription -eq 'Microsoft Hyper-V Network Adapter'};@{switches=@(Get-VMSwitch | Select-Object Name,Id,SwitchType);adapters=@(Get-NetAdapter -IncludeHidden | Select-Object Name,InterfaceGuid,InterfaceDescription,Status,MacAddress,ifIndex);outerDns=@(Get-DnsClientServerAddress -InterfaceIndex $outer.ifIndex | Select-Object AddressFamily,ServerAddresses);outerIp=@(Get-NetIPAddress -InterfaceIndex $outer.ifIndex | Select-Object AddressFamily,IPAddress,PrefixOrigin);outerDhcp=[string](Get-NetIPInterface -InterfaceIndex $outer.ifIndex -AddressFamily IPv4).Dhcp;nested=@(Get-VM | Select-Object Name,@{Name='state';Expression={[string]$_.State}});networkReceipts=@(Get-ChildItem -LiteralPath C:\MuLab\approved -File -Filter 'network-*.json' | Select-Object Name,LastWriteTime)}}
+  Save-Probe 'network-inventory-complete' $evidence;exit 0
+ }
+ if($Phase -eq 'network-prepare'){
+  $inputs=Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../.mu-data/windows-run/clean-host-network-inputs.json') -Raw | ConvertFrom-Json
+  $inputsDirectory=[IO.Path]::GetFullPath($inputs.directory)
+  if([IO.Path]::GetDirectoryName($inputsDirectory) -ne [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../.mu-data/windows-clean-host-assets')) -or [IO.Path]::GetFileName($inputsDirectory) -notmatch '^network-[a-f0-9-]{36}$'){throw 'Synthetic TLS fixture boundary changed'}
+  foreach($name in @('fixture-key.pem','fixture-cert.pem','local-fixtures.js')){if((Get-FileHash -LiteralPath (Join-Path $inputsDirectory $name) -Algorithm SHA256).Hash.ToLowerInvariant() -ne $inputs.hashes.$name){throw 'Synthetic TLS input changed'}}
+  Invoke-Command -Session $session -ScriptBlock {if(@(Get-VM).Count -or (Get-VMSwitch -Name MuCleanNetwork -ErrorAction SilentlyContinue)){throw 'Network acceptance requires empty dedicated resources'};New-Item -ItemType Directory -Path C:\MuLab\network-fixtures -Force | Out-Null}
+  foreach($name in @('fixture-key.pem','fixture-cert.pem')){Copy-Item -LiteralPath (Join-Path $inputsDirectory $name) -Destination ('C:\MuLab\network-fixtures\'+$name) -ToSession $session -Force}
+  Copy-Item -LiteralPath (Join-Path $inputsDirectory 'local-fixtures.js') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\local-fixtures.js -ToSession $session -Force
+  $outerAdapters=@(Get-VMNetworkAdapter -VM (Assert-LabVM));if($outerAdapters.Count -ne 1){throw 'Exactly one disconnected evaluation NIC is required'}
+  $evidence=Invoke-Command -Session $session -ArgumentList $outerAdapters[0].MacAddress -ScriptBlock {
+   param($mac) $ErrorActionPreference='Stop'
+   if(Test-Path -LiteralPath C:\MuLab\approved\network-adapter.json){throw 'Network preparation evidence already exists; inspect it instead of replacing it'}
+   $adapters=@(Get-NetAdapter | Where-Object {$_.MacAddress.Replace('-','') -eq $mac});if($adapters.Count -ne 1){throw 'Cannot uniquely bind the evaluation NIC'};$adapter=$adapters[0]
+   $dhcp=[string](Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).Dhcp
+   $dns4=@((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).ServerAddresses);$dns6=@((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv6).ServerAddresses)
+   $legacy=@('fec0:0:0:ffff::1','fec0:0:0:ffff::2','fec0:0:0:ffff::3')
+   if($adapter.Status -ne 'Disconnected' -or $dhcp -ne 'Enabled' -or $dns4.Count -or ($dns6.Count -and ($dns6 -join ',') -ne ($legacy -join ',')) -or @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.PrefixOrigin -eq 'Manual'}).Count){throw 'Only the unused DHCP evaluation NIC may be changed'}
+   $record=@{interfaceGuid=[string]$adapter.InterfaceGuid;name=$adapter.Name;originalDhcp=$dhcp;originalDnsDefault=$true;originalDns6=$dns6;scope='the-outer-disconnected-nic-inside-the-windows-evaluation-guest'}
+   [IO.File]::WriteAllText('C:\MuLab\approved\network-adapter.json',($record | ConvertTo-Json -Compress))
+   New-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress 192.0.2.1 -PrefixLength 24 -AddressFamily IPv4 -PolicyStore ActiveStore | Out-Null
+   return $record
+  }
+  Save-Probe 'synthetic-windows-network-prepared' $evidence;exit 0
+ }
+ if($Phase -eq 'network-collect'){
+  $evidence=Invoke-Command -Session $session -ScriptBlock {
+   $ErrorActionPreference='Stop';$result=Get-Content -LiteralPath C:\MuLab\approved\network-result.json -Raw | ConvertFrom-Json
+   if(-not $result.complete -or -not $result.nested.removed -or @($result.nested.cases).Count -ne 3){throw 'All actual Windows network cases must pass'}
+   $kinds=@($result.nested.cases | ForEach-Object {$_.kind} | Sort-Object);if(($kinds -join ',') -ne 'dns,link,route'){throw 'The three distinct Windows transitions are required'}
+   foreach($case in $result.nested.cases){
+    if(-not $case.started -or -not $case.detected -or -not $case.confirmedOff -or -not $case.removed){throw 'A Windows transition was not fully verified'}
+    $receipt=Get-Content -LiteralPath ('C:\MuLab\approved\network-'+$case.kind+'-mutate.json') -Raw | ConvertFrom-Json
+    if(-not $receipt.complete -or $receipt.nonce -ne $result.nonce -or $receipt.operation -ne 'mutate' -or $receipt.kind -ne $case.kind){throw 'The privileged network mutation receipt differs from the current owner result'}
+   }
+   if(@(Get-VM).Count){throw 'Nested VMs still remain'}
+   $sid=(Get-LocalUser -Name MuLabUser).SID.Value;if(@(Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object {$_.SID.Value -eq $sid}).Count){throw 'The application user must remain ordinary'}
+   $record=Get-Content -LiteralPath C:\MuLab\approved\network-adapter.json -Raw | ConvertFrom-Json
+   $adapter=Get-NetAdapter -Name $record.name;if([string]$adapter.InterfaceGuid -ne $record.interfaceGuid -or $record.originalDhcp -ne 'Enabled' -or -not $record.originalDnsDefault){throw 'The diagnostic NIC identity changed'}
+   if($adapter.Status -eq 'Disabled'){Enable-NetAdapter -Name $record.name -Confirm:$false}
+   foreach($route in @(Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '198.51.100.0/24' -ErrorAction SilentlyContinue)){if($route.NextHop -ne '0.0.0.0' -or $route.RouteMetric -ne 1919){throw 'Unexpected synthetic route'};Remove-NetRoute -InputObject $route -Confirm:$false}
+   Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress 192.0.2.1 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false
+   Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -Dhcp Enabled;Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ResetServerAddresses
+   if((Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).Dhcp -ne 'Enabled' -or @(Get-NetIPAddress -InterfaceIndex $adapter.ifIndex -IPAddress 192.0.2.1 -ErrorAction SilentlyContinue).Count -or @((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4).ServerAddresses).Count -or (@((Get-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv6).ServerAddresses) -join ',') -ne (@($record.originalDns6) -join ',')){throw 'Original diagnostic NIC configuration was not restored'}
+   $hashes=@{};foreach($file in @('C:\MuLab\client.mjs','C:\MuLab\network-client.mjs','C:\MuLab\product\resources\app\dist-server\scripts\windows\local-fixtures.js','C:\MuLab\product\resources\app\dist-server\server\platform\windows\service.js','C:\MuLab\product\resources\app\dist-server\server\platform\windows\monitor.js','C:\MuLab\product\resources\app\dist-server\server\platform\windows\manager.js','C:\MuLab\product\resources\app\dist-server\server\platform\windows\runtime.js')){$hashes[$file]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()}
+   @{result=$result;sourceHashes=$hashes;nestedGuestsRemaining=0;evaluationNicRestored=$true;physicalNetworkSwitchTested=$false;actualOsSleepTested=$false;aiWebsitesVisited=0}
+  }
+  Assert-LabVM | Out-Null;Save-Probe 'network-evidence-collected' $evidence
+  try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+  Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$until=[DateTime]::UtcNow.AddMinutes(2)
+  do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'network-complete-and-evaluation-vm-off' $evidence;exit 0};if([DateTime]::UtcNow -gt $until){throw 'The evaluation VM has not confirmed shutdown'};Start-Sleep -Seconds 2}while($true)
+ }
+ if($Phase -eq 'ssh-inspect'){
+  $evidence=Invoke-Command -Session $session -ScriptBlock {
+   $ErrorActionPreference='Stop'
+   @{capability=[string](Get-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0').State;hyperV=[string](Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All).State;nestedGuests=@(Get-VM).Count;sshFile=(Test-Path -LiteralPath C:\Windows\System32\OpenSSH\ssh.exe);packages=@(Get-WindowsPackage -Online | Where-Object {$_.PackageName -match 'OpenSSH'} | Select-Object PackageName,PackageState);sources=@(Get-ChildItem -LiteralPath C:\Windows\servicing\Packages -Filter '*OpenSSH*' | Select-Object Name,Length);pendingReboot=(Test-Path -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending');bootId=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');servicing=@(Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*'} | Select-Object ProcessId)}
+  }
+  Save-Probe 'ssh-inventory-complete' $evidence;exit 0
+ }
+ if($Phase -eq 'ssh-remove'){
+  Save-Probe 'removing-only-the-evaluation-guest-ssh-client'
+  $removed=Invoke-Command -Session $session -ScriptBlock {
+   $ErrorActionPreference='Stop'
+   if(@(Get-VM).Count){throw 'The isolated evaluation guest must contain no nested VMs'}
+   if(@(Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*'}).Count){throw 'Windows servicing is still running'}
+   $capability=Get-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0'
+   if($capability.State -ne 'Installed'){throw 'Inspect the previous removal instead of repeating it'}
+   if(Test-Path -LiteralPath C:\MuLab\approved\ssh-removal.json){throw 'SSH removal evidence already exists; inspect it before another attempt'}
+   $startup='C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\MuCleanHostProbe.lnk'
+   if(Test-Path -LiteralPath $startup){if(Test-Path -LiteralPath C:\MuLab\private\ssh-prior-startup.lnk){throw 'Prior startup evidence already exists'};Move-Item -LiteralPath $startup -Destination C:\MuLab\private\ssh-prior-startup.lnk}
+   $before=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+   $r=Remove-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0' -ErrorAction Stop
+   $result=@{restartNeeded=[bool]$r.RestartNeeded;capability=[string](Get-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0').State;sshFile=(Test-Path -LiteralPath C:\Windows\System32\OpenSSH\ssh.exe);keygenFile=(Test-Path -LiteralPath C:\Windows\System32\OpenSSH\ssh-keygen.exe);bootBefore=$before;bootAfter=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');scope='only-disconnected-evaluation-guest'}
+   [IO.File]::WriteAllText('C:\MuLab\approved\ssh-removal.json',($result | ConvertTo-Json -Compress));return $result
+  }
+  Save-Probe 'ssh-client-removed-from-evaluation-guest' $removed;exit 0
+ }
+ if($Phase -eq 'ssh-source'){
+  # Fixed diagnostic-only source. Production servicing still uses Windows'
+  # configured component source and never accepts caller-selected packages.
+  $cab=Join-Path $PSScriptRoot '../../.mu-data/windows-clean-host-assets/fod-26100/OpenSSH-Client-Package~31bf3856ad364e35~amd64~~.cab'
+  if((Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash.ToLowerInvariant() -ne '6d2259ebe546ff24c7a54fd40b8e14988b66dcc76968324c9839568d617e9256'){throw 'Pinned official client CAB changed'}
+  Invoke-Command -Session $session -ScriptBlock {
+   if(@(Get-VM).Count -or @(Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*'}).Count){throw 'Guests or servicing still remain'}
+   if((Get-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0').State -ne 'NotPresent'){throw 'This test requires an actually missing client'}
+   New-Item -ItemType Directory -Path C:\MuLab\private\fod -ErrorAction Stop | Out-Null
+  }
+  Copy-Item -LiteralPath $cab -Destination C:\MuLab\private\fod\OpenSSH-Client-Package~31bf3856ad364e35~amd64~~.cab -ToSession $session
+  $evidence=Invoke-Command -Session $session -ScriptBlock {
+   $ErrorActionPreference='Stop';$cab='C:\MuLab\private\fod\OpenSSH-Client-Package~31bf3856ad364e35~amd64~~.cab'
+   if((Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash.ToLowerInvariant() -ne '6d2259ebe546ff24c7a54fd40b8e14988b66dcc76968324c9839568d617e9256'){throw 'Guest CAB digest mismatch'}
+   $policy='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Servicing'
+   if(Test-Path -LiteralPath $policy){throw 'Do not replace an existing component source policy'}
+   New-Item -Path $policy -Force | Out-Null;New-ItemProperty -LiteralPath $policy -Name LocalSourcePath -Value C:\MuLab\private\fod -PropertyType ExpandString | Out-Null
+   @{cabSha256='6d2259ebe546ff24c7a54fd40b8e14988b66dcc76968324c9839568d617e9256';source='Microsoft official Windows 11 24H2 FoD';policyScope='only-empty-evaluation-guest';productionScriptUnchanged=$true;networkDisconnected=$true}
+  }
+  Save-Probe 'offline-component-source-prepared' $evidence;exit 0
+ }
+ if($Phase -eq 'ssh-collect'){
+  $evidence=Invoke-Command -Session $session -ScriptBlock {
+   $ErrorActionPreference='Stop'
+   $removed=Get-Content -LiteralPath C:\MuLab\approved\ssh-removal.json -Raw | ConvertFrom-Json
+   $installed=Get-Content -LiteralPath C:\MuLab\approved\ssh-install-result.json -Raw | ConvertFrom-Json
+   $ready=Get-Content -LiteralPath C:\MuLab\approved\ssh-ready-result.json -Raw | ConvertFrom-Json
+   $sid=(Get-LocalUser -Name MuLabUser).SID.Value;$id=[guid]$installed.after.operation.id
+   $job=Get-Content -LiteralPath (Join-Path $env:ProgramData ('MuCodeSandbox-HyperVBroker-v1/users/'+$sid+'/host-components/job-'+$id.ToString('D')+'.json')) -Raw | ConvertFrom-Json
+   if(-not $installed.complete -or -not $ready.complete -or -not $installed.actualSshInstallationExercised -or -not $ready.nested.removed -or $job.status -ne 'completed' -or $job.changed -notcontains 'ssh-client' -or $removed.sshFile -or $removed.keygenFile){throw 'Actual missing-client installation and nested Linux acceptance must pass'}
+   $offline=$null
+   foreach($file in @(Get-ChildItem -LiteralPath C:\MuLab\private -File -Filter '*-ssh-install-result.json')){
+    $prior=Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+    if($prior.before.sshClientPresent -eq $false -and $prior.after.sshClientPresent -eq $false -and $prior.after.runtimeActive -eq $false -and $prior.after.operation.status -eq 'failed' -and $prior.after.operation.errorCode -eq -2145107924){
+     $failedId=[guid]$prior.after.operation.id;$failedJob=Get-Content -LiteralPath (Join-Path $env:ProgramData ('MuCodeSandbox-HyperVBroker-v1/users/'+$sid+'/host-components/job-'+$failedId.ToString('D')+'.json')) -Raw | ConvertFrom-Json
+     if($failedJob.status -eq 'failed' -and $failedJob.errorCode -eq -2145107924 -and $failedJob.bootId -eq $prior.before.bootId){$offline=@{operation=$prior.after.operation;runtimeActive=$false;ready=$false;protectedReceiptMatches=$true};break}
+    }
+   }
+   if(-not $offline){throw 'The disconnected-source failure must also have a protected matching receipt'}
+   if(@(Get-VM).Count -or @(Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*'}).Count){throw 'Nested guests or servicing still remain'}
+   if(@(Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object {$_.SID.Value -eq $sid}).Count){throw 'The application user must remain a standard user'}
+   $policy='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Servicing'
+   $key=Get-Item -LiteralPath $policy
+   if($key.GetValue('LocalSourcePath') -ne 'C:\MuLab\private\fod' -or @($key.GetValueNames()).Count -ne 1 -or $key.SubKeyCount){throw 'The synthetic component policy changed; preserve it for inspection'}
+   Remove-Item -LiteralPath $policy
+   $hashes=@{};foreach($file in @('C:\MuLab\client.mjs','C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1','C:\MuLab\product\resources\app\dist-server\native\windows\HyperVBroker.cs')){$hashes[$file]=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()}
+   @{removed=$removed;installed=$installed;ready=$ready;offlineFailure=$offline;protectedJob=$job;sourceHashes=$hashes;syntheticSourcePolicyRemoved=$true;components=@{ssh=[string](Get-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0').State;sshFile=(Test-Path -LiteralPath C:\Windows\System32\OpenSSH\ssh.exe);keygenFile=(Test-Path -LiteralPath C:\Windows\System32\OpenSSH\ssh-keygen.exe)};nestedGuestsRemaining=0;applicationIsAdministrator=$false;aiWebsitesVisited=0}
+  }
+  Assert-LabVM | Out-Null;Save-Probe 'ssh-evidence-collected' $evidence
+  try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+  Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$until=[DateTime]::UtcNow.AddMinutes(2)
+  do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'ssh-complete-and-evaluation-vm-off' $evidence;exit 0};if([DateTime]::UtcNow -gt $until){throw 'The evaluation VM has not confirmed shutdown'};Start-Sleep -Seconds 2}while($true)
  }
  if($Phase -eq 'collect-stop'){
   $evidence=Invoke-Command -Session $session -ScriptBlock {
@@ -120,6 +255,7 @@ try{
   }
  }
  Save-Probe 'preparing-standard-user-probe'
+ if($Phase -eq 'network'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-network-client.mjs') -Destination C:\MuLab\network-client.mjs -ToSession $session -Force}
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-client.mjs') -Destination C:\MuLab\client.mjs -ToSession $session -Force
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HyperVBroker.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HyperVBroker.cs -ToSession $session -Force
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'host-components.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -ToSession $session -Force
@@ -131,7 +267,7 @@ try{
   $manifest=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json
   if((Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.nodeSha256){throw 'Packaged Node digest changed'}
   if((Get-FileHash -LiteralPath C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.hostScriptSha256){throw 'Packaged servicing script changed'}
-  if($phase -in @('before-reboot','after-reboot')){
+  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network')){
    $build=@'
 import {buildBroker} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/broker.js';
 import {writeFile} from 'node:fs/promises';
@@ -173,8 +309,28 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
   $broker=Join-Path $bin $meta.brokerFile
   if((Get-FileHash -LiteralPath $broker -Algorithm SHA256).Hash.ToLowerInvariant() -ne $meta.brokerSha256){throw 'Protected broker digest mismatch'}
   $agent=Start-Process -FilePath $broker -ArgumentList @('--owner',[string]$ownerPid,'--pipe',$nonce,'--detect-host') -WorkingDirectory $bin -WindowStyle Hidden -RedirectStandardOutput ('C:\MuLab\private\'+$phase+'-broker-stdout.log') -RedirectStandardError ('C:\MuLab\private\'+$phase+'-broker-stderr.log') -PassThru
+  $handled=@{}
+  function Invoke-SyntheticNetworkRequests {
+   $record=Get-Content -LiteralPath C:\MuLab\approved\network-adapter.json -Raw | ConvertFrom-Json
+   $adapter=Get-NetAdapter -Name $record.name;if([string]$adapter.InterfaceGuid -ne $record.interfaceGuid){throw 'The synthetic interface changed'}
+   foreach($kind in @('link','dns','route')){foreach($operation in @('reset','mutate')){
+    $name='network-'+$kind+'-'+$operation;$file=Join-Path C:\MuLab\public ($name+'.json')
+    if($handled.ContainsKey($name) -or -not (Test-Path -LiteralPath $file)){continue}
+    $request=Get-Content -LiteralPath $file -Raw | ConvertFrom-Json;if($request.nonce -ne $nonce){continue}
+    if($request.kind -ne $kind -or $request.operation -ne $operation){throw 'Invalid synthetic network request'}
+    if($operation -eq 'reset'){
+     if($adapter.Status -eq 'Disabled'){Enable-NetAdapter -Name $record.name -Confirm:$false}
+     Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ResetServerAddresses
+     foreach($route in @(Get-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '198.51.100.0/24' -ErrorAction SilentlyContinue)){if($route.NextHop -ne '0.0.0.0' -or $route.RouteMetric -ne 1919){throw 'Unexpected synthetic route'};Remove-NetRoute -InputObject $route -Confirm:$false}
+     Start-Sleep -Seconds 2
+    }elseif($kind -eq 'link'){Disable-NetAdapter -Name $record.name -Confirm:$false}
+    elseif($kind -eq 'dns'){Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -ServerAddresses '203.0.113.53'}
+    else{New-NetRoute -InterfaceIndex $adapter.ifIndex -DestinationPrefix '198.51.100.0/24' -NextHop '0.0.0.0' -RouteMetric 1919 -PolicyStore ActiveStore | Out-Null}
+    [IO.File]::WriteAllText((Join-Path C:\MuLab\approved ($name+'.json')),(@{nonce=$nonce;kind=$kind;operation=$operation;complete=$true;scope='only-the-disconnected-nic-inside-the-windows-evaluation-guest'} | ConvertTo-Json -Compress));$handled[$name]=$true
+   }}
+  }
   $until=[DateTime]::UtcNow.AddMinutes(65);$resultFile='C:\MuLab\public\'+$phase+'-result.json'
-  do{if(Test-Path -LiteralPath $resultFile){$finished=[IO.File]::ReadAllText($resultFile) | ConvertFrom-Json;if($finished.pid -eq $ownerPid -and $finished.nonce -eq $nonce){New-Item -ItemType Directory -Path C:\MuLab\approved -Force | Out-Null;[IO.File]::WriteAllText(('C:\MuLab\approved\'+$phase+'-result.json'),($finished | ConvertTo-Json -Depth 16 -Compress));Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue;return $finished}};if($agent.HasExited){throw ('Protected broker exited: '+[IO.File]::ReadAllText(('C:\MuLab\private\'+$phase+'-broker-stderr.log')))};if([DateTime]::UtcNow -gt $until){throw 'Servicing or the client is still running; no process or VM was stopped'};Start-Sleep -Seconds 2}while($true)
+  do{if(Test-Path -LiteralPath $resultFile){$finished=[IO.File]::ReadAllText($resultFile) | ConvertFrom-Json;if($finished.pid -eq $ownerPid -and $finished.nonce -eq $nonce){New-Item -ItemType Directory -Path C:\MuLab\approved -Force | Out-Null;[IO.File]::WriteAllText(('C:\MuLab\approved\'+$phase+'-result.json'),($finished | ConvertTo-Json -Depth 16 -Compress));Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue;return $finished}};if($agent.HasExited){throw ('Protected broker exited: '+[IO.File]::ReadAllText(('C:\MuLab\private\'+$phase+'-broker-stderr.log')))};if([DateTime]::UtcNow -gt $until){throw 'Servicing or the client is still running; no process or VM was stopped'};if($phase -eq 'network'){Invoke-SyntheticNetworkRequests};Start-Sleep -Seconds 2}while($true)
  }
  Assert-LabVM | Out-Null;Save-Probe 'finished' $result;if(-not $result.complete){exit 2};exit 0
 }catch{Save-Probe 'failed' @{message=$_.Exception.Message};throw}

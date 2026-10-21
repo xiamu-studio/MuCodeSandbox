@@ -54,7 +54,9 @@ try {
   }
   if(-not $before.sshClientPresent){
    $state.phase='install-ssh';Save-HostJob
-   $result=Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0' -NoRestart -ErrorAction Stop
+   # Unlike Enable-WindowsOptionalFeature, this DISM cmdlet has no NoRestart
+   # parameter. It returns RestartNeeded; the application never reboots Windows.
+   $result=Add-WindowsCapability -Online -Name 'OpenSSH.Client~~~~0.0.1.0' -ErrorAction Stop
    Save-HostChange 'ssh-client' ([bool]$result.RestartNeeded)
   }
   $middle=Get-HostComponentStatus
@@ -64,6 +66,7 @@ try {
   }
  }
  $after=Get-HostComponentStatus
+ if(-not $after.ready -and -not $state.restartNeeded -and -not $after.restartRequired){throw [InvalidOperationException]::new('Windows component installation did not produce a ready host or a pending reboot')}
  $state.snapshot=$after;$state.restartNeeded=[bool]($state.restartNeeded -or $after.restartRequired);$state.bootId=$after.bootId;$state.status='completed';$state.phase='complete';$state.errorCode=$null;Save-HostJob
 }catch {
  $failure=$_

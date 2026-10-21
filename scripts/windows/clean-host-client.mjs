@@ -9,7 +9,7 @@ import {HyperVBrokerClient,brokerSourceDigest} from 'file:///C:/MuLab/product/re
 import {HyperVRuntime} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/runtime.js';
 import {windowsConfigSchema} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/config.js';
 
-const phase=process.argv[2];assert.ok(['before-reboot','after-reboot'].includes(phase));
+const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network'].includes(phase));
 const directory='C:/MuLab/public',nonce=randomBytes(32).toString('hex'),client=new HyperVBrokerClient(nonce);
 let complete=false;const checks=[];let before,after,error,nested;
 const pass=name=>checks.push({name,passed:true});
@@ -19,10 +19,19 @@ try{
  for(;;){try{const hello=await client.hello();assert.equal(hello.sourceDigest,await brokerSourceDigest());pass('The protected production broker is bound to this standard-user process and the packaged source');break;}catch(failure){if(failure.code!=='BROKER_UNAVAILABLE'||performance.now()>deadline)throw failure;await delay(500);}}
  before=await client.call('host-status',{}, {timeoutMs:90000});
  assert.equal(before.supported,true);assert.equal(before.firmwareVirtualization,true);assert.equal(before.slat,true);
- if(phase==='before-reboot'){
-  assert.equal(before.hyperV,'disabled');assert.equal(before.runtimeActive,false);
+ if(phase==='network'){
+  assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);
+  const {networkAcceptance}=await import('file:///C:/MuLab/network-client.mjs');
+  nested=await networkAcceptance(client,nonce,pass);
+ }else if(phase==='before-reboot'||phase==='ssh-install'){
+  assert.equal(before.hyperV,phase==='before-reboot'?'disabled':'enabled');assert.equal(before.runtimeActive,false);
+  if(phase==='ssh-install'){
+   const removal=JSON.parse(await readFile('C:/MuLab/approved/ssh-removal.json','utf8'));
+   assert.equal(removal.capability,'NotPresent');assert.equal(removal.sshFile,false);assert.equal(removal.keygenFile,false);
+   assert.equal(before.sshClientPresent,false);assert.equal(before.sshCapability,'missing');assert.equal(before.restartRequired,false);
+  }
   await assert.rejects(client.call('start',{id:'12345678-1234-4234-8234-123456789012'}),{code:'DENIED'});
-  pass('A fresh Windows installation has no Hyper-V runtime authority');
+  pass('Missing system components keep this detected-host session unable to run VMs');
   await client.call('prepare-host',{}, {timeoutMs:90000});
   // A timeout does not cancel Windows servicing. Leave its guest running and
   // report incomplete rather than killing DISM or restarting during servicing.
@@ -32,19 +41,25 @@ try{
    if(!['starting','running'].includes(after.operation?.status))break;
    assert.ok(performance.now()<until,'Component servicing is still running; do not restart this VM');await delay(2000);
   }
-  assert.equal(after.bootId,before.bootId);assert.equal(after.restartRequired,true);
-  assert.ok(after.operation?.changed.includes('hyperv'));
-  assert.ok(['enabled','pending'].includes(after.hyperV));
-  pass('Hyper-V was actually installed with a durable receipt and without an automatic reboot');
+  assert.equal(after.bootId,before.bootId);
+  if(phase==='before-reboot'){
+   assert.equal(after.restartRequired,true);assert.ok(after.operation?.changed.includes('hyperv'));
+   assert.ok(['enabled','pending'].includes(after.hyperV));
+   pass('Hyper-V was actually installed with a durable receipt and without an automatic reboot');
+  }else{
+   assert.ok(after.operation?.changed.includes('ssh-client'));assert.equal(after.sshClientPresent,true);assert.equal(after.sshCapability,'installed');
+   assert.equal(after.runtimeActive,false);
+   pass('The production fixed operation actually installs the missing Windows OpenSSH client, without rebooting or granting the old session VM authority');
+  }
   // An offline OpenSSH failure is retained as failure evidence, never passed.
   assert.equal(after.operation.status,'completed');
  }else{
-  const previous=JSON.parse(await readFile('C:/MuLab/approved/before-reboot-result.json','utf8'));
-  assert.ok(previous.after?.operation?.changed.includes('hyperv'));
-  assert.notEqual(before.bootId,previous.before.bootId);
+  const previous=JSON.parse(await readFile(`C:/MuLab/approved/${phase==='ssh-ready'?'ssh-install':'before-reboot'}-result.json`,'utf8'));
+  assert.equal(previous.complete,true);assert.ok(previous.after?.operation?.changed.includes(phase==='ssh-ready'?'ssh-client':'hyperv'));
+  if(phase==='after-reboot')assert.notEqual(before.bootId,previous.before.bootId);
   assert.equal(before.hyperV,'enabled');assert.equal(before.hypervisorPresent,true);
   assert.equal(before.managementModule,true);assert.equal(before.vmmsRunning,true);
-  pass('After the operator restarts only this evaluation guest, its nested Hyper-V service is active');
+  pass('The evaluation guest has an active nested Hyper-V service');
   assert.equal(before.sshClientPresent,true);assert.equal(before.ready,true);
   assert.equal(before.restartRequired,false);assert.equal(before.runtimeActive,true);
   pass('A new detected-host session enables normal runtime authority only after verified readiness');
@@ -69,6 +84,6 @@ try{
 }catch(failure){error={message:failure.message,code:failure.code??null};}
 finally{
  await client.call('shutdown').catch(()=>{});
- await writeFile(`${directory}/${phase}-result.json`,JSON.stringify({phase,pid:process.pid,nonce,complete,checks,before,after,error,nested,actualHyperVInstallationExercised:phase==='before-reboot'&&!!after?.operation?.changed.includes('hyperv'),actualSshInstallationExercised:phase==='before-reboot'&&!before?.sshClientPresent&&!!after?.sshClientPresent,aiWebsitesVisited:0},null,2));
+ await writeFile(`${directory}/${phase}-result.json`,JSON.stringify({phase,pid:process.pid,nonce,complete,checks,before,after,error,nested,actualHyperVInstallationExercised:phase==='before-reboot'&&!!after?.operation?.changed.includes('hyperv'),actualSshInstallationExercised:['before-reboot','ssh-install'].includes(phase)&&before?.sshClientPresent===false&&after?.sshClientPresent===true&&after?.operation?.changed.includes('ssh-client'),aiWebsitesVisited:0},null,2));
 }
 if(!complete)process.exitCode=1;

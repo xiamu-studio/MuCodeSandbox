@@ -11,7 +11,7 @@
 - 确认内层 VM 停止后删除其专属交换机、磁盘和管理文件。独立检查内层 VM 数量为零；外层评估 VM 最后也确认 Off。
 - 安装阶段 3 项、重启后与 Linux 阶段 5 项检查通过。物理宿主启动时间、Mac main 引用均与测试前一致；没有访问 AI 网站。
 
-OpenSSH 客户端在微软镜像中已经安装，本轮验证其实际可用性。缺失 OpenSSH 时的真实 Add-WindowsCapability 安装仍须补测。此结果覆盖隔离评估 VM 中的后端流程，第二台 Windows 11 Pro、全新机器的图形 UAC/安装向导和真实 Mac 回归仍分别保留。
+OpenSSH 客户端在微软镜像中已经安装，本轮验证其实际可用性。后续已单独完成缺失客户端的实际安装与失败关闭补测，详见 [OpenSSH 验收](windows-openssh-validation.md)。此结果覆盖隔离评估 VM 中的后端流程，第二台 Windows 11 Pro、全新机器的图形 UAC/安装向导和真实 Mac 回归仍分别保留。
 
 ## 实测发现与修复
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';import path from 'node:path';import {readFile} from 'node:fs/promises';
 import {run} from '../server/process.ts';import {powershellPath,powershellArgs} from '../server/platform/windows/runtime.ts';import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
-const phase=process.argv[2];assert.ok(['deployment-inspect','host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','collect-stop'].includes(phase));
+const phase=process.argv[2];assert.ok(['deployment-inspect','host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','collect-stop'].includes(phase));if(phase==='package-open-main')assert.ok(process.argv.includes('--human-ready'),'The human must be ready for the real Windows authentication dialog');
 const index=JSON.parse(await readFile('.mu-data/windows-run/pro-host-lab.json','utf8')),directory=path.resolve(index.directory);
 assert.equal(path.dirname(directory),path.resolve(windowsRuntimeDirectory()));assert.match(path.basename(directory),/^pro-host-[a-f0-9-]{36}$/);
 const script=phase==='deployment-inspect'?'scripts/windows/inspect-pro-deployment.ps1':'scripts/windows/verify-pro-host.ps1';

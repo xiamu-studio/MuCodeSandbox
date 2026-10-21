@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','collect-stop')][string]$Phase)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $directoryPath = [IO.Path]::GetFullPath($Directory)
@@ -78,6 +78,7 @@ function Connect-ProGuest([string]$DifferentBootId = '') {
 }
 try {
     $vm = Assert-ProFixture
+    if ($Phase -eq 'package-logon' -and $vm.State -eq 'Off') { Start-VM -VM $vm | Out-Null }
     Save-ProProbe 'connecting'
     $session = Connect-ProGuest
     $initial = Invoke-Command -Session $session -ArgumentList $config.nonce -ScriptBlock {
@@ -99,6 +100,38 @@ try {
         Save-ProProbe 'diagnosed' @{ host = $initial; details = $details }; exit 0
     }
     if (-not $initial.userOrdinary -or $initial.oobe -ne 0 -or $initial.setupInProgress -ne 0) { throw 'Ordinary Pro profile and completed system setup required' }
+    if ($Phase -in @('package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main')) {
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-package-operator.ps1'))))
+        Save-ProProbe 'running-package-check' $initial
+        $result = Invoke-ProPackagePhase $session $Phase $guard $directoryPath $config.nonce
+        if (-not $result.complete) { Save-ProProbe 'package-failed' $result; exit 1 }
+        if ($Phase -eq 'package-open-main') { Start-Process -FilePath (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'vmconnect.exe') -ArgumentList @('localhost',$machine.name) -WindowStyle Normal | Out-Null }
+        Save-ProProbe 'package-completed' $result; exit 0
+    }
+    if ($Phase -eq 'package-logon') {
+        Invoke-Command -Session $session -ScriptBlock {
+            if (@(Get-VM).Count -or @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*' }).Count) { throw 'Empty synthetic Pro guest required' }
+            $c = Get-Content C:\MuLab\private\credentials.json -Raw | ConvertFrom-Json
+            if ($c.user -ne 'MuLabUser') { throw 'Synthetic application user required' }
+            $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+            Set-ItemProperty -LiteralPath $key -Name DefaultDomainName -Value 'MU-PRO-LAB'
+            Set-ItemProperty -LiteralPath $key -Name DefaultUserName -Value $c.user
+            Set-ItemProperty -LiteralPath $key -Name DefaultPassword -Value $c.userPassword
+            Set-ItemProperty -LiteralPath $key -Name AutoAdminLogon -Value '1'
+            Set-ItemProperty -LiteralPath $key -Name AutoLogonCount -Value 2 -Type DWord
+        }
+        Save-ProProbe 'package-synthetic-logon-restart'
+        try { Invoke-Command -Session $session -ScriptBlock { Restart-Computer -Force } } catch [System.Management.Automation.Remoting.PSRemotingTransportException] {}
+        Remove-PSSession $session -ErrorAction SilentlyContinue; $session = $null
+        $session = Connect-ProGuest ([string]$initial.bootId)
+        $until = [DateTime]::UtcNow.AddMinutes(4)
+        do {
+            $user = Invoke-Command -Session $session -ScriptBlock { (Get-CimInstance Win32_ComputerSystem).UserName }
+            if ($user -eq 'MU-PRO-LAB\MuLabUser') { break }
+            if ([DateTime]::UtcNow -gt $until) { throw 'Synthetic Pro desktop is not ready' }; Start-Sleep -Seconds 2
+        } while ($true)
+        Save-ProProbe 'package-ordinary-desktop-ready' @{ complete = $true; syntheticUser = 'MuLabUser'; hostRestarted = $false }; exit 0
+    }
     if ($Phase -eq 'restart-check') {
         Invoke-Command -Session $session -ScriptBlock {
             if (@(Get-VM).Count -or @(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*' }).Count) { throw 'Empty Pro VM with no servicing process required' }
@@ -120,6 +153,8 @@ try {
     }
     if ($Phase -eq 'collect-stop') {
         $collected = Invoke-Command -Session $session -ScriptBlock {
+            $busy = @(Get-CimInstance Win32_Process | Where-Object { ($_.ExecutablePath -and $_.ExecutablePath.StartsWith('C:\MuLab\public\package-',[StringComparison]::OrdinalIgnoreCase) -and $_.Name -in @('MuCodeSandbox Windows Preview.exe','node.exe')) -or $_.ExecutablePath -eq 'C:\MuLab\installers\current-preview.exe' -or ($_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*') })
+            if ($busy.Count) { throw 'Installed application or servicing is active; close it before stopping the Pro VM' }
             $count = @(Get-VM).Count
             if ($count) { throw 'Nested Pro test VMs remain; preserve the running guest' }
             $switches = @(Get-VMSwitch | Where-Object { $_.Name -match '^mu-win-[a-f0-9]{32}$' }).Count
@@ -135,6 +170,11 @@ try {
             Set-ItemProperty -LiteralPath $winlogon -Name AutoAdminLogon -Value '0'
             Remove-ItemProperty -LiteralPath $winlogon -Name DefaultPassword -ErrorAction SilentlyContinue
             Set-ItemProperty -LiteralPath $winlogon -Name AutoLogonCount -Value 0 -Type DWord
+            $listTask = Get-ScheduledTask -TaskName MuPro-package-show-list -ErrorAction SilentlyContinue
+            if ($listTask) {
+                if ($listTask.Actions.Execute -ne (Join-Path $env:SystemRoot 'System32/control.exe') -or $listTask.Actions.Arguments -ne '/name Microsoft.ProgramsAndFeatures') { throw 'Unknown list task preserved' }
+                Unregister-ScheduledTask -TaskName MuPro-package-show-list -Confirm:$false
+            }
             return @{ nestedGuests = $count; privateSwitches = $switches; registrationCopiesEqual = $true; registeredGuests = 0; runtimeDirectories = 0; brokerSourceDigest = $meta.sourceDigest }
         }
         Remove-PSSession $session; $session = $null

@@ -65,6 +65,7 @@
 - [x] 安装进程中断后的原程序/登记恢复、首次安装和旧版升级重试、未完成文件保留及原 DPAPI/SQLite 配置读回，详见 [安装中断恢复](windows-installer-recovery.md)。
 - [x] 可见 NSIS 当前用户安装、安装前取消、中文及特殊字符目录、运行中保护提示与同目录修复；官方简体中文多版本 ISO 整体摘要及 Pro 索引已离线核验，详见 [安装兼容性进展](windows-install-compatibility.md)。
 - [x] 独立简体中文 Windows 11 Pro 实际部署，缺失 Hyper-V 安装 3 项、测试 VM 重启后嵌套 Linux 5 项及真实重启等待 1 项；独立确认资源清空、测试机 Off 和宿主启动时间不变，详见 [Pro 验收](windows-pro-validation.md)。
+- [x] 普通 Pro 用户执行真实 NSIS 预览包安装及同版修复，6 项检查覆盖特殊字符目录、原 DPAPI/SQLite 数据保留、运行中保护和系统程序列表；158 项 Windows 自动测试通过，详见 [Pro 包安装验收](windows-pro-package-validation.md)。
 - [ ] Pro 完整图形安装/组件准备与 UAC 交互、控制面板登记可见性及 GUI 卸载/取消，另保留真实断电恢复与更多历史升级矩阵。
 - [ ] Windows 实机全流程及第二环境回归。
 - [ ] Mac 共享接口变化的真实回归；无 Mac 实机时不得声称已通过。

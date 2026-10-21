@@ -8,9 +8,11 @@ import {secureWindowsDirectory} from './credentials.ts';
 import {installedBrokerPath,startBroker,installBroker,cleanWindowsEnvironment} from './broker.ts';
 import type {WindowsConfig} from './config.ts';
 import {watchWindowsDesktopOwner} from './desktop-owner.ts';
+import {createWindowsRecoveryService} from './recovery-service.ts';
 
 let started=false,initializing=true,closing:Promise<void>|undefined,service:Awaited<ReturnType<typeof createWindowsService>>|undefined,broker:Awaited<ReturnType<typeof startBroker>>|undefined,runtime:HyperVRuntime|undefined,profiles:WindowsConfig[]|undefined;
 let ownerWatch:{stop:()=>void}|undefined;
+let recoveryService:Awaited<ReturnType<typeof createWindowsRecoveryService>>|undefined;
 const send=(value:object)=>{if(process.connected)process.send?.({version:1,...value});};
 async function exitWithMessage(value:object,code:number){ownerWatch?.stop();if(process.connected)await new Promise<void>(resolve=>process.send?.({version:1,...value},()=>resolve()));if(process.connected)process.disconnect();process.exit(code);}
 async function shutdown(orphan=false){
@@ -29,7 +31,7 @@ async function shutdown(orphan=false){
    // immediately so the protected broker also performs its independent sweep.
    ownerWatch?.stop();process.exit(0);
   }
-  await service?.close();service=undefined;
+  await recoveryService?.close();recoveryService=undefined;await service?.close();service=undefined;
   const failed:unknown[]=[];
   for(const c of profiles){try{if((await runtime!.allocation(c)).registered)await runtime!.stop(c);}catch(error){failed.push(error);}}
   if(failed.length)throw Error(`尚未确认 ${failed.length} 个环境停止，请重试`);
@@ -41,7 +43,7 @@ const ownerLost=()=>{const deadline=setTimeout(()=>process.exit(1),10000);deadli
 process.once('disconnect',ownerLost);
 for(const signal of ['SIGINT','SIGTERM'] as const)process.once(signal,()=>{void shutdown(true);});
 process.on('message',raw=>{void(async()=>{
- const value=z.discriminatedUnion('type',[z.object({version:z.literal(1),type:z.literal('start'),rootDir:z.string().refine(path.isAbsolute)}).strict(),z.object({version:z.literal(1),type:z.literal('shutdown')}).strict()]).parse(raw);
+ const value=z.discriminatedUnion('type',[z.object({version:z.literal(1),type:z.literal('start'),rootDir:z.string().refine(path.isAbsolute),mode:z.enum(['normal','recovery']).default('normal')}).strict(),z.object({version:z.literal(1),type:z.literal('shutdown')}).strict()]).parse(raw);
  if(value.type==='shutdown'){await shutdown();return;}if(started)return;started=true;
  try{
   if(process.platform!=='win32')throw Error('Windows 桌面入口只能在 Windows 上运行');
@@ -50,7 +52,12 @@ process.on('message',raw=>{void(async()=>{
   const root=windowsRuntimeDirectory();await secureWindowsDirectory(root);process.chdir(root);await secureWindowsDirectory(windowsAppDirectory());send({type:'status',phase:'checking'});
   let executable:string;
   try{executable=await installedBrokerPath();}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT'&&(error as {code?:string}).code!=='BROKER_UPDATE_REQUIRED')throw error;send({type:'status',phase:'installing'});await installBroker(root);executable=await installedBrokerPath();}
-  send({type:'status',phase:'authorizing'});broker=await startBroker(executable,{detectHost:true});runtime=new HyperVRuntime(root,undefined,broker);service=await createWindowsService({rootDir:value.rootDir,runtimeRoot:root,runtime});initializing=false;send({type:'ready',url:service.launchUrl(),pid:process.pid});
- }catch(error){initializing=false;await service?.close().catch(()=>{});await broker?.call('shutdown').catch(()=>{});await exitWithMessage({type:'error',message:error instanceof Error?error.message:'Windows 服务初始化失败'},1);}
+  send({type:'status',phase:'authorizing'});
+  if(value.mode==='recovery'){
+   broker=await startBroker(executable,{recoveryOnly:true});recoveryService=await createWindowsRecoveryService({rootDir:value.rootDir,runtimeRoot:root,broker,returnToNormal:()=>send({type:'mode-request',mode:'normal'})});initializing=false;send({type:'ready',url:recoveryService.launchUrl(),pid:process.pid});
+  }else{
+   broker=await startBroker(executable,{detectHost:true});runtime=new HyperVRuntime(root,undefined,broker);service=await createWindowsService({rootDir:value.rootDir,runtimeRoot:root,runtime});initializing=false;send({type:'ready',url:service.launchUrl(),pid:process.pid});
+  }
+ }catch(error){initializing=false;await recoveryService?.close().catch(()=>{});await service?.close().catch(()=>{});await broker?.call('shutdown').catch(()=>{});await exitWithMessage({type:'error',message:error instanceof Error?error.message:'Windows 服务初始化失败'},1);}
  })().catch(()=>{send({type:'error',message:'无效的桌面管理请求'});process.exit(1);});});
 if(!process.connected)throw Error('Windows desktop worker requires its owning IPC channel');

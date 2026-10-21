@@ -9,12 +9,17 @@ import WindowsSetupPanel from './WindowsSetupPanel.tsx';
 import WindowsHostPanel from './WindowsHostPanel.tsx';
 import WindowsStoragePanel from './WindowsStoragePanel.tsx';
 import WindowsResourcesPanel from './WindowsResourcesPanel.tsx';
+import WindowsRecoveryWorkspace from './WindowsRecoveryWorkspace.tsx';
 const TerminalPanel=lazy(()=>import('../TerminalPanel.tsx'));
 const WindowsBrowserView=lazy(()=>import('./WindowsBrowserView.tsx'));
 
 const displayIssue=(message:string)=>message.replaceAll('Two distinct matching exit receipts are required','未获得两个与批准出口一致的核验结果，请检查代理和出口配置');
 
 export default function WindowsWorkspace(){
+ if(window.__MU_CONFIG__?.windowsMode==='recovery')return <WindowsRecoveryWorkspace/>;
+ return <WindowsNormalWorkspace/>;
+}
+function WindowsNormalWorkspace(){
  const [snapshot,setSnapshot]=useState<Snapshot|null>(null),[selectedId,select]=useState<string|null>(null),[system,showSystem]=useState(false);
  const [error,setError]=useState(''),[connected,setConnected]=useState(true),[dialog,setDialog]=useState<'new'|Environment|null>(null);
  const [tool,setTool]=useState<'terminal'|'files'|'browser'|null>(null);

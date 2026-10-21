@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-loss','adoption-review','adoption-approve','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-loss','adoption-review','adoption-approve','adoption-ui','adoption-ui-stage','adoption-ui-collect','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -78,8 +78,10 @@ try{
    Save-Probe 'adoption-progress-inspected' $value;exit 0
   }
   if($Phase -eq 'adoption-loss'){$value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action loss};Save-Probe 'synthetic-copies-removed-for-explicit-adoption' $value;exit 0}
-  if($Phase -eq 'adoption-collect'){
-   $value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action collect}
+  if($Phase -in @('adoption-collect','adoption-ui-collect')){
+   $action=if($Phase -eq 'adoption-ui-collect'){'collect-ui'}else{'collect'}
+   $value=Invoke-Command -Session $session -ArgumentList $operatorSource,$action -ScriptBlock {param($source,$action) & ([ScriptBlock]::Create($source)) -Action $action}
+   if($Phase -eq 'adoption-ui-collect'){$screenshot=$guard.Reserve('recovery-ui.png');Copy-Item -LiteralPath C:\MuLab\public\adoption-ui.png -Destination $screenshot -FromSession $session -Force;$value.screenshot=$screenshot}
    Assert-LabVM | Out-Null;Save-Probe 'adoption-evidence-collected' $value
    try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
    Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
@@ -92,14 +94,15 @@ try{
   }
   Save-Probe 'cache-progress-inspected' $evidence;exit 0
  }
- if($Phase -eq 'cache-ui-stage'){
+ if($Phase -in @('cache-ui-stage','adoption-ui-stage')){
   Invoke-Command -Session $session -ScriptBlock {[IO.Directory]::CreateDirectory('C:\MuLab\test-tools') | Out-Null}
   foreach($tool in @(@{source='../../node_modules/electron/dist';target='C:\MuLab\test-tools\electron';file='electron.exe'},@{source='../../node_modules/playwright-core';target='C:\MuLab\test-tools\playwright-core';file='index.mjs'})){
    $source=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot $tool.source));$present=Invoke-Command -Session $session -ArgumentList $tool.target,$tool.file -ScriptBlock {param($root,$file) Test-Path -LiteralPath (Join-Path $root $file)}
    if(-not $present){Copy-Item -LiteralPath $source -Destination $tool.target -ToSession $session -Recurse}
   }
   $dist=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../dist'));foreach($file in @(Get-ChildItem -LiteralPath $dist -File -Recurse)){$relative=$file.FullName.Substring($dist.Length+1);$target='C:\MuLab\product\resources\app\dist\'+$relative;Invoke-Command -Session $session -ArgumentList ([IO.Path]::GetDirectoryName($target)) -ScriptBlock {param($path) [IO.Directory]::CreateDirectory($path) | Out-Null};Copy-Item -LiteralPath $file.FullName -Destination $target -ToSession $session -Force}
-  foreach($name in @('clean-host-cache-ui.cjs','clean-host-cache-ui.mjs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination ('C:\MuLab\'+$name.Replace('clean-host-','')) -ToSession $session -Force}
+  $uiFiles=if($Phase -eq 'adoption-ui-stage'){@('clean-host-recovery-ui.cjs','clean-host-recovery-ui.mjs')}else{@('clean-host-cache-ui.cjs','clean-host-cache-ui.mjs')}
+  foreach($name in $uiFiles){Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination ('C:\MuLab\'+$name.Replace('clean-host-','')) -ToSession $session -Force}
   Save-Probe 'local-only-cache-ui-tools-staged';exit 0
  }
  if($Phase -in @('cache','cache-ui','cache-reset','cache-collect')){
@@ -359,6 +362,7 @@ try{
  if($Phase.StartsWith('adoption-')){
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-adoption-client.mjs') -Destination C:\MuLab\adoption-client.mjs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/recovery.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\recovery.js -ToSession $session -Force
+  if($Phase -eq 'adoption-ui'){foreach($name in @('recovery-service.js','recovery-candidates.js','recovery-wizard.js')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../dist-server/server/platform/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\'+$name) -ToSession $session -Force}}
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'hyperv.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\hyperv.ps1 -ToSession $session -Force
  }
  if($Phase -eq 'network'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-network-client.mjs') -Destination C:\MuLab\network-client.mjs -ToSession $session -Force}
@@ -436,7 +440,7 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
   $bin=Join-Path $env:ProgramData 'MuCodeSandbox-HyperVBroker-v1/bin';$meta=Get-Content -LiteralPath (Join-Path $bin 'current.json') -Raw | ConvertFrom-Json
   $broker=Join-Path $bin $meta.brokerFile
   if((Get-FileHash -LiteralPath $broker -Algorithm SHA256).Hash.ToLowerInvariant() -ne $meta.brokerSha256){throw 'Protected broker digest mismatch'}
-  if($phase -eq 'adoption-review'){
+  if($phase -in @('adoption-review','adoption-ui')){
    $start=[Diagnostics.ProcessStartInfo]::new($broker,('--owner '+$ownerPid+' --pipe '+$nonce+' --detect-host'));$start.WorkingDirectory=$bin;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardError=$true;$start.RedirectStandardOutput=$true
    $ordinary=[Diagnostics.Process]::Start($start);if(-not $ordinary.WaitForExit(30000)){throw 'Normal startup did not refuse missing registration copies'};$failure=$ordinary.StandardError.ReadToEnd()
    [IO.File]::WriteAllText('C:\MuLab\private\adoption-default-denied.log',$failure)
@@ -451,7 +455,7 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
    $brokerFailure=$agent.StandardError.ReadToEnd();[IO.File]::WriteAllText('C:\MuLab\private\ledger-deny-broker-stderr.log',$brokerFailure)
    if($agent.ExitCode -ne 1 -or $brokerFailure -notlike '*Unregistered VM storage remains*'){throw ('The broker failed for an unexpected reason (exit '+$agent.ExitCode+'): '+$brokerFailure)}
    & ([ScriptBlock]::Create($operatorSource)) -Action deny -Nonce $nonce | Out-Null
-  }else{$agent=Start-Process -FilePath $broker -ArgumentList @('--owner',[string]$ownerPid,'--pipe',$nonce,$(if($phase -in @('adoption-review','adoption-approve')){'--recover-storage'}else{'--detect-host'})) -WorkingDirectory $bin -WindowStyle Hidden -RedirectStandardOutput ('C:\MuLab\private\'+$phase+'-broker-stdout.log') -RedirectStandardError ('C:\MuLab\private\'+$phase+'-broker-stderr.log') -PassThru}
+  }else{$agent=Start-Process -FilePath $broker -ArgumentList @('--owner',[string]$ownerPid,'--pipe',$nonce,$(if($phase -in @('adoption-review','adoption-approve','adoption-ui')){'--recover-storage'}else{'--detect-host'})) -WorkingDirectory $bin -WindowStyle Hidden -RedirectStandardOutput ('C:\MuLab\private\'+$phase+'-broker-stdout.log') -RedirectStandardError ('C:\MuLab\private\'+$phase+'-broker-stderr.log') -PassThru}
   $handled=@{}
   function Invoke-SyntheticNetworkRequests {
    $record=Get-Content -LiteralPath C:\MuLab\approved\network-adapter.json -Raw | ConvertFrom-Json
@@ -483,7 +487,7 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
    if($agent.HasExited -and $phase -ne 'ledger-deny'){throw ('Protected broker exited: '+[IO.File]::ReadAllText(('C:\MuLab\private\'+$phase+'-broker-stderr.log')))}
    if($probeClock.ElapsedMilliseconds -gt 3900000){throw 'Servicing or the client is still running; no process or VM was stopped'}
    if($phase -eq 'network'){Invoke-SyntheticNetworkRequests}
-   if($phase -in @('adoption-review','adoption-approve')){
+   if($phase -in @('adoption-review','adoption-approve','adoption-ui')){
     foreach($action in @('inspect-plan','change-seed','restore-seed','break-acl','restore-acl','break-permissions','restore-permissions','add-dependency','remove-dependency','inspect-adopted')){
      $name='adoption-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'
      if(-not $handled.ContainsKey($name) -and (Test-Path -LiteralPath $file)){$request=Get-Content -LiteralPath $file -Raw|ConvertFrom-Json;if($request.nonce -eq $nonce){if($request.action -ne $action){throw 'Unexpected adoption operator action'};& ([ScriptBlock]::Create($operatorSource)) -Action $action -Nonce $nonce|Out-Null;$handled[$name]=$true}}

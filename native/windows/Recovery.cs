@@ -17,6 +17,7 @@ public static partial class MuHyperVBroker {
         using(var sha=SHA256.Create()){var buffer=new byte[1048576];int count;while((count=input.Read(buffer,0,buffer.Length))>0){cancellation.ThrowIfCancellationRequested();sha.TransformBlock(buffer,0,count,null,0);}sha.TransformFinalBlock(new byte[0],0,0);return BitConverter.ToString(sha.Hash).Replace("-","").ToLowerInvariant();}
     }
     private static object RecoveryAction(string action,Dictionary<string,object> request,CancellationToken cancellation){
+        if(action=="recovery-info"){ValidateKeys(request,"action");lock(Gate)return new {mode="recovery",registeredIds=Records.Keys.OrderBy(value=>value,StringComparer.Ordinal).ToArray(),publicationAttempted=RecoveryPublicationAttempted};}
         if(action!="recovery-review"&&action!="recovery-adopt")throw new UnauthorizedAccessException("This recovery session only reviews and registers stopped protected resources");
         if(action=="recovery-review")ValidateKeys(request,"action","id","imageSha256");else ValidateKeys(request,"action","id","imageSha256","plan","confirmName");
         string id=Id(request),digest=Digest(request,"imageSha256"),name="mu-win-"+id.Replace("-","");

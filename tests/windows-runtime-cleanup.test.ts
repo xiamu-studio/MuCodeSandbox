@@ -5,11 +5,11 @@ import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {run} from '../server/process.ts';
-import {powershellPath,powershellArgs} from '../server/platform/windows/runtime.ts';
+import {powershellPath,powershellArgs,powershellScript} from '../server/platform/windows/runtime.ts';
 
 const windows={skip:process.platform!=='win32'};
 async function fixture(){const root=await mkdtemp(path.join(tmpdir(),'mu-runtime-cleanup-')),id=randomUUID(),directory=path.join(root,'mu-win-'+id.replaceAll('-',''));await mkdir(directory);return {root,id,directory,close:()=>rm(root,{recursive:true,force:true})};}
-const clean=(root:string,id:string,reset=false)=>run(powershellPath(),powershellArgs(`& '${path.resolve('scripts/windows/clean-runtime-metadata.ps1').replaceAll("'","''")}'`),{input:JSON.stringify({root,id,reset}),timeoutMs:30000});
+const clean=(root:string,id:string,reset=false)=>run(powershellPath(),['-ExecutionPolicy','Restricted',...powershellArgs(`${powershellScript(path.resolve('scripts/windows/clean-runtime-metadata.ps1'))} -ScriptDirectory '${path.resolve('scripts/windows').replaceAll("'","''")}'`)],{input:JSON.stringify({root,id,reset}),timeoutMs:30000});
 
 test('Metadata reset removes only an unfinished allocation and keeps its sibling data',windows,async()=>{
  const f=await fixture();try{await mkdir(path.join(f.directory,'seed'));await writeFile(path.join(f.directory,'seed/user-data'),'synthetic');await writeFile(path.join(f.directory,'management'),'synthetic key');await writeFile(path.join(f.root,'sibling.txt'),'keep');await clean(f.root,f.id,true);assert.deepEqual(await readdir(f.directory),[]);assert.equal(await readFile(path.join(f.root,'sibling.txt'),'utf8'),'keep');}finally{await f.close();}

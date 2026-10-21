@@ -4,9 +4,9 @@ import {readFile,writeFile,mkdir,rename,rm} from 'node:fs/promises';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {z} from 'zod';
-import {run,type RunOptions} from '../../process.ts';
+import {run,type RunOptions,type Runner} from '../../process.ts';
 import {AppError} from '../../errors.ts';
-import {powershellPath,powershellArgs,fileHash} from './runtime.ts';
+import {powershellPath,powershellArgs,powershellScript,fileHash} from './runtime.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../../scripts/windows');
 const reply=z.discriminatedUnion('ok',[z.object({ok:z.literal(true),result:z.unknown()}).strict(),z.object({ok:z.literal(false),code:z.string(),error:z.string()}).strict()]);
@@ -40,27 +40,28 @@ export function cleanWindowsEnvironment(){
  for(const name of ['SystemDrive','TEMP','TMP','USERPROFILE','LOCALAPPDATA','PROGRAMDATA'])if(process.env[name])env[name]=process.env[name];return env;
 }
 
-export async function buildBroker(root:string){
+export async function buildBroker(root:string,runner:Runner=run){
  const directory=path.join(root,'tools','broker-build-'+randomUUID()),sourceDigest=await brokerSourceDigest();await mkdir(directory,{recursive:true});
  const channelTemp=path.join(directory,'channel.exe'),brokerTemp=path.join(directory,'broker.exe');
  try{
-  await run(powershellPath(),powershellArgs(`& '${path.join(scripts,'build-channel.ps1').replaceAll("'","''")}' -Destination '${channelTemp.replaceAll("'","''")}'`),{env:cleanWindowsEnvironment(),timeoutMs:30000});
+  await runner(powershellPath(),powershellArgs(`${powershellScript(path.join(scripts,'build-channel.ps1'))} -ScriptDirectory '${scripts.replaceAll("'","''")}' -Destination '${channelTemp.replaceAll("'","''")}'`),{env:cleanWindowsEnvironment(),timeoutMs:30000});
   const channelSha256=await fileHash(channelTemp),channelFile='hv-channel-'+channelSha256.slice(0,16)+'.exe',channel=path.join(directory,channelFile);await rename(channelTemp,channel);
-  await run(powershellPath(),powershellArgs(`& '${path.join(scripts,'build-broker.ps1').replaceAll("'","''")}' -Destination '${brokerTemp.replaceAll("'","''")}' -ChannelFile '${channelFile}' -SourceDigest '${sourceDigest}'`),{env:cleanWindowsEnvironment(),timeoutMs:30000});
-  await run(brokerTemp,['--self-test'],{timeoutMs:5000});const sha256=await fileHash(brokerTemp),brokerFile='hv-broker-'+sha256.slice(0,16)+'.exe',broker=path.join(directory,brokerFile);await rename(brokerTemp,broker);
+  await runner(powershellPath(),powershellArgs(`${powershellScript(path.join(scripts,'build-broker.ps1'))} -ScriptDirectory '${scripts.replaceAll("'","''")}' -Destination '${brokerTemp.replaceAll("'","''")}' -ChannelFile '${channelFile}' -SourceDigest '${sourceDigest}'`),{env:cleanWindowsEnvironment(),timeoutMs:30000});
+  await runner(brokerTemp,['--self-test'],{timeoutMs:5000});const sha256=await fileHash(brokerTemp),brokerFile='hv-broker-'+sha256.slice(0,16)+'.exe',broker=path.join(directory,brokerFile);await rename(brokerTemp,broker);
   return {directory,broker,brokerFile,sha256,channel,channelFile,channelSha256,sourceDigest};
  }catch(error){const target=path.resolve(directory);if(path.dirname(target)!==path.resolve(root,'tools')||!/^broker-build-[a-f0-9-]{36}$/.test(path.basename(target)))throw Error('Broker staging boundary changed');await rm(target,{recursive:true,force:true});throw error;}
 }
 
-export async function installBroker(root:string){
- const artifact=await buildBroker(root),source=await readFile(path.join(scripts,'install-broker.ps1'),'utf8');
+export async function installBroker(root:string,runner:Runner=run){
+ const artifact=await buildBroker(root,runner),source=await readFile(path.join(scripts,'install-broker.ps1'),'utf8');
  const values={Broker:artifact.broker,ExpectedBrokerHash:artifact.sha256,Channel:artifact.channel,ExpectedChannelHash:artifact.channelSha256,SourceDigest:artifact.sourceDigest};
  const invocation=Object.entries(values).map(([key,value])=>`-${key} '${value.replaceAll("'","''")}'`).join(' ');
  const elevated=`$ErrorActionPreference='Stop'; & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(source).toString('base64')}')))) ${invocation}`;
  const encoded=Buffer.from(elevated,'utf16le').toString('base64');
  const launch=`$ErrorActionPreference='Stop'; $p=Start-Process -FilePath '${powershellPath().replaceAll("'","''")}' -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','${encoded}') -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if($p.ExitCode -ne 0){throw 'Broker installation did not complete'}`;
  const launcher=path.join(artifact.directory,'install-launch.ps1');await writeFile(launcher,'\ufeff'+launch,{flag:'wx'});
- await run(powershellPath(),['-NoLogo','-NoProfile','-NonInteractive','-File',launcher],{env:cleanWindowsEnvironment(),timeoutMs:120000});return artifact;
+ // Keep the outer command short: the nested elevated payload is already large.
+ await runner(powershellPath(),powershellArgs(powershellScript(launcher)),{env:cleanWindowsEnvironment(),timeoutMs:120000});return artifact;
 }
 
 export async function hostRuntimeUsable(){

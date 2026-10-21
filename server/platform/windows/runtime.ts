@@ -48,6 +48,9 @@ export function powershellArgs(script:string) {
   const protocol="$ProgressPreference='SilentlyContinue'; [Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);\n";
   return ['-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(protocol+script,'utf16le').toString('base64')];
 }
+// Read only the application's fixed local script. This uses the same command
+// execution path as the protected broker, without changing execution policy.
+export function powershellScript(file:string) {return `& ([ScriptBlock]::Create([IO.File]::ReadAllText('${file.replaceAll("'","''")}')))`;}
 
 export class HyperVRuntime implements VmBackend<WindowsConfig> {
   private transports=new Map<string,ChildProcessWithoutNullStreams>();
@@ -68,7 +71,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return false;throw error;}
   }
   private async cleanMetadata(c:WindowsConfig,reset:boolean,checkOnly=false){
-    const script=`& '${path.join(scripts,'clean-runtime-metadata.ps1').replaceAll("'","''")}'`;
+    const script=`${powershellScript(path.join(scripts,'clean-runtime-metadata.ps1'))} -ScriptDirectory '${scripts.replaceAll("'","''")}'`;
     await this.runner(powershellPath(),powershellArgs(script),{input:JSON.stringify({root:path.resolve(this.root),id:c.id,reset,checkOnly}),timeoutMs:30000});
   }
   private async confirmUnregisteredAbsence(c:WindowsConfig){
@@ -104,7 +107,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     }
     await this.cleanMetadata(c,false);this.vmIds.delete(c.id);this.transportFailures.delete(c.id);
   }
-  private psScript(action:string) {return `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); try { & '${path.join(scripts,'hyperv.ps1').replaceAll("'","''")}' -Action '${action}' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }`;}
+  private psScript(action:string) {return `$ErrorActionPreference='Stop'; [Console]::OutputEncoding=New-Object System.Text.UTF8Encoding($false); try { ${powershellScript(path.join(scripts,'hyperv.ps1'))} -Action '${action}' } catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }`;}
   async powershell(action:string,c?:WindowsConfig,options:RunOptions={}) {
     if(process.platform!=='win32')throw Error('Hyper-V backend requires Windows');
     if(this.broker){
@@ -132,7 +135,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     try{await access(target);}catch{
       const staging=target+'.'+randomUUID()+'.exe';
       try{
-        await this.runner(powershellPath(),powershellArgs(`& '${path.join(scripts,'build-channel.ps1').replaceAll("'","''")}' -Destination '${staging.replaceAll("'","''")}'`),{timeoutMs:30000});
+        await this.runner(powershellPath(),powershellArgs(`${powershellScript(path.join(scripts,'build-channel.ps1'))} -ScriptDirectory '${scripts.replaceAll("'","''")}' -Destination '${staging.replaceAll("'","''")}'`),{timeoutMs:30000});
         await this.runner(staging,['--self-test'],{timeoutMs:5000});
         try{await rename(staging,target);}catch(error){await access(target);await this.runner(target,['--self-test'],{timeoutMs:5000});}
       }finally{await rm(staging,{force:true});}
@@ -237,7 +240,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     const seedDirectory=path.join(p.directory,'seed');await mkdir(seedDirectory);
     for(const [name,contents]of Object.entries(files))await writeFile(path.join(seedDirectory,name),contents,{flag:'wx'});
     await writeFile(p.knownHosts,`${n.name} ${(await readFile(p.hostKey+'.pub','utf8')).trim()}\n`,{flag:'wx'});
-    await this.runner(powershellPath(),powershellArgs(`& '${path.join(scripts,'seed-iso.ps1').replaceAll("'","''")}' -Source '${seedDirectory.replaceAll("'","''")}' -Destination '${p.seed.replaceAll("'","''")}'`),{timeoutMs:30000});
+    await this.runner(powershellPath(),powershellArgs(`${powershellScript(path.join(scripts,'seed-iso.ps1'))} -Source '${seedDirectory.replaceAll("'","''")}' -Destination '${p.seed.replaceAll("'","''")}'`),{timeoutMs:30000});
     if(!retry)await this.powershell('disk',c,{...options,timeoutMs:1200000});
     const created=JSON.parse(await this.powershell('create',c,options));
     const platformId=z.uuid().parse(created.platformId);this.vmIds.set(c.id,platformId);

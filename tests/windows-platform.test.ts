@@ -7,7 +7,7 @@ import { parse } from 'yaml';
 import { windowsConfigSchema, vmIdentity, NET_UID, PROBE_UID } from '../server/platform/windows/config.ts';
 import { cloudInit, configureWindowsGuard } from '../server/platform/windows/guest.ts';
 import { WindowsNetworkSession, type GuardDriver } from '../server/platform/windows/session.ts';
-import { HyperVRuntime, powershellArgs, powershellPath } from '../server/platform/windows/runtime.ts';
+import { HyperVRuntime, powershellArgs, powershellPath, powershellScript } from '../server/platform/windows/runtime.ts';
 import { run } from '../server/process.ts';
 import { WindowsHostMonitor } from '../server/platform/windows/monitor.ts';
 import {spawn} from 'node:child_process';
@@ -114,6 +114,13 @@ test('Native Hyper-V helper builds, validates endpoint layout and rejects wildca
     await assert.rejects(run(helper,['00000000-0000-0000-0000-000000000000']));
   }finally{await rm(directory,{recursive:true,force:true});}
 });
+
+test('Native helper compilation works with process Restricted policy without changing machine policy',{skip:process.platform!=='win32'},async()=>{
+ const directory=await mkdtemp(path.join(tmpdir(),'mu-restricted-channel-'));
+ const restricted:typeof run=(file,args,options)=>run(file,file===powershellPath()?['-ExecutionPolicy','Restricted',...args]:args,options);
+ try{const helper=await new HyperVRuntime(directory,restricted).channelHelper();assert.match(await run(helper,['--self-test']),/layout verified/);}
+ finally{const target=path.resolve(directory);assert.equal(path.dirname(target),path.resolve(tmpdir()));assert.match(path.basename(target),/^mu-restricted-channel-/);await rm(target,{recursive:true,force:true});}
+});
 test('The loopback transport exits when its owning controller is killed',{skip:process.platform!=='win32',timeout:15000},async()=>{
   const directory=await mkdtemp(path.join(tmpdir(),'mu-channel-owner-'));let owner:ReturnType<typeof spawn>|undefined,helperPid=0;
   try{
@@ -131,8 +138,8 @@ test('Windows IMAPI creates a readable NoCloud ISO with exact filenames',{skip:p
     const source=path.join(root,'seed');await mkdir(source);
     for(const name of ['user-data','meta-data','network-config'])await writeFile(path.join(source,name),'fixture\n');
     const target=path.join(root,'seed.iso');
-    const script=path.resolve('scripts/windows/seed-iso.ps1').replaceAll("'","''");
-    await run(powershellPath(),powershellArgs(`& '${script}' -Source '${source.replaceAll("'","''")}' -Destination '${target.replaceAll("'","''")}'`));
+    const script=powershellScript(path.resolve('scripts/windows/seed-iso.ps1'));
+    await run(powershellPath(),['-ExecutionPolicy','Restricted',...powershellArgs(`${script} -Source '${source.replaceAll("'","''")}' -Destination '${target.replaceAll("'","''")}'`)]);
     const bytes=await readFile(target);assert.equal(bytes.subarray(16*2048+1,16*2048+6).toString(),'CD001');
     const names=await run('tar.exe',['-tf',target]);for(const name of ['user-data','meta-data','network-config'])assert.ok(names.includes(name));
   } finally {await rm(root,{recursive:true,force:true});}

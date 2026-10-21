@@ -9,7 +9,7 @@ import {HyperVBrokerClient,brokerSourceDigest} from 'file:///C:/MuLab/product/re
 import {HyperVRuntime} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/runtime.js';
 import {windowsConfigSchema} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/config.js';
 
-const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network','ledger-seed','ledger-check','ledger-deny','ledger-final'].includes(phase));
+const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network','cache','cache-ui','ledger-seed','ledger-check','ledger-deny','ledger-final'].includes(phase));
 const directory='C:/MuLab/public',nonce=randomBytes(32).toString('hex'),client=new HyperVBrokerClient(nonce);
 let complete=false;const checks=[];let before,after,error,nested;
 const pass=name=>checks.push({name,passed:true});
@@ -22,7 +22,13 @@ try{
  for(;;){try{const hello=await client.hello();assert.equal(hello.sourceDigest,await brokerSourceDigest());pass('The protected production broker is bound to this standard-user process and the packaged source');break;}catch(failure){if(failure.code!=='BROKER_UNAVAILABLE'||performance.now()>deadline)throw failure;await delay(500);}}
  before=await client.call('host-status',{}, {timeoutMs:90000});
  assert.equal(before.supported,true);assert.equal(before.firmwareVirtualization,true);assert.equal(before.slat,true);
- if(phase.startsWith('ledger-')){
+ if(phase==='cache-ui'){
+  assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);
+  const {cacheUiAcceptance}=await import('file:///C:/MuLab/cache-ui.mjs');nested=await cacheUiAcceptance(client,nonce,pass);
+ }else if(phase==='cache'){
+  assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);
+  const {cacheAcceptance}=await import('file:///C:/MuLab/cache-client.mjs');nested=await cacheAcceptance(client,nonce,pass);
+ }else if(phase.startsWith('ledger-')){
   assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);
   const {ledgerAcceptance}=await import('file:///C:/MuLab/ledger-client.mjs');nested=await ledgerAcceptance(phase,client,nonce,pass);
  }else if(phase==='network'){

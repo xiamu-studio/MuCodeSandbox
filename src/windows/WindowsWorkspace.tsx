@@ -7,6 +7,7 @@ import './windows.css';
 import WindowsFilesPanel from './WindowsFilesPanel.tsx';
 import WindowsSetupPanel from './WindowsSetupPanel.tsx';
 import WindowsHostPanel from './WindowsHostPanel.tsx';
+import WindowsStoragePanel from './WindowsStoragePanel.tsx';
 const TerminalPanel=lazy(()=>import('../TerminalPanel.tsx'));
 const WindowsBrowserView=lazy(()=>import('./WindowsBrowserView.tsx'));
 
@@ -65,6 +66,7 @@ export default function WindowsWorkspace(){
      <dl className="facts"><div><dt>运行组件</dt><dd>{snapshot.system.runtime.available?'已就绪':'需要处理'}</dd></div><div><dt>虚拟化后端</dt><dd>Windows Hyper-V</dd></div><div><dt>设备资源</dt><dd>{snapshot.system.cpus} 核心 · {snapshot.system.memoryGiB} GiB</dd></div><div><dt>数据目录</dt><dd className="path-text">{snapshot.system.dataDir}</dd></div><div><dt>版本</dt><dd>{snapshot.system.version}</dd></div></dl>
      {snapshot.system.runtime.error&&!(window.__MU_CONFIG__.capabilities?.setup&&snapshot.system.runtime.error==='请先准备空白受保护基盘')&&<Notice kind="error">{snapshot.system.runtime.error}</Notice>}
      <Notice>当前可管理 Linux 环境，使用交互式终端、文件传输和独立 Linux 浏览器。共享、快照和完整系统准备仍在开发。</Notice>
+     {window.__MU_CONFIG__.capabilities?.storage&&<WindowsStoragePanel/>}
     </>:selected?<>
      <header className="page-header environment-header"><div><div className="eyebrow">HYPER-V · LINUX</div><h1>{selected.name}</h1><p>{selected.description}</p></div><div className="environment-header-actions"><Status state={selected.state}/><Button disabled={!connected||!!active||selected.state!=='running'} onClick={()=>void action('restart')} icon={<RefreshCw size={15}/>}>重启</Button><Button className="primary" loading={!!active} disabled={!connected} onClick={()=>void action(selected.state==='running'?'stop':'start')}>{active?'处理中':selected.state==='running'?'停止':'启动'}</Button></div></header>
      {selected.lastError&&<Notice kind="error">{displayIssue(selected.lastError)}</Notice>}

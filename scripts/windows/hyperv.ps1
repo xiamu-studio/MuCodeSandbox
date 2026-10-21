@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence')][string]$Action)
+param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies')][string]$Action)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -26,6 +26,43 @@ if (-not $isAdmin) { throw 'Administrator PowerShell is required for this previe
 Import-Module Hyper-V
 $inputText = [Console]::In.ReadToEnd()
 $c = $inputText | ConvertFrom-Json
+if($Action -eq 'cache-dependencies'){
+ $root=[IO.Path]::GetFullPath([string]$c.cacheRoot).TrimEnd('\');$users=[IO.Path]::GetFullPath((Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'MuCodeSandbox-HyperVBroker-v1/users'))
+ $sid=[IO.Path]::GetFileName($root)
+ if([IO.Path]::GetDirectoryName($root) -ne $users -or ([Security.Principal.SecurityIdentifier]::new($sid)).Value -ne $sid){throw 'Fixed protected cache root required'}
+ $images=Join-Path $root 'images';$paths=[Collections.Generic.Dictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
+ foreach($entry in @(Get-ChildItem -LiteralPath $images -File)){$paths[[IO.Path]::GetFullPath($entry.FullName)]=$entry.Name}
+ $referenced=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase);$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+ function Assert-LocalDiskPath([string]$value){
+  $full=[IO.Path]::GetFullPath($value)
+  if($full -notmatch '^[a-zA-Z]:\\' -or [IO.DriveInfo]::new([IO.Path]::GetPathRoot($full)).DriveType -eq 'Network'){throw 'Remote disk dependency cannot be inspected without network access'}
+  $cursor=[IO.Path]::GetPathRoot($full)
+  foreach($part in $full.Substring($cursor.Length).Split('\')){$cursor=Join-Path $cursor $part;if([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint){throw 'Disk dependency reparse point rejected'}}
+  return $full
+ }
+ $drives=@()
+ foreach($vm in @(Get-VM -ErrorAction Stop)){
+  $drives+=@(Get-VMHardDiskDrive -VM $vm -ErrorAction Stop)
+  foreach($snapshot in @(Get-VMSnapshot -VM $vm -ErrorAction Stop)){$drives+=@(Get-VMHardDiskDrive -VMSnapshot $snapshot -ErrorAction Stop)}
+  if($drives.Count -gt 1024){throw 'Disk dependency inventory exceeds its fixed bound'}
+ }
+ foreach($drive in $drives){
+  $path=[string]$drive.Path;$depth=0
+  while($path){
+   if(++$depth -gt 32){throw 'Disk dependency chain exceeds its fixed bound'}
+   $full=Assert-LocalDiskPath $path;if(-not $seen.Add($full)){break}
+   if($paths.ContainsKey($full)){[void]$referenced.Add($paths[$full])}
+   $disk=Get-VHD -Path $full -ErrorAction Stop;$path=[string]$disk.ParentPath
+  }
+ }
+ foreach($image in @(Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_DiskImage -ErrorAction Stop)){
+  if($image.Attached -and $image.ImagePath){$full=[IO.Path]::GetFullPath([string]$image.ImagePath);if($paths.ContainsKey($full)){[void]$referenced.Add($paths[$full])}}
+ }
+ # Return only names in this user's cache. Other VM names, paths and data never
+ # cross the privileged boundary and no dependency is changed or mounted.
+ @{referenced=@($referenced | Sort-Object)} | ConvertTo-Json -Compress
+ exit 0
+}
 if ($c.name -notmatch '^mu-win-[0-9a-f]{32}$' -or $c.host -notmatch '^172\.29\.\d{1,3}\.\d{1,3}$' -or $c.guest -notmatch '^172\.29\.\d{1,3}\.\d{1,3}$') { throw 'Invalid owned VM identity' }
 $marker = 'MuCodeSandbox Windows preview ' + $c.name
 function OwnedVM {

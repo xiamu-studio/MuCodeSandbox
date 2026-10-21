@@ -23,6 +23,7 @@ import {windowsAppDirectory,windowsRuntimeDirectory} from './paths.ts';
 import {windowsBaseSchema} from './config.ts';
 import {WindowsSetup} from './setup.ts';
 import {WindowsHostComponents,hostReady} from './host-components.ts';
+import {WindowsStorage} from './storage.ts';
 
 export interface WindowsServiceOptions {
  rootDir:string;dataDir?:string;runtimeRoot?:string;port?:number;base?:WindowsBase;
@@ -37,7 +38,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
  const runtimeRoot=windowsRuntimeDirectory(options.runtimeRoot,dataDir);
  await secureWindowsDirectory(dataDir);
  const unlock=await acquireWindowsServiceLock(dataDir);
- let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined,setup:WindowsSetup|undefined,host:WindowsHostComponents|undefined;
+ let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined,setup:WindowsSetup|undefined,host:WindowsHostComponents|undefined,storage:WindowsStorage|undefined;
  try{
   await secureWindowsDirectory(runtimeRoot);
   const runtime=options.runtime??new HyperVRuntime(runtimeRoot);
@@ -49,6 +50,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   manager=new WindowsManager(await openWindowsStore(dataDir),runtime,{runtimeRoot,base,probe:options.probe});
   const controller=manager;
   if(runtime instanceof HyperVRuntime&&runtime.broker){host=new WindowsHostComponents(runtime.broker,()=>!controller.tasks.size&&controller.store.list().every(e=>!['running','starting','creating','stopping'].includes(e.state))&&!setup?.running);await host.refresh();setup=new WindowsSetup(runtime,runtimeRoot,{base,canPrepare:()=>!!host&&hostReady(host.snapshot())&&!controller.options.base&&!controller.tasks.size&&controller.store.list().every(e=>e.state==='not_created'),publish:value=>{controller.options.base=value;controller.profiles.clear();}});await setup.initialize();}
+  if(runtime instanceof HyperVRuntime&&runtime.broker)storage=new WindowsStorage(runtime.broker,()=>controller.options.base?.imageSha256??null,()=>!!host&&hostReady(host.snapshot())&&!controller.tasks.size&&!setup?.running);
   terminal=runtime.terminalLaunch?new WindowsTerminalServer(controller,{terminalLaunch:runtime.terminalLaunch.bind(runtime)},options.ptyFactory):undefined;
   const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>();
   const guest=runtime.guest?.bind(runtime),management=runtime.management?.bind(runtime);
@@ -99,6 +101,9 @@ export async function createWindowsService(options:WindowsServiceOptions){
   const hostComponents=()=>{if(!host)throw new AppError('此入口不提供系统组件准备，请使用 Windows 桌面',409,'HOST_SETUP_UNAVAILABLE');return host;};
   app.get('/api/windows/host',async(_req,res)=>res.json(await hostComponents().refresh()));
   app.post('/api/windows/host',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.status(202).json(await hostComponents().prepare());});
+  const storageHost=()=>{if(!storage)throw new AppError('此入口不提供受保护缓存管理，请使用 Windows 桌面',409,'STORAGE_UNAVAILABLE');return storage;};
+  app.get('/api/windows/storage',async(_req,res)=>res.json(await storageHost().inspect()));
+  app.post('/api/windows/storage/prune',async(req,res)=>{const input=z.object({plan:z.string().regex(/^[a-f0-9]{64}$/)}).strict().parse(req.body);res.json(await storageHost().prune(input.plan));});
   const browserHost=()=>{if(!guestBrowser)throw new AppError('Windows 浏览器运行组件不可用',409,'FEATURE_UNAVAILABLE');return guestBrowser;};
   app.get('/api/environments/:id/guest-browser',(req,res)=>res.json(browserHost().info(id(req))));
   app.post('/api/environments/:id/browser/open',async(req,res)=>{z.object({}).strict().parse(req.body??{});const envId=id(req),host=browserHost();res.status(202).json(await controller.submit(envId,'open-browser',options=>host.open(envId,options)));});
@@ -138,7 +143,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.post('/api/environments/:id/clipboard/read',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(await files().readClipboard(id(req)));});
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));

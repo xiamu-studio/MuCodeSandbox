@@ -8,6 +8,7 @@ $source=[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/SealedBases.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/HostComponents.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/ProtectedLedger.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/ImageCache.cs'))
 $script=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText((Join-Path $ScriptDirectory 'hyperv.ps1'))))
 $hostScript=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.File]::ReadAllText((Join-Path $ScriptDirectory 'host-components.ps1'))))
 $source=$source.Replace('__HYPERV_SCRIPT_BASE64__',$script).Replace('__HOST_COMPONENTS_SCRIPT_BASE64__',$hostScript).Replace('__CHANNEL_FILE__',$ChannelFile).Replace('__BROKER_SOURCE_DIGEST__',$SourceDigest)

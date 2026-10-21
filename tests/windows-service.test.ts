@@ -38,6 +38,10 @@ test('Windows API requires its launch cookie, bearer token, valid Host and same 
   assert.equal((await fetch(service.url+'/api/windows/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,401);
   assert.equal((await fetch(service.url+'/api/windows/setup',{method:'POST',headers,body:JSON.stringify({image:'C:\\outside.vhdx'})})).status,400);
   assert.equal((await fetch(service.url+'/api/windows/setup',{method:'POST',headers,body:'{}'})).status,409);
+  assert.equal((await fetch(service.url+'/api/windows/storage')).status,401);
+  assert.equal((await fetch(service.url+'/api/windows/storage',{headers})).status,409);
+  assert.equal((await fetch(service.url+'/api/windows/storage/prune',{method:'POST',headers,body:JSON.stringify({plan:'a'.repeat(64),directory:'C:\\outside'})})).status,400);
+  assert.equal((await fetch(service.url+'/api/windows/storage/prune',{method:'POST',headers,body:JSON.stringify({plan:'a'.repeat(64)})})).status,409);
   assert.equal((await fetch(service.url+'/api/snapshot',{headers:{Authorization:headers.Authorization}})).status,401);
   const wrongHost=await new Promise<number>(resolve=>{const request=httpRequest(service!.url+'/api/snapshot',{headers:{...headers,Host:'attacker.invalid'}},response=>{response.resume();resolve(response.statusCode!);});request.end();});
   assert.equal(wrongHost,403);

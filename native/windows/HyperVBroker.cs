@@ -185,7 +185,12 @@ public static partial class MuHyperVBroker {
         if(action=="doctor"&&SetupOnly){ValidateKeys(request,"action");return Json().Serialize(new {available=false,issues=new[]{"请完成 Windows 系统组件准备后重新打开软件"}});}
         if(action=="doctor"||action=="fingerprint"){ValidateKeys(request,"action");return Invoke(action,null,10000,cancellation);}
         if(action=="shutdown"){ValidateKeys(request,"action");return "";}
-        if(action=="base-status"){ValidateKeys(request,"action","imageSha256");string digest=Digest(request,"imageSha256");if(!File.Exists(Path.Combine(UserRoot,"bases",digest+".json")))return new {ready=false};ResolveSealedBase("mu-base:"+digest,digest);return BaseReceipt(digest);}
+        if(action=="base-status"){ValidateKeys(request,"action","imageSha256");string digest=Digest(request,"imageSha256");lock(ImportGate){if(!File.Exists(Path.Combine(UserRoot,"bases",digest+".json")))return new {ready=false};ResolveSealedBase("mu-base:"+digest,digest);return BaseReceipt(digest);}}
+        if(action=="cache-status"||action=="cache-prune"){
+            if(action=="cache-prune")ValidateKeys(request,"action","keepDigest","plan");else ValidateKeys(request,"action","keepDigest");
+            string keep=request.ContainsKey("keepDigest")&&request["keepDigest"]!=null?Digest(request,"keepDigest"):null;
+            return CacheAction(action,keep,action=="cache-prune"?Digest(request,"plan"):null,cancellation);
+        }
         if(SetupOnly)throw new UnauthorizedAccessException("This session only prepares Windows components; reopen the application for virtual machines");
         if((action=="disk"||action=="begin-base"||action=="create"||action=="start")&&HostServicingBusy())throw new InvalidOperationException("Windows component servicing is running");
         string id=Id(request);
@@ -212,8 +217,10 @@ public static partial class MuHyperVBroker {
                 lock(Gate){record.Remove("platformId");record["stage"]="allocated";Save();}PrivateDirectory(Convert.ToString(Parameters(record)["directory"]),false);
                 string image=Convert.ToString(record["image"]);if(record.ContainsKey("sealedSource")){string reference=Text(request,"image",4096);if(reference!=Convert.ToString(record["sealedSource"]))throw new ArgumentException("Sealed source changed");ResolveSealedBase(reference,Convert.ToString(record["imageSha256"]));}if(!File.Exists(image)){
                     lock(ImportGate){if(!File.Exists(image)){
+                        using(var reservation=new FileStream(Path.Combine(Directory.GetParent(Directory.GetParent(UserRoot).FullName).FullName,"import.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None)){
                         long remaining=64L*1024*1024*1024-Directory.GetFiles(Path.Combine(UserRoot,"images")).Sum(file=>new FileInfo(file).Length);if(remaining<1)throw new IOException("Image cache quota reached");
                         string next=image+"."+Guid.NewGuid().ToString("N")+".next";try{CopyCaller(pipe,Text(request,"image",4096),next,Convert.ToString(record["imageSha256"]),remaining,cancellation);File.Move(next,image);}finally{if(File.Exists(next))File.Delete(next);}
+                        }
                     }}
                 }
                 if(HashFile(Convert.ToString(record["image"]))!=Convert.ToString(record["imageSha256"]))throw new UnauthorizedAccessException("Protected image changed");
@@ -224,11 +231,12 @@ public static partial class MuHyperVBroker {
             ValidateKeys(request,"action","id","image","imageSha256","cpus","memoryGiB","diskGiB");string source=Text(request,"image",4096),digest=Digest(request,"imageSha256");bool sealedSource=source.StartsWith("mu-base:",StringComparison.Ordinal);string extension=sealedSource?".vhdx":Path.GetExtension(source).ToLowerInvariant();if(extension!=".vhd"&&extension!=".vhdx")throw new ArgumentException("Disk image required");
             int cpu=Number(request,"cpus",1,Math.Min(16,Environment.ProcessorCount)),memory=Number(request,"memoryGiB",2,32),disk=Number(request,"diskGiB",16,256);
             if(action=="begin-base"&&(sealedSource||digest!=CanonicalBuilderDigest||cpu!=2||memory!=4||disk!=32))throw new ArgumentException("A new base requires the fixed official builder source and resources");
-            if(sealedSource)ResolveSealedBase(source,digest);
             lock(VmGate(id)) {
                 string dir=Path.Combine(UserRoot,"vms",id),image=Path.Combine(UserRoot,"images",digest+extension);
                 var record=new Dictionary<string,object>{{"id",id},{"ownerSid",OwnerSid},{"image",image},{"imageSha256",digest},{"cpus",cpu},{"memoryGiB",memory},{"diskGiB",disk},{"stage","allocated"}};
                 if(action=="begin-base")record["baseBuilder"]=true;if(sealedSource)record["sealedSource"]=source;
+                lock(ImportGate){
+                if(sealedSource)ResolveSealedBase(source,digest);
                 // Persist ownership before creating any allocation files. Failed
                 // source reads and cancelled imports remain discoverable/removable.
                 lock(Gate){if(Records.ContainsKey(id)||Records.Count>=32)throw new InvalidOperationException("VM allocation refused");if(HasStorage(dir))throw new UnauthorizedAccessException("Unregistered allocation storage is preserved; it cannot be replaced by a new VM");Records.Add(id,record);Save();}
@@ -241,6 +249,7 @@ public static partial class MuHyperVBroker {
                     }
                 }
                 else if((File.GetAttributes(image)&FileAttributes.ReparsePoint)!=0||HashFile(image)!=digest)throw new UnauthorizedAccessException("Protected image changed");}
+                }
                 Invoke("disk",Parameters(record),1200000,cancellation);lock(Gate){record["stage"]="disk-ready";Save();}return "";
             }
         }
@@ -278,7 +287,7 @@ public static partial class MuHyperVBroker {
                 lock(Gate){if(Stopping)throw new OperationCanceledException("Broker is closing");ActiveRequests++;RequestsIdle.Reset();counted=true;}
                 var request=Json().Deserialize<Dictionary<string,object>>(new UTF8Encoding(false,true).GetString(bytes.ToArray()));object result=Dispatch(pipe,request,cancel.Token);byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=true,result=result})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();if(Convert.ToString(request["action"])=="shutdown"){try{pipe.WaitForPipeDrain();}catch{}ThreadPool.QueueUserWorkItem(_=>Shutdown());}
             }
-        }catch(Exception error){try{byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=false,code=error is UnauthorizedAccessException?"DENIED":error is ArgumentException?"INVALID_REQUEST":error is OperationCanceledException?"CANCELLED":"BROKER_FAILED",error=error is ArgumentException||error is UnauthorizedAccessException?error.Message:"Privileged VM operation failed"})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();}catch{}try{File.AppendAllText(Path.Combine(UserRoot,"broker-errors.log"),DateTime.UtcNow.ToString("o")+" "+error.ToString()+Environment.NewLine);}catch{}}
+        }catch(Exception error){try{byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=false,code=error is MuStorageException?((MuStorageException)error).Code:error is UnauthorizedAccessException?"DENIED":error is ArgumentException?"INVALID_REQUEST":error is OperationCanceledException?"CANCELLED":"BROKER_FAILED",error=error is ArgumentException||error is UnauthorizedAccessException||error is MuStorageException?error.Message:"Privileged VM operation failed"})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();}catch{}try{File.AppendAllText(Path.Combine(UserRoot,"broker-errors.log"),DateTime.UtcNow.ToString("o")+" "+error.ToString()+Environment.NewLine);}catch{}}
         finally{closingRegistration.Dispose();cancel.Cancel();pipe.Dispose();lock(Gate){Pipes.Remove(pipe);if(counted){ActiveRequests--;if(ActiveRequests==0)RequestsIdle.Set();}}}
     }
     private static void Shutdown(){bool producer=false;NamedPipeServerStream[] closingPipes=null;lock(Gate){if(!Stopping){Stopping=true;producer=true;closingPipes=Pipes.ToArray();}}if(!producer){ShutdownComplete.WaitOne();return;}

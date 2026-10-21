@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -41,6 +41,34 @@ try{
   if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Synthetic guest administrator required'}
   if(-not (Test-Path -LiteralPath C:\MuLab\public\provisioned.json)){throw 'Guest bootstrap is incomplete'}
   [ordered]@{bootId=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');hypervisor=[bool](Get-CimInstance Win32_ComputerSystem).HypervisorPresent;edition=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID}
+ }
+ if($Phase -eq 'cache-inspect'){
+  $evidence=Invoke-Command -Session $session -ScriptBlock {
+   @{vms=@(Get-VM | Select-Object Name,@{Name='state';Expression={[string]$_.State}});receipts=@(Get-ChildItem -LiteralPath C:\MuLab\approved -File -Filter 'cache-*.json' | Select-Object Name,LastWriteTime);clients=@(Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object {$_.CommandLine -like '*client.mjs*cache*'} | Select-Object ProcessId,CreationDate);result=$(if(Test-Path -LiteralPath C:\MuLab\public\cache-result.json){Get-Content C:\MuLab\public\cache-result.json -Raw | ConvertFrom-Json}else{$null})}
+  }
+  Save-Probe 'cache-progress-inspected' $evidence;exit 0
+ }
+ if($Phase -eq 'cache-ui-stage'){
+  Invoke-Command -Session $session -ScriptBlock {[IO.Directory]::CreateDirectory('C:\MuLab\test-tools') | Out-Null}
+  foreach($tool in @(@{source='../../node_modules/electron/dist';target='C:\MuLab\test-tools\electron';file='electron.exe'},@{source='../../node_modules/playwright-core';target='C:\MuLab\test-tools\playwright-core';file='index.mjs'})){
+   $source=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot $tool.source));$present=Invoke-Command -Session $session -ArgumentList $tool.target,$tool.file -ScriptBlock {param($root,$file) Test-Path -LiteralPath (Join-Path $root $file)}
+   if(-not $present){Copy-Item -LiteralPath $source -Destination $tool.target -ToSession $session -Recurse}
+  }
+  $dist=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../dist'));foreach($file in @(Get-ChildItem -LiteralPath $dist -File -Recurse)){$relative=$file.FullName.Substring($dist.Length+1);$target='C:\MuLab\product\resources\app\dist\'+$relative;Invoke-Command -Session $session -ArgumentList ([IO.Path]::GetDirectoryName($target)) -ScriptBlock {param($path) [IO.Directory]::CreateDirectory($path) | Out-Null};Copy-Item -LiteralPath $file.FullName -Destination $target -ToSession $session -Force}
+  foreach($name in @('clean-host-cache-ui.cjs','clean-host-cache-ui.mjs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination ('C:\MuLab\'+$name.Replace('clean-host-','')) -ToSession $session -Force}
+  Save-Probe 'local-only-cache-ui-tools-staged';exit 0
+ }
+ if($Phase -in @('cache','cache-ui','cache-reset','cache-collect')){
+  $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-cache-operator.ps1'))
+  if($Phase -eq 'cache-reset'){$value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action reset -Nonce ('0'*64)};Save-Probe 'completed-cache-receipts-archived' $value;exit 0}
+  if($Phase -eq 'cache-collect'){
+   $evidence=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action collect -Nonce ('0'*64)}
+   $screenshot=$guard.Reserve('cache-ui.png');Copy-Item -LiteralPath C:\MuLab\public\cache-ui.png -Destination $screenshot -FromSession $session -Force
+   Assert-LabVM | Out-Null;Save-Probe 'cache-evidence-collected' $evidence
+   try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+   Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$until=[DateTime]::UtcNow.AddMinutes(2)
+   do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'cache-complete-and-evaluation-vm-off' $evidence;exit 0};if([DateTime]::UtcNow -gt $until){throw 'The evaluation VM has not confirmed shutdown'};Start-Sleep -Seconds 2}while($true)
+  }
  }
  if($Phase.StartsWith('ledger-')){
   if($Phase -eq 'ledger-logon'){
@@ -285,12 +313,18 @@ try{
  }
  Save-Probe 'preparing-standard-user-probe'
  if($Phase -eq 'network'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-network-client.mjs') -Destination C:\MuLab\network-client.mjs -ToSession $session -Force}
- if($Phase.StartsWith('ledger-')){
+ if($Phase.StartsWith('ledger-') -or $Phase -in @('cache','cache-ui')){
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-ledger-client.mjs') -Destination C:\MuLab\ledger-client.mjs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ProtectedLedger.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HostComponents.cs -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ImageCache.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ImageCache.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-broker.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-broker.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/broker.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js -ToSession $session -Force
+  if($Phase -in @('cache','cache-ui')){
+   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-cache-client.mjs') -Destination C:\MuLab\cache-client.mjs -ToSession $session -Force
+   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'hyperv.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\hyperv.ps1 -ToSession $session -Force
+   foreach($name in @('storage.js','service.js')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../dist-server/server/platform/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\'+$name) -ToSession $session -Force}
+  }
  }
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-client.mjs') -Destination C:\MuLab\client.mjs -ToSession $session -Force
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HyperVBroker.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HyperVBroker.cs -ToSession $session -Force
@@ -303,15 +337,16 @@ try{
   $manifest=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json
   if((Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.nodeSha256){throw 'Packaged Node digest changed'}
   if((Get-FileHash -LiteralPath C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.hostScriptSha256){throw 'Packaged servicing script changed'}
-  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','ledger-seed','ledger-check','ledger-final','ledger-deny')){
+  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','cache','cache-ui','ledger-seed','ledger-check','ledger-final','ledger-deny')){
    $build=@'
 import {buildBroker} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/broker.js';
 import {writeFile} from 'node:fs/promises';
 await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroker('C:/MuLab/private/build')));
 '@
    [IO.File]::WriteAllText('C:\MuLab\private\build.mjs',$build)
-   & $node --no-warnings C:\MuLab\private\build.mjs
-   if($LASTEXITCODE -ne 0){throw 'Guest broker build failed'}
+   $priorPreference=$ErrorActionPreference;$ErrorActionPreference='Continue';$buildOutput=@(& $node --no-warnings C:\MuLab\private\build.mjs 2>&1);$buildExit=$LASTEXITCODE;$ErrorActionPreference=$priorPreference
+   $buildText=$buildOutput | Out-String;[IO.File]::WriteAllText(('C:\MuLab\private\'+$phase+'-build.log'),$buildText)
+   if($buildExit -ne 0){throw ('Guest broker build failed: '+$buildText.Substring([Math]::Max(0,$buildText.Length-6000)))}
    $artifact=Get-Content -LiteralPath C:\MuLab\private\artifact.json -Raw | ConvertFrom-Json
    & ([ScriptBlock]::Create([IO.File]::ReadAllText('C:\MuLab\product\resources\app\dist-server\scripts\windows\install-broker.ps1'))) -Broker $artifact.broker -ExpectedBrokerHash $artifact.sha256 -Channel $artifact.channel -ExpectedChannelHash $artifact.channelSha256 -SourceDigest $artifact.sourceDigest
    if($LASTEXITCODE -ne 0){throw 'Guest protected broker installation failed'}
@@ -386,6 +421,15 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
    if($agent.HasExited -and $phase -ne 'ledger-deny'){throw ('Protected broker exited: '+[IO.File]::ReadAllText(('C:\MuLab\private\'+$phase+'-broker-stderr.log')))}
    if($probeClock.ElapsedMilliseconds -gt 3900000){throw 'Servicing or the client is still running; no process or VM was stopped'}
    if($phase -eq 'network'){Invoke-SyntheticNetworkRequests}
+   if($phase -in @('cache','cache-ui')){
+    foreach($action in @('seed','change','hold','remove-control','ui-seed','ui-change','permissions')){
+     $name='cache-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'
+     if(-not $handled.ContainsKey($name) -and (Test-Path -LiteralPath $file)){
+      $request=Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+      if($request.nonce -eq $nonce){if($request.action -ne $action){throw 'Unexpected cache operator request'};& ([ScriptBlock]::Create($operatorSource)) -Action $action -Nonce $nonce | Out-Null;$handled[$name]=$true}
+     }
+    }
+   }
    if($phase -in @('ledger-check','ledger-final') -and -not $ledgerInspected -and (Test-Path -LiteralPath C:\MuLab\public\ledger-inspect-request.json)){
     $request=Get-Content -LiteralPath C:\MuLab\public\ledger-inspect-request.json -Raw | ConvertFrom-Json
     if($request.nonce -eq $nonce){& ([ScriptBlock]::Create($operatorSource)) -Action inspect -Nonce $nonce | Out-Null;$ledgerInspected=$true}

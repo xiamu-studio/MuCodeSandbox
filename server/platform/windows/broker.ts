@@ -10,7 +10,7 @@ import {powershellPath,powershellArgs,fileHash} from './runtime.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../../scripts/windows');
 const reply=z.discriminatedUnion('ok',[z.object({ok:z.literal(true),result:z.unknown()}).strict(),z.object({ok:z.literal(false),code:z.string(),error:z.string()}).strict()]);
-export type BrokerAction='hello'|'doctor'|'fingerprint'|'disk'|'create'|'start'|'stop'|'status'|'inspect'|'channel'|'close-channel'|'shutdown'|'allocation'|'recover'|'prepare'|'delete'|'absence';
+export type BrokerAction='hello'|'doctor'|'fingerprint'|'disk'|'create'|'start'|'stop'|'status'|'inspect'|'channel'|'close-channel'|'shutdown'|'allocation'|'recover'|'prepare'|'delete'|'absence'|'begin-base'|'seal-base'|'base-status'|'discard-base-builder';
 
 export class HyperVBrokerClient{
  readonly pipe:string;
@@ -32,7 +32,7 @@ export class HyperVBrokerClient{
 }
 
 export async function brokerSourceDigest(){
- const files=['../../native/windows/HyperVBroker.cs','../../native/windows/HyperVChannel.cs','hyperv.ps1','build-broker.ps1','install-broker.ps1'];const sha=createHash('sha256');for(const file of files){sha.update(file+'\0');sha.update(await readFile(path.resolve(scripts,file)));}return sha.digest('hex');
+ const files=['../../native/windows/HyperVBroker.cs','../../native/windows/SealedBases.cs','../../native/windows/HyperVChannel.cs','hyperv.ps1','build-broker.ps1','install-broker.ps1'];const sha=createHash('sha256');for(const file of files){sha.update(file+'\0');sha.update(await readFile(path.resolve(scripts,file)));}return sha.digest('hex');
 }
 
 export function cleanWindowsEnvironment(){
@@ -65,7 +65,7 @@ export async function installBroker(root:string){
 
 export async function startBroker(executable:string){
  const nonce=randomBytes(32).toString('hex'),client=new HyperVBrokerClient(nonce);
- const launch=`$ErrorActionPreference='Stop'; Start-Process -FilePath '${executable.replaceAll("'","''")}' -ArgumentList @('--owner','${process.pid}','--pipe','${nonce}') -Verb RunAs -WindowStyle Hidden`;
+ const launch=`$ErrorActionPreference='Stop'; Start-Process -FilePath '${executable.replaceAll("'","''")}' -WorkingDirectory '${path.dirname(executable).replaceAll("'","''")}' -ArgumentList @('--owner','${process.pid}','--pipe','${nonce}') -Verb RunAs -WindowStyle Hidden`;
  await run(powershellPath(),powershellArgs(launch),{env:cleanWindowsEnvironment(),timeoutMs:30000});
  const expected=await brokerSourceDigest(),until=Date.now()+120000;for(;;){try{const hello=await client.hello();if(hello.sourceDigest!==expected)throw new AppError('权限代理版本与当前源码不一致，请重新安装',409,'BROKER_UPDATE_REQUIRED');return client;}catch(error){if(!(error instanceof AppError)||error.code!=='BROKER_UNAVAILABLE'||Date.now()>until)throw error;await new Promise(resolve=>setTimeout(resolve,200));}}
 }

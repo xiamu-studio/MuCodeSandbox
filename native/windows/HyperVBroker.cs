@@ -15,7 +15,7 @@ using System.Web.Script.Serialization;
 // Source preview authority boundary. Requests contain typed VM operations, never
 // executable text. Hyper-V inputs and disks live in an administrator-owned store.
 // User-selected images/seeds are opened while impersonating the pipe caller.
-public static class MuHyperVBroker {
+public static partial class MuHyperVBroker {
     private const string HyperVScript = "__HYPERV_SCRIPT_BASE64__";
     private const string ChannelFile = "__CHANNEL_FILE__";
     private const string SourceDigest = "__BROKER_SOURCE_DIGEST__";
@@ -167,7 +167,10 @@ public static class MuHyperVBroker {
         if(action=="hello"){ValidateKeys(request,"action");return new {version=1,ownerPid=Owner.Id,ownerSid=OwnerSid,elevated=true,protectedStorage=true,sourceDigest=SourceDigest};}
         if(action=="doctor"||action=="fingerprint"){ValidateKeys(request,"action");return Invoke(action,null,10000,cancellation);}
         if(action=="shutdown"){ValidateKeys(request,"action");return "";}
+        if(action=="base-status"){ValidateKeys(request,"action","imageSha256");string digest=Digest(request,"imageSha256");if(!File.Exists(Path.Combine(UserRoot,"bases",digest+".json")))return new {ready=false};ResolveSealedBase("mu-base:"+digest,digest);return BaseReceipt(digest);}
         string id=Id(request);
+        if(action=="seal-base"){ValidateKeys(request,"action","id");return SealBase(id,cancellation);}
+        if(action=="discard-base-builder"){ValidateKeys(request,"action","id");lock(VmGate(id)){var builder=Owned(id);if(!builder.ContainsKey("baseBuilder")||!Convert.ToBoolean(builder["baseBuilder"]))throw new UnauthorizedAccessException("Only a marked base builder may be discarded by setup");return Dispatch(pipe,new Dictionary<string,object>{{"action","delete"},{"id",id}},cancellation);}}
         if(action=="absence"){
             ValidateKeys(request,"action","id","platformId");var record=new Dictionary<string,object>{{"id",id},{"image",""},{"imageSha256",""},{"cpus",1},{"memoryGiB",2},{"diskGiB",16},{"stage","unregistered"}};var parameters=Parameters(record);
             if(request.ContainsKey("platformId")){string platform=Text(request,"platformId",36);Guid parsed;if(!Guid.TryParseExact(platform,"D",out parsed)||parsed==Guid.Empty)throw new ArgumentException("VM identity required");parameters["expectedPlatformId"]=platform;}
@@ -187,7 +190,7 @@ public static class MuHyperVBroker {
                     lock(Gate){Records.Remove(id);try{Save();}catch{Records.Add(id,record);throw;}}return new {deleted=true,vmAbsent=true,switchAbsent=true,storageAbsent=true};
                 }
                 lock(Gate){record.Remove("platformId");record["stage"]="allocated";Save();}PrivateDirectory(Convert.ToString(Parameters(record)["directory"]),false);
-                string image=Convert.ToString(record["image"]);if(!File.Exists(image)){
+                string image=Convert.ToString(record["image"]);if(record.ContainsKey("sealedSource")){string reference=Text(request,"image",4096);if(reference!=Convert.ToString(record["sealedSource"]))throw new ArgumentException("Sealed source changed");ResolveSealedBase(reference,Convert.ToString(record["imageSha256"]));}if(!File.Exists(image)){
                     lock(ImportGate){if(!File.Exists(image)){
                         long remaining=64L*1024*1024*1024-Directory.GetFiles(Path.Combine(UserRoot,"images")).Sum(file=>new FileInfo(file).Length);if(remaining<1)throw new IOException("Image cache quota reached");
                         string next=image+"."+Guid.NewGuid().ToString("N")+".next";try{CopyCaller(pipe,Text(request,"image",4096),next,Convert.ToString(record["imageSha256"]),remaining,cancellation);File.Move(next,image);}finally{if(File.Exists(next))File.Delete(next);}
@@ -197,12 +200,15 @@ public static class MuHyperVBroker {
                 Invoke("disk",Parameters(record),1200000,cancellation);lock(Gate){record["stage"]="disk-ready";Save();}return new {state="Off",present=false,ready=false};
             }
         }
-        if(action=="disk") {
-            ValidateKeys(request,"action","id","image","imageSha256","cpus","memoryGiB","diskGiB");string source=Text(request,"image",4096),digest=Digest(request,"imageSha256"),extension=Path.GetExtension(source).ToLowerInvariant();if(extension!=".vhd"&&extension!=".vhdx")throw new ArgumentException("Disk image required");
+        if(action=="disk"||action=="begin-base") {
+            ValidateKeys(request,"action","id","image","imageSha256","cpus","memoryGiB","diskGiB");string source=Text(request,"image",4096),digest=Digest(request,"imageSha256");bool sealedSource=source.StartsWith("mu-base:",StringComparison.Ordinal);string extension=sealedSource?".vhdx":Path.GetExtension(source).ToLowerInvariant();if(extension!=".vhd"&&extension!=".vhdx")throw new ArgumentException("Disk image required");
             int cpu=Number(request,"cpus",1,Math.Min(16,Environment.ProcessorCount)),memory=Number(request,"memoryGiB",2,32),disk=Number(request,"diskGiB",16,256);
+            if(action=="begin-base"&&(sealedSource||digest!=CanonicalBuilderDigest||cpu!=2||memory!=4||disk!=32))throw new ArgumentException("A new base requires the fixed official builder source and resources");
+            if(sealedSource)ResolveSealedBase(source,digest);
             lock(VmGate(id)) {
                 string dir=Path.Combine(UserRoot,"vms",id),image=Path.Combine(UserRoot,"images",digest+extension);
                 var record=new Dictionary<string,object>{{"id",id},{"ownerSid",OwnerSid},{"image",image},{"imageSha256",digest},{"cpus",cpu},{"memoryGiB",memory},{"diskGiB",disk},{"stage","allocated"}};
+                if(action=="begin-base")record["baseBuilder"]=true;if(sealedSource)record["sealedSource"]=source;
                 // Persist ownership before creating any allocation files. Failed
                 // source reads and cancelled imports remain discoverable/removable.
                 lock(Gate){if(Records.ContainsKey(id)||Records.Count>=32)throw new InvalidOperationException("VM allocation refused");Records.Add(id,record);Save();}
@@ -235,6 +241,7 @@ public static class MuHyperVBroker {
             lock(VmGate(id)){
                 if((action=="status"||action=="stop")&&(!owned.ContainsKey("platformId")||Convert.ToString(owned["stage"])!="ready"))return Json().Serialize(RecoverAllocation(owned));
                 if(!owned.ContainsKey("platformId")||action=="start"&&Convert.ToString(owned["stage"])!="ready")throw new InvalidOperationException("VM is not ready");
+                if(action=="start"&&owned.ContainsKey("baseSealedDigest"))throw new InvalidOperationException("A sealed builder cannot be started again");
                 if(action=="start")lock(Gate)StartedHere.Add(id);
                 if(action=="stop")CloseChannel(id);try{return Invoke(action,Parameters(owned),30000,action=="stop"?CancellationToken.None:cancellation);}finally{if(action=="start"&&cancellation.IsCancellationRequested){CloseChannel(id);try{Invoke("stop",Parameters(owned),30000,CancellationToken.None);}catch{}}}
             }
@@ -266,7 +273,7 @@ public static class MuHyperVBroker {
         if(args.Length!=4||args[0]!="--owner"||args[2]!="--pipe")return 64;int ownerPid;if(!int.TryParse(args[1],out ownerPid)||ownerPid<=0||args[3].Length!=64||args[3].Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))return 64;
         if(!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator))return 77;
         try {
-            Owner=Process.GetProcessById(ownerPid);OwnerSid=ProcessSid(Owner);var common=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),"MuCodeSandbox-HyperVBroker-v1");TrustedExecutable(common);PrivateDirectory(common);var users=Path.Combine(common,"users");PrivateDirectory(users);UserRoot=Path.Combine(users,OwnerSid);PrivateDirectory(UserRoot);PrivateDirectory(Path.Combine(UserRoot,"images"));PrivateDirectory(Path.Combine(UserRoot,"vms"));
+            Owner=Process.GetProcessById(ownerPid);OwnerSid=ProcessSid(Owner);var common=Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),"MuCodeSandbox-HyperVBroker-v1");TrustedExecutable(common);PrivateDirectory(common);var users=Path.Combine(common,"users");PrivateDirectory(users);UserRoot=Path.Combine(users,OwnerSid);PrivateDirectory(UserRoot);Directory.SetCurrentDirectory(UserRoot);PrivateDirectory(Path.Combine(UserRoot,"images"));PrivateDirectory(Path.Combine(UserRoot,"vms"));
             // The previous owner can exit before its agent finishes VM cleanup.
             // Wait for that sealed store to be released, never bypass its lock.
             var waiting=Stopwatch.StartNew();for(;;){if(Owner.HasExited)throw new OperationCanceledException("Application exited while waiting for storage");try{Held.Add(new FileStream(Path.Combine(UserRoot,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None));break;}catch(IOException){if(waiting.ElapsedMilliseconds>90000)throw;Thread.Sleep(100);}}

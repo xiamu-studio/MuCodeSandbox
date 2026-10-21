@@ -5,6 +5,7 @@ import {api,editConfig,request} from '../api.ts';
 import {Button,Field,Modal,Notice,SectionHeading,Status,dateLabel} from '../components.tsx';
 import './windows.css';
 import WindowsFilesPanel from './WindowsFilesPanel.tsx';
+import WindowsSetupPanel from './WindowsSetupPanel.tsx';
 const TerminalPanel=lazy(()=>import('../TerminalPanel.tsx'));
 const WindowsBrowserView=lazy(()=>import('./WindowsBrowserView.tsx'));
 
@@ -48,7 +49,7 @@ export default function WindowsWorkspace(){
   <aside className="sidebar">
    <button className="brand" onClick={()=>{showSystem(false);select(null);}}><span className="brand-mark"><TerminalSquare size={23}/></span><span>MuCodeSandbox<small>WINDOWS PREVIEW</small></span></button>
    <nav className="primary-nav"><button onClick={()=>{showSystem(false);select(null);}}><Box size={17}/><span>工作区</span></button><button onClick={()=>showSystem(true)}><Settings size={17}/><span>系统状态</span></button></nav>
-   <div className="sidebar-section-heading"><span>Linux 环境</span><Button aria-label="新建环境" disabled={!snapshot} onClick={()=>setDialog('new')} icon={<Plus size={15}/>}/></div>
+   <div className="sidebar-section-heading"><span>Linux 环境</span><Button aria-label="新建环境" disabled={!snapshot?.system.runtime.available} onClick={()=>setDialog('new')} icon={<Plus size={15}/>}/></div>
    <div className="sidebar-environments">{snapshot?.environments.map(e=><button key={e.id} className={`sidebar-env ${selectedId===e.id&&!system?'selected':''}`} onClick={()=>{showSystem(false);select(e.id);}}><span className={`small-env-symbol color-${e.color}`}><Box size={16}/></span><span><strong>{e.name}</strong><small>Hyper-V · Linux</small></span><span className={`sidebar-status dot-${e.state}`}/></button>)}</div>
    <div className="sidebar-bottom"><div className="local-health"><span className={connected?'live-dot':'offline-dot'}/><span>{connected?'本机服务已连接':'连接已断开'}</span></div></div>
   </aside>
@@ -56,11 +57,12 @@ export default function WindowsWorkspace(){
    <div className="main-content">
     {error&&<Notice kind="error">{error}</Notice>}
     {snapshot?.system.hostNetwork?.issue&&<Notice kind="error">{snapshot.system.hostNetwork.issue}。请退出并重新打开预览后再启动环境。</Notice>}
+    {snapshot&&window.__MU_CONFIG__.capabilities?.setup&&!snapshot.system.runtime.available&&<WindowsSetupPanel onReady={refresh}/>}
     {!snapshot?<div className="loading-view">连接 Windows 本机服务…</div>:system?<>
      <header className="page-header"><div><div className="eyebrow">WINDOWS</div><h1>系统状态</h1><p>Hyper-V 管理预览</p></div></header>
      <dl className="facts"><div><dt>运行组件</dt><dd>{snapshot.system.runtime.available?'已就绪':'需要处理'}</dd></div><div><dt>虚拟化后端</dt><dd>Windows Hyper-V</dd></div><div><dt>设备资源</dt><dd>{snapshot.system.cpus} 核心 · {snapshot.system.memoryGiB} GiB</dd></div><div><dt>数据目录</dt><dd className="path-text">{snapshot.system.dataDir}</dd></div><div><dt>版本</dt><dd>{snapshot.system.version}</dd></div></dl>
-     {snapshot.system.runtime.error&&<Notice kind="error">{snapshot.system.runtime.error}</Notice>}
-     <Notice>当前可管理 Linux 环境，使用交互式终端、文件传输和独立 Linux 浏览器。共享、快照和安装包仍在开发。</Notice>
+     {snapshot.system.runtime.error&&!(window.__MU_CONFIG__.capabilities?.setup&&snapshot.system.runtime.error==='请先准备空白受保护基盘')&&<Notice kind="error">{snapshot.system.runtime.error}</Notice>}
+     <Notice>当前可管理 Linux 环境，使用交互式终端、文件传输和独立 Linux 浏览器。共享、快照和完整系统准备仍在开发。</Notice>
     </>:selected?<>
      <header className="page-header environment-header"><div><div className="eyebrow">HYPER-V · LINUX</div><h1>{selected.name}</h1><p>{selected.description}</p></div><div className="environment-header-actions"><Status state={selected.state}/><Button disabled={!connected||!!active||selected.state!=='running'} onClick={()=>void action('restart')} icon={<RefreshCw size={15}/>}>重启</Button><Button className="primary" loading={!!active} disabled={!connected} onClick={()=>void action(selected.state==='running'?'stop':'start')}>{active?'处理中':selected.state==='running'?'停止':'启动'}</Button></div></header>
      {selected.lastError&&<Notice kind="error">{displayIssue(selected.lastError)}</Notice>}
@@ -75,9 +77,9 @@ export default function WindowsWorkspace(){
      {selected.state==='running'&&!active&&tool==='files'&&<WindowsFilesPanel key={selected.id} id={selected.id}/>}
      {selected.state==='running'&&selected.browserRunning&&tool==='browser'&&<Suspense fallback={<p>加载画面…</p>}><WindowsBrowserView key={selected.id} environment={selected}/></Suspense>}
     </>:<>
-     <header className="page-header"><div><div className="eyebrow">WINDOWS PREVIEW</div><h1>工作区</h1><p>独立 Linux 环境 · 严格代理联网</p></div><Button className="primary" disabled={!connected} onClick={()=>setDialog('new')} icon={<Plus size={16}/>}>新建环境</Button></header>
+     <header className="page-header"><div><div className="eyebrow">WINDOWS PREVIEW</div><h1>工作区</h1><p>独立 Linux 环境 · 严格代理联网</p></div><Button className="primary" disabled={!connected||!snapshot.system.runtime.available} onClick={()=>setDialog('new')} icon={<Plus size={16}/>}>新建环境</Button></header>
      <Notice>先配置代理和明确批准的出口 IPv4。启动时核验出口，核验失败或连接中断会关闭环境。</Notice>
-     {snapshot.system.runtime.error&&<Notice kind="error">{snapshot.system.runtime.error}</Notice>}
+     {snapshot.system.runtime.error&&!(window.__MU_CONFIG__.capabilities?.setup&&snapshot.system.runtime.error==='请先准备空白受保护基盘')&&<Notice kind="error">{snapshot.system.runtime.error}</Notice>}
      <div className="env-table">{snapshot.environments.map(e=><button key={e.id} className="windows-environment-row" onClick={()=>select(e.id)}><span className="env-table-name"><ShieldCheck size={20}/><strong>{e.name}</strong></span><span>{e.cpus} 核心 · {e.memoryGiB} GiB</span><Status state={e.state}/></button>)}</div>
      {!snapshot.environments.length&&<div className="workspace-empty"><Box size={32}/><h2>创建第一个 Windows Linux 环境</h2></div>}
     </>}

@@ -3,6 +3,8 @@ import { isIPv4 } from 'node:net';
 import path from 'node:path';
 import { z } from 'zod';
 
+export const isSealedBase=(value:string)=>/^mu-base:[a-f0-9]{64}$/.test(value);
+export const windowsBaseSchema=z.object({image:z.string().refine(v=>path.isAbsolute(v)||isSealedBase(v)),imageSha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict().refine(v=>!isSealedBase(v.image)||v.image.slice(8)===v.imageSha256,'Sealed base digest mismatch');
 export const windowsConfigSchema = z.object({
   version: z.literal(1),
   id: z.uuid(),
@@ -11,7 +13,7 @@ export const windowsConfigSchema = z.object({
   diskGiB: z.number().int().min(16).max(256).default(24),
   timezone: z.string().refine(v => { try { new Intl.DateTimeFormat('en', { timeZone: v }); return true; } catch { return false; } }).default('UTC'),
   // A protected image is explicitly prepared before it can be used for work.
-  image: z.string().refine(v => path.isAbsolute(v)),
+  image: z.string().refine(v => path.isAbsolute(v)||isSealedBase(v)),
   imageSha256: z.string().regex(/^[a-f0-9]{64}$/),
   proxy: z.object({
     mode: z.enum(['http', 'https', 'socks5']),
@@ -23,7 +25,7 @@ export const windowsConfigSchema = z.object({
   }).strict().refine(v => v.mode !== 'https' || !!v.serverName, 'HTTPS proxy requires a TLS server name'),
   expectedIp: z.string().refine(isIPv4),
   dns:z.object({address:z.string().refine(isIPv4),serverName:z.string().regex(/^[a-zA-Z0-9.-]+$/),port:z.number().int().min(1).max(65535),path:z.string().regex(/^\/[a-zA-Z0-9/_?=.%+-]*$/)}).strict().optional(),
-}).strict();
+}).strict().refine(v=>!isSealedBase(v.image)||v.image.slice(8)===v.imageSha256,'Sealed base digest mismatch');
 export type WindowsConfig = z.infer<typeof windowsConfigSchema>;
 export const RELAY_PORT = 17401;
 export const PROBE_PORT = 17402;

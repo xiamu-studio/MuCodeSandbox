@@ -11,7 +11,7 @@ import {environmentSchema,redact} from '../../validation.ts';
 import {AppError,errorMessage} from '../../errors.ts';
 import type {RunOptions} from '../../process.ts';
 import {HyperVRuntime} from './runtime.ts';
-import {windowsConfigSchema,windowsPaths,vmIdentity,type WindowsConfig} from './config.ts';
+import {windowsConfigSchema,windowsPaths,vmIdentity,isSealedBase,type WindowsConfig} from './config.ts';
 import type {WindowsNetworkSession} from './session.ts';
 
 export interface WindowsBase {image:string;imageSha256:string}
@@ -42,6 +42,7 @@ export class WindowsManager {
   if(e.mounts.length||e.ports.length)throw new AppError('Windows 持续共享和端口映射仍在适配；请先使用手动传输',409,'FEATURE_UNAVAILABLE');
   if(e.network.tls?.certificate)throw new AppError('Windows 自定义代理 CA 仍在适配，请使用受信任证书',409,'FEATURE_UNAVAILABLE');
   if(e.cpus>Math.min(16,cpus().length)||e.memoryGiB<2||e.memoryGiB>Math.min(32,Math.floor(totalmem()/2**30*.8))||e.diskGiB<16)throw new AppError('请使用可用的 CPU、至少 2 GiB 内存和至少 16 GiB 磁盘',400,'RESOURCE_LIMIT');
+  if(this.options.base&&isSealedBase(this.options.base.image)&&e.diskGiB<32)throw new AppError('当前空白基盘需要至少 32 GiB 虚拟磁盘',400,'RESOURCE_LIMIT');
   return e;
  }
  async create(input:unknown){

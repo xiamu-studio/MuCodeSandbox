@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence')][string]$Action)
+param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence')][string]$Action)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -112,6 +112,14 @@ switch ($Action) {
     if(Test-Path -LiteralPath $servicePath) {
       if((Get-ItemProperty -LiteralPath $servicePath).ElementName -ne $friendly){throw 'Hyper-V channel ID belongs to another application'}
     } else {New-Item -Path $servicePath | Out-Null;New-ItemProperty -LiteralPath $servicePath -Name ElementName -Value $friendly -PropertyType String | Out-Null}
+  }
+  'seal-base' {
+    $v=StopAllocation
+    if(-not $v){throw 'Base builder is missing'}
+    InspectVM | Out-Null
+    $disk=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($disk.ParentPath -or $disk.Size -ne 32GB -or $disk.VhdFormat -ne 'VHDX'){throw 'Expected a self-contained 32 GiB base builder'}
+    [pscustomobject]@{state='Off';verified=$true} | ConvertTo-Json -Compress
   }
   'export-base' {
     $v = OwnedVM

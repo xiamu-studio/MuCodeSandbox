@@ -47,7 +47,7 @@ process.on('message',raw=>{void(async()=>{
   if(process.platform!=='win32')throw Error('Windows 桌面入口只能在 Windows 上运行');
   ownerWatch=await watchWindowsDesktopOwner(process.ppid,ownerLost);
   const elevated=await run(powershellPath(),powershellArgs("[Console]::Write(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"),{env:cleanWindowsEnvironment(),timeoutMs:10000});if(elevated.trim()!=='False')throw Error('请以普通用户身份启动 Windows 桌面程序');
-  const root=windowsRuntimeDirectory();await secureWindowsDirectory(root);await secureWindowsDirectory(windowsAppDirectory());send({type:'status',phase:'checking'});
+  const root=windowsRuntimeDirectory();await secureWindowsDirectory(root);process.chdir(root);await secureWindowsDirectory(windowsAppDirectory());send({type:'status',phase:'checking'});
   let executable:string;
   try{executable=await installedBrokerPath();}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT'&&(error as {code?:string}).code!=='BROKER_UPDATE_REQUIRED')throw error;send({type:'status',phase:'installing'});await installBroker(root);executable=await installedBrokerPath();}
   send({type:'status',phase:'authorizing'});broker=await startBroker(executable);runtime=new HyperVRuntime(root,undefined,broker);service=await createWindowsService({rootDir:value.rootDir,runtimeRoot:root,runtime});initializing=false;send({type:'ready',url:service.launchUrl(),pid:process.pid});

@@ -12,7 +12,7 @@ import { shellQuote } from '../../network-guard.ts';
 import { LEASE_HELPER_PATH } from '../../guest-lease.ts';
 import { PROXY_SESSION } from '../../proxy-transport.ts';
 import type { VmBackend } from '../contract.ts';
-import { windowsConfigSchema, windowsPaths, vmIdentity, RELAY_PORT, PROBE_PORT, type WindowsConfig } from './config.ts';
+import { windowsConfigSchema, windowsPaths, vmIdentity, RELAY_PORT, PROBE_PORT, isSealedBase, windowsBaseSchema, type WindowsConfig } from './config.ts';
 import { cloudInit, bootstrapScript, installAmd64TunnelScript, configureWindowsGuard, INSPECT_WINDOWS_GUARD, windowsEnvironment } from './guest.ts';
 import { WindowsNetworkSession } from './session.ts';
 import { measureEgress } from '../../egress.ts';
@@ -56,6 +56,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   private vmIds=new Map<string,string>();
   private channels=new Map<string,{child:ChildProcessWithoutNullStreams;port:number}>();
   private serviceStreams=new Map<string,Set<Duplex>>();
+  private baseBuilders=new Set<string>();
   readonly root:string;
   readonly runner:Runner;
   readonly broker:HyperVBrokerClient|undefined;
@@ -110,9 +111,9 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
       if(action==='register-channel')return '';
       if(action==='export-base')throw new AppError('基盘构建和导出仍使用独立管理员构建入口',409,'BROKER_EXPORT_UNAVAILABLE');
       const request:Record<string,unknown>=c?{id:c.id}:{};
-      if(action==='disk'&&c)Object.assign(request,{image:path.resolve(c.image),imageSha256:c.imageSha256,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB});
+      if(action==='disk'&&c)Object.assign(request,{image:isSealedBase(c.image)?c.image:path.resolve(c.image),imageSha256:c.imageSha256,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB});
       if(action==='create'&&c)Object.assign(request,{seed:windowsPaths(this.root,c.id).seed,seedSha256:await fileHash(windowsPaths(this.root,c.id).seed)});
-      return String(await this.broker.call(action as BrokerAction,request,{...options,timeoutMs:options.timeoutMs??45000}));
+      return String(await this.broker.call(action==='disk'&&c&&this.baseBuilders.has(c.id)?'begin-base':action as BrokerAction,request,{...options,timeoutMs:options.timeoutMs??45000}));
     }
     const p=c?windowsPaths(this.root,c.id):undefined;
     const value=c?{...vmIdentity(c.id),...p,cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB,image:c.image,
@@ -205,8 +206,9 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     for(const key of ['SystemDrive','TEMP','TMP','USERPROFILE','LOCALAPPDATA','PROGRAMDATA'])if(process.env[key])env[key]=process.env[key]!;
     return {file:path.join(systemRoot,'System32/OpenSSH/ssh.exe'),args,env,cwd:this.root};
   }
-  async create(input:WindowsConfig,options:RunOptions={}) {
+  async create(input:WindowsConfig,options:RunOptions={},purpose:'environment'|'base-builder'='environment') {
     const c=windowsConfigSchema.parse(input),p=windowsPaths(this.root,c.id),n=vmIdentity(c.id);
+    if(purpose==='base-builder'){if(!this.broker||c.imageSha256!==CANONICAL_NOCLOUD_PATCH.sourceSha256||c.cpus!==2||c.memoryGiB!==4||c.diskGiB!==32)throw Error('Only the fixed official source can create a base builder');this.baseBuilders.add(c.id);}
     let retry=false;
     if(this.broker){
       const allocated=await this.allocation(c);
@@ -214,7 +216,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
         if(await this.recoverCreation(c))return;
         if(allocated.everReady)throw new AppError('已有环境的虚拟机或防护状态异常，已保留原磁盘',409,'EXISTING_GUEST_RETAINED');
         if(allocated.imageSha256!==c.imageSha256||allocated.cpus!==c.cpus||allocated.memoryGiB!==c.memoryGiB||allocated.diskGiB!==c.diskGiB)throw new AppError('未完成创建的资源配置已变化，已保留原文件',409,'RECOVERY_CONFIG_CHANGED');
-        const prepared=await this.broker.call('prepare',{id:c.id,image:path.resolve(c.image)},{...options,timeoutMs:1200000}) as {ready:boolean};
+        const prepared=await this.broker.call('prepare',{id:c.id,image:isSealedBase(c.image)?c.image:path.resolve(c.image)},{...options,timeoutMs:1200000}) as {ready:boolean};
         if(prepared.ready){if(await this.recoverCreation(c))return;throw Error('Recovered allocation is incomplete');}retry=true;
       }
       try{await access(p.directory);if(!allocated.registered&&!await this.metadataMarker(c))throw new AppError('已有运行目录没有权限代理创建标记，已保留文件',409,'RECOVERY_FILES_RETAINED');await this.cleanMetadata(c,true);}
@@ -222,8 +224,8 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     }
     const info=await this.info();if(!info.available)throw Error(info.issues.join('; '));
     if(!this.broker)await this.channelHelper();await this.powershell('register-channel',c);
-    if(await fileHash(c.image)!==c.imageSha256)throw Error('VM image checksum mismatch');
-    if((await lstat(c.image)).isSymbolicLink())throw Error('VM image cannot be a symbolic link');
+    if(isSealedBase(c.image)){if(!this.broker)throw Error('Protected base references require the privileged broker');await this.verifySealedBase(c);}
+    else{if(await fileHash(c.image)!==c.imageSha256)throw Error('VM image checksum mismatch');if((await lstat(c.image)).isSymbolicLink())throw Error('VM image cannot be a symbolic link');}
     await mkdir(this.root,{recursive:true});
     if((await lstat(this.root)).isSymbolicLink())throw Error('Data root cannot be a symbolic link');
     if(this.broker)await mkdir(p.directory,{recursive:true});else await mkdir(p.directory);
@@ -310,19 +312,30 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
       child.once('close',()=>{clearTimeout(timer);resolve();});
     });
   }
-  async bootstrap(c:WindowsConfig,archive:string) {
+  async bootstrap(c:WindowsConfig,archive:string,options:RunOptions={}) {
     if(await fileHash(archive)!==AMD64_TUNNEL.sha256)throw Error('Tunnel component checksum mismatch');
-    await this.management(c,['bash','-s'],{input:bootstrapScript(c),timeoutMs:600000});
+    await this.management(c,['bash','-s'],{...options,input:bootstrapScript(c),timeoutMs:600000});
     const guestArchive='/tmp/mu-windows-tunnel.tar.gz';
-    await this.management(c,['bash','-c',`umask 077; base64 -d > ${guestArchive}`],{input:(await readFile(archive)).toString('base64'),timeoutMs:60000});
-    await this.management(c,['bash','-s'],{input:installAmd64TunnelScript(guestArchive),timeoutMs:60000});
+    await this.management(c,['bash','-c',`umask 077; base64 -d > ${guestArchive}`],{...options,input:(await readFile(archive)).toString('base64'),timeoutMs:60000});
+    await this.management(c,['bash','-s'],{...options,input:installAmd64TunnelScript(guestArchive),timeoutMs:60000});
     await this.management(c,['rm','-f',guestArchive]);
   }
-  async freezeBase(c:WindowsConfig) {
+  async discardBaseBuilder(c:WindowsConfig){
+    if(!this.broker||c.imageSha256!==CANONICAL_NOCLOUD_PATCH.sourceSha256)throw Error('Official base builder required');
+    if((await this.allocation(c)).registered){const receipt=z.object({deleted:z.literal(true),vmAbsent:z.literal(true),switchAbsent:z.literal(true),storageAbsent:z.literal(true)}).strict().parse(await this.broker.call('discard-base-builder',{id:c.id},{timeoutMs:45000}));if(!receipt.deleted)throw Error('Builder cleanup not confirmed');}
+    await this.confirmUnregisteredAbsence(c);try{await access(windowsPaths(this.root,c.id).directory);await this.cleanMetadata(c,false);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}this.baseBuilders.delete(c.id);this.vmIds.delete(c.id);
+  }
+  async verifySealedBase(base:{image:string;imageSha256:string}){windowsBaseSchema.parse({image:base.image,imageSha256:base.imageSha256});if(!this.broker||!isSealedBase(base.image))throw Error('Sealed base reference required');const value=await this.broker.call('base-status',{imageSha256:base.imageSha256});const receipt=z.object({ready:z.literal(true),image:z.literal(base.image),imageSha256:z.literal(base.imageSha256)}).strict().parse(value);return {image:receipt.image,imageSha256:receipt.imageSha256};}
+  async sealPreparedBase(c:WindowsConfig,options:RunOptions={}){
+    if(!this.broker||!this.baseBuilders.has(c.id)||c.imageSha256!==CANONICAL_NOCLOUD_PATCH.sourceSha256)throw Error('Only this newly created official builder can be sealed');
+    await this.scrubBase(c,options);await this.disconnect();await this.stop(c);
+    const receipt=z.object({ready:z.literal(true),image:z.string(),imageSha256:z.string()}).strict().parse(await this.broker.call('seal-base',{id:c.id},{...options,timeoutMs:1200000}));return windowsBaseSchema.parse({image:receipt.image,imageSha256:receipt.imageSha256});
+  }
+  private async scrubBase(c:WindowsConfig,options:RunOptions={}) {
     if(c.proxy.username||c.proxy.password)throw Error('A reusable lab base must be built without proxy credentials');
     // Only for a fresh builder VM, before any user work. The next clone gets
     // new cloud-init credentials, machine-id and a new per-environment guard.
-    await this.management(c,['bash','-s'],{timeoutMs:30000,input:`set -euo pipefail
+    await this.management(c,['bash','-s'],{...options,timeoutMs:30000,input:`set -euo pipefail
 sudo systemctl disable --now mucodesandbox-tunnel.service || true
 sudo tee /etc/mucodesandbox/network.nft >/dev/null <<'MU_CLOSED'
 add table inet mu_egress
@@ -342,10 +355,13 @@ table inet mu_lease {
 MU_LEASE_CLOSED
 sudo rm -f /etc/mucodesandbox/tunnel.json /etc/mucodesandbox/tunnel.json.next /etc/mucodesandbox/environment /etc/mucodesandbox/proxy-endpoints.json
 sudo rm -f /home/mu/.ssh/authorized_keys /etc/ssh/ssh_host_*key /etc/ssh/ssh_host_*key.pub
-sudo cloud-init clean --logs --machine-id
+sudo rm -f /root/.bash_history /home/mu/.bash_history /home/dev/.bash_history
+sudo cloud-init clean --logs --machine-id --seed
 sudo sync
 `});
-    await this.disconnect();await this.stop(c);await this.powershell('export-base',c,{timeoutMs:300000});
+  }
+  async freezeBase(c:WindowsConfig) {
+    await this.scrubBase(c);await this.disconnect();await this.stop(c);await this.powershell('export-base',c,{timeoutMs:300000});
     const file=path.join(windowsPaths(this.root,c.id).directory,'protected-base.vhdx');
     return {file,sha256:await fileHash(file)};
   }

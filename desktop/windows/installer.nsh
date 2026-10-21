@@ -1,3 +1,21 @@
+!macro MuInstallTrace MESSAGE
+  Push $R5
+  Push $R6
+  ReadEnvStr $R6 "MU_WINDOWS_INSTALL_TRACE"
+  ${If} $R6 != ""
+    ClearErrors
+    FileOpen $R5 "$R6" a
+    ${IfNot} ${Errors}
+      FileSeek $R5 0 END
+      FileWrite $R5 "${MESSAGE}$\r$\n"
+      FileClose $R5
+    ${EndIf}
+  ${EndIf}
+  Pop $R6
+  Pop $R5
+  ClearErrors
+!macroend
+
 !macro customCheckAppRunning
   ; Check the selected installation only. Never terminate the management
   ; worker from an installer: its IPC shutdown must confirm VM stop first.
@@ -7,6 +25,11 @@
   nsExec::ExecToStack /TIMEOUT=15000 '"$PowerShellPath" -NoLogo -NoProfile -NonInteractive -EncodedCommand @MU_WINDOWS_RUNNING_CHECK@'
   Pop $R9
   Pop $R8
+  !ifdef BUILD_UNINSTALLER
+    !insertmacro MuInstallTrace "uninstall-process-check=$R9"
+  !else
+    !insertmacro MuInstallTrace "install-process-check=$R9"
+  !endif
   ${If} $R9 != 0
     ${IfNot} ${Silent}
       MessageBox MB_OK|MB_ICONEXCLAMATION "Please close MuCodeSandbox Windows Preview and wait for its environments to stop, then retry."
@@ -33,13 +56,25 @@
     Abort "Windows Preview executable missing; installation preserved"
   IfFileExists "$INSTDIR\resources\windows-runtime-manifest.json" +2 0
     Abort "Windows Preview runtime manifest missing; installation preserved"
-  GetTempFileName $MuRemovalStaging "$R7"
-  Delete "$MuRemovalStaging"
+  ; Do not pre-create and delete a temporary file. On Windows that name may
+  ; remain delete-pending and the subsequent directory move returns 80.
+  System::Call 'kernel32::GetCurrentProcessId()i.r4'
+  System::Call 'kernel32::GetTickCount64()l.r5'
+  StrCpy $MuRemovalStaging "$INSTDIR.mu-remove-$4-$5"
+  IfFileExists "$MuRemovalStaging" 0 +2
+    Abort "Windows Preview removal staging already exists; files preserved"
   SetOutPath $TEMP
-  ClearErrors
-  Rename "$INSTDIR" "$MuRemovalStaging"
-  ${If} ${Errors}
+  System::Call 'kernel32::MoveFileEx(t "$INSTDIR", t "$MuRemovalStaging", i 0)i.r4?e'
+  Pop $5
+  ${If} $4 == 0
+    !insertmacro MuInstallTrace "remove-rename-failed=$5"
     Abort "Unable to move the closed Windows Preview installation; files preserved"
   ${EndIf}
+  !insertmacro MuInstallTrace "remove-rename-ok"
   RMDir /r "$MuRemovalStaging"
+  ${If} ${Errors}
+    !insertmacro MuInstallTrace "remove-cleanup-pending"
+  ${Else}
+    !insertmacro MuInstallTrace "remove-cleanup-ok"
+  ${EndIf}
 !macroend

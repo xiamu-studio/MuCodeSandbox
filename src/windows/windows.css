@@ -19,3 +19,7 @@
 .windows-browser-canvas{height:650px;min-height:360px;background:#181d20;overflow:hidden;border-radius:12px}
 .windows-address{display:flex;gap:12px;margin:14px 0}.windows-address input{flex:1;min-width:0}
 @media(max-width:760px){.windows-preview .windows-environment-row>span:nth-child(2){display:none}.windows-preview .windows-job>time{display:none}}
+.windows-setup{padding:24px;margin-bottom:28px;border:1px solid rgba(255,255,255,.8);border-radius:20px;background:rgba(255,255,255,.58)}
+.windows-setup>p{line-height:1.8;margin:12px 0;color:#45645c}
+.windows-setup .button-row{margin-top:18px}
+.windows-setup progress{width:min(440px,65%);margin:10px 14px 10px 0;accent-color:#2b786b}

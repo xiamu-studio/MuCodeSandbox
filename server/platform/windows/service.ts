@@ -20,6 +20,8 @@ import {WindowsBrowser} from './browser.ts';
 import {displayRequestSchema} from '../../../shared/guest-display.ts';
 import {clipboardText} from '../../guest-exchange.ts';
 import {windowsAppDirectory,windowsRuntimeDirectory} from './paths.ts';
+import {windowsBaseSchema} from './config.ts';
+import {WindowsSetup} from './setup.ts';
 
 export interface WindowsServiceOptions {
  rootDir:string;dataDir?:string;runtimeRoot?:string;port?:number;base?:WindowsBase;
@@ -34,17 +36,18 @@ export async function createWindowsService(options:WindowsServiceOptions){
  const runtimeRoot=windowsRuntimeDirectory(options.runtimeRoot,dataDir);
  await secureWindowsDirectory(dataDir);
  const unlock=await acquireWindowsServiceLock(dataDir);
- let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined;
+ let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined,setup:WindowsSetup|undefined;
  try{
   await secureWindowsDirectory(runtimeRoot);
   const runtime=options.runtime??new HyperVRuntime(runtimeRoot);
   let base=options.base;
   if(!base){
-   try{let source:string;try{source=await readFile(path.join(runtimeRoot,'protected-desktop-base.json'),'utf8');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;source=await readFile(path.join(runtimeRoot,'protected-base.json'),'utf8');}base=z.object({image:z.string().refine(path.isAbsolute),imageSha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict().parse(JSON.parse(source));}
+   try{let source:string;try{source=await readFile(path.join(runtimeRoot,'protected-desktop-base.json'),'utf8');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;source=await readFile(path.join(runtimeRoot,'protected-base.json'),'utf8');}base=windowsBaseSchema.parse(JSON.parse(source));}
    catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
   }
   manager=new WindowsManager(await openWindowsStore(dataDir),runtime,{runtimeRoot,base,probe:options.probe});
   const controller=manager;
+  if(runtime instanceof HyperVRuntime&&runtime.broker){setup=new WindowsSetup(runtime,runtimeRoot,{base,canPrepare:()=>!controller.options.base&&!controller.tasks.size&&controller.store.list().every(e=>e.state==='not_created'),publish:value=>{controller.options.base=value;controller.profiles.clear();}});await setup.initialize();}
   terminal=runtime.terminalLaunch?new WindowsTerminalServer(controller,{terminalLaunch:runtime.terminalLaunch.bind(runtime)},options.ptyFactory):undefined;
   const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>();
   const guest=runtime.guest?.bind(runtime),management=runtime.management?.bind(runtime);
@@ -88,6 +91,10 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.get('/api/environments/:id/network/protection',async(req,res)=>res.json(await controller.protection(id(req))));
   app.get('/api/logs',(req,res)=>res.json(controller.store.logs(req.query.environmentId?z.uuid().parse(req.query.environmentId):null,z.coerce.number().int().min(0).parse(req.query.after??0))));
   app.post('/api/jobs/:id/cancel',(req,res)=>{controller.cancel(id(req));res.json({ok:true});});
+  const setupHost=()=>{if(!setup)throw new AppError('此入口不支持自动准备，请使用普通用户桌面入口',409,'SETUP_UNAVAILABLE');return setup;};
+  app.get('/api/windows/setup',(_req,res)=>res.json(setupHost().snapshot()));
+  app.post('/api/windows/setup',(req,res)=>{z.object({}).strict().parse(req.body??{});res.status(202).json(setupHost().start());});
+  app.post('/api/windows/setup/cancel',(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(setupHost().cancel());});
   const browserHost=()=>{if(!guestBrowser)throw new AppError('Windows 浏览器运行组件不可用',409,'FEATURE_UNAVAILABLE');return guestBrowser;};
   app.get('/api/environments/:id/guest-browser',(req,res)=>res.json(browserHost().info(id(req))));
   app.post('/api/environments/:id/browser/open',async(req,res)=>{z.object({}).strict().parse(req.body??{});const envId=id(req),host=browserHost();res.status(202).json(await controller.submit(envId,'open-browser',options=>host.open(envId,options)));});
@@ -127,7 +134,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.post('/api/environments/:id/clipboard/read',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(await files().readClipboard(id(req)));});
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,remove:!!runtime.deletionAvailable}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));
@@ -151,8 +158,8 @@ export async function createWindowsService(options:WindowsServiceOptions){
   const url=`http://127.0.0.1:${port}`;
   const close=()=>closing??=(async()=>{
    watcher.stop();terminals?.close();guestBrowser?.dispose();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
-   try{await controller.close();}finally{await closed;await unlock();}
+   try{await setup?.close();await controller.close();}finally{await closed;await unlock();}
   })();
-  return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,exchange,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};
- }catch(error){monitor?.stop();terminal?.close();browser?.dispose();try{await manager?.close();}finally{await unlock();}throw error;}
+  return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,exchange,setup,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};
+ }catch(error){monitor?.stop();terminal?.close();browser?.dispose();try{await setup?.close();await manager?.close();}finally{await unlock();}throw error;}
 }

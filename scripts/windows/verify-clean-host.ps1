@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -34,13 +34,40 @@ function Connect-LabGuest {
 }
 try{
  $selected=Assert-LabVM
- if($Phase -in @('ssh-inspect','network-prepare') -and $selected.State -eq 'Off'){Start-VM -VM $selected | Out-Null}
+ if($Phase -in @('ssh-inspect','network-prepare','ledger-seed','ledger-logon') -and $selected.State -eq 'Off'){Start-VM -VM $selected | Out-Null}
  Save-Probe 'connecting'
  $session=Connect-LabGuest
  $initial=Invoke-Command -Session $session -ScriptBlock {
   if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Synthetic guest administrator required'}
   if(-not (Test-Path -LiteralPath C:\MuLab\public\provisioned.json)){throw 'Guest bootstrap is incomplete'}
   [ordered]@{bootId=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');hypervisor=[bool](Get-CimInstance Win32_ComputerSystem).HypervisorPresent;edition=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID}
+ }
+ if($Phase.StartsWith('ledger-')){
+  if($Phase -eq 'ledger-logon'){
+   Invoke-Command -Session $session -ScriptBlock {
+    $ErrorActionPreference='Stop';$node='C:\MuLab\product\resources\node\node.exe';$c=Get-Content -LiteralPath C:\MuLab\private\credentials.json -Raw | ConvertFrom-Json
+    if(@(Get-VM).Count -or @(Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath -eq $node -or $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*'}).Count){throw 'Synthetic logon preparation requires no nested VM or live product process'}
+    $task=Get-ScheduledTask -TaskName MuCleanHost-ledger-seed -ErrorAction SilentlyContinue
+    if($task){if($task.State -eq 'Running' -or $task.Actions.Execute -ne $node -or $task.Actions.Arguments -ne '--no-warnings C:\MuLab\client.mjs ledger-seed'){throw 'Unexpected pending seed task'};Unregister-ScheduledTask -TaskName MuCleanHost-ledger-seed -Confirm:$false}
+    $winlogon='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    foreach($pair in @(@('DefaultUserName',$c.user),@('DefaultDomainName',$env:COMPUTERNAME),@('DefaultPassword',$c.userPassword),@('AutoAdminLogon','1'))){Set-ItemProperty -LiteralPath $winlogon -Name $pair[0] -Value $pair[1] -Type String}
+    Set-ItemProperty -LiteralPath $winlogon -Name AutoLogonCount -Value 2 -Type DWord
+   }
+   Save-Probe 'restarting-only-empty-evaluation-guest-for-synthetic-user-logon'
+   try{Invoke-Command -Session $session -ScriptBlock {Restart-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+   exit 0
+  }
+  $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-ledger-operator.ps1'))
+  if($Phase -in @('ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-orphan-create','ledger-collect')){
+   $action=$Phase.Substring(7);$evidence=Invoke-Command -Session $session -ArgumentList $action,$operatorSource -ScriptBlock {param($action,$source) & ([ScriptBlock]::Create($source)) -Action $action}
+   Assert-LabVM | Out-Null;Save-Probe 'ledger-operator-complete' $evidence
+   if($Phase -eq 'ledger-collect'){
+    try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
+    Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$until=[DateTime]::UtcNow.AddMinutes(2)
+    do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'ledger-complete-and-evaluation-vm-off' $evidence;exit 0};if([DateTime]::UtcNow -gt $until){throw 'The evaluation VM has not confirmed shutdown'};Start-Sleep -Seconds 2}while($true)
+   }
+   exit 0
+  }
  }
  if($Phase -eq 'network-inspect'){
   $evidence=Invoke-Command -Session $session -ScriptBlock {$outer=Get-NetAdapter | Where-Object {$_.InterfaceDescription -eq 'Microsoft Hyper-V Network Adapter'};@{switches=@(Get-VMSwitch | Select-Object Name,Id,SwitchType);adapters=@(Get-NetAdapter -IncludeHidden | Select-Object Name,InterfaceGuid,InterfaceDescription,Status,MacAddress,ifIndex);outerDns=@(Get-DnsClientServerAddress -InterfaceIndex $outer.ifIndex | Select-Object AddressFamily,ServerAddresses);outerIp=@(Get-NetIPAddress -InterfaceIndex $outer.ifIndex | Select-Object AddressFamily,IPAddress,PrefixOrigin);outerDhcp=[string](Get-NetIPInterface -InterfaceIndex $outer.ifIndex -AddressFamily IPv4).Dhcp;nested=@(Get-VM | Select-Object Name,@{Name='state';Expression={[string]$_.State}});networkReceipts=@(Get-ChildItem -LiteralPath C:\MuLab\approved -File -Filter 'network-*.json' | Select-Object Name,LastWriteTime)}}
@@ -226,11 +253,13 @@ try{
  }
  if($Phase -eq 'inspect'){
   $diagnostic=Invoke-Command -Session $session -ScriptBlock {
-   $tasks=@();foreach($name in @('MuCleanHost-before-reboot','MuCleanHost-after-reboot')){$task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue;if($task){$info=Get-ScheduledTaskInfo -TaskName $name;$tasks+=@{name=$name;state=[string]$task.State;lastResult=$info.LastTaskResult;user=$task.Principal.UserId;runLevel=[string]$task.Principal.RunLevel;execute=$task.Actions.Execute;arguments=$task.Actions.Arguments}}}
+   $tasks=@();foreach($name in @('MuCleanHost-before-reboot','MuCleanHost-after-reboot','MuCleanHost-ledger-seed','MuCleanHost-ledger-check','MuCleanHost-ledger-final','MuCleanHost-ledger-deny')){$task=Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue;if($task){$info=Get-ScheduledTaskInfo -TaskName $name;$tasks+=@{name=$name;state=[string]$task.State;lastResult=$info.LastTaskResult;user=$task.Principal.UserId;runLevel=[string]$task.Principal.RunLevel;logonType=[string]$task.Principal.LogonType;execute=$task.Actions.Execute;arguments=$task.Actions.Arguments}}}
    $files=@();foreach($file in @('C:\MuLab','C:\MuLab\public','C:\MuLab\client.mjs','C:\MuLab\product\resources\node\node.exe','C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js')){$acl=Get-Acl -LiteralPath $file;$files+=@{path=$file;protected=$acl.AreAccessRulesProtected;access=@($acl.Access | ForEach-Object {@{identity=$_.IdentityReference.Value;rights=[string]$_.FileSystemRights;type=[string]$_.AccessControlType;inherited=$_.IsInherited}})}}
    $logs=@();foreach($file in Get-ChildItem -LiteralPath C:\MuLab\public -File | Where-Object {$_.Name -like '*-stderr.log' -or $_.Name -like '*-stdout.log' -or $_.Name -like '*-launcher.json'}){$logs+=@{name=$file.Name;text=([IO.File]::ReadAllText($file.FullName)).Substring(0,[math]::Min(8000,$file.Length))}}
    $setup=Get-ItemProperty 'HKLM:\SYSTEM\Setup';$owner=$null;if(Test-Path -LiteralPath C:\MuLab\public\before-reboot-owner.json){$owner=Get-Content -LiteralPath C:\MuLab\public\before-reboot-owner.json -Raw | ConvertFrom-Json;$process=Get-CimInstance Win32_Process -Filter ('ProcessId = '+[int]$owner.pid);$owner=@{pid=$owner.pid;executable=$process.ExecutablePath;sid=$(if($process){(Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid).Sid}else{$null})}}
-   @{tasks=$tasks;files=$files;logs=$logs;owner=$owner;loggedOnUser=(Get-CimInstance Win32_ComputerSystem).UserName;publicFiles=@(Get-ChildItem -LiteralPath C:\MuLab\public -File | Select-Object -ExpandProperty Name);users=@(Get-LocalUser -Name MuLabAdmin,MuLabUser | Select-Object Name,Enabled);groups=@(Get-LocalGroupMember -SID 'S-1-5-32-545' | Select-Object Name);setupInProgress=$setup.SystemSetupInProgress;auditInProgress=$setup.AuditInProgress;oobeInProgress=$setup.OOBEInProgress;sysprep=@(Get-CimInstance Win32_Process -Filter "Name='sysprep.exe'" | Select-Object ProcessId,CommandLine)}
+   $ledgerProcesses=@(Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object {$_.CommandLine -like '*client.mjs*ledger-*'} | Select-Object ProcessId,CreationDate,ExecutablePath)
+   $ledgerEvents=@(Get-WinEvent -FilterHashtable @{LogName='Application';StartTime=(Get-Date).AddMinutes(-15)} -ErrorAction SilentlyContinue | Where-Object {$_.Message -like '*node.exe*'} | Select-Object -First 4 Id,@{Name='message';Expression={$_.Message.Substring(0,[Math]::Min(1200,$_.Message.Length))}})
+   @{tasks=$tasks;files=$files;logs=$logs;ledgerProcesses=$ledgerProcesses;ledgerEvents=$ledgerEvents;owner=$owner;loggedOnUser=(Get-CimInstance Win32_ComputerSystem).UserName;publicFiles=@(Get-ChildItem -LiteralPath C:\MuLab\public -File | Select-Object -ExpandProperty Name);users=@(Get-LocalUser -Name MuLabAdmin,MuLabUser | Select-Object Name,Enabled);groups=@(Get-LocalGroupMember -SID 'S-1-5-32-545' | Select-Object Name);setupInProgress=$setup.SystemSetupInProgress;auditInProgress=$setup.AuditInProgress;oobeInProgress=$setup.OOBEInProgress;sysprep=@(Get-CimInstance Win32_Process -Filter "Name='sysprep.exe'" | Select-Object ProcessId,CommandLine)}
   };Save-Probe 'inspected' @{initial=$initial;diagnostic=$diagnostic};exit 0
  }
  if($Phase -eq 'after-reboot'){
@@ -256,18 +285,25 @@ try{
  }
  Save-Probe 'preparing-standard-user-probe'
  if($Phase -eq 'network'){Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-network-client.mjs') -Destination C:\MuLab\network-client.mjs -ToSession $session -Force}
+ if($Phase.StartsWith('ledger-')){
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-ledger-client.mjs') -Destination C:\MuLab\ledger-client.mjs -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ProtectedLedger.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HostComponents.cs -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-broker.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-broker.ps1 -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/broker.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js -ToSession $session -Force
+ }
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-client.mjs') -Destination C:\MuLab\client.mjs -ToSession $session -Force
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HyperVBroker.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HyperVBroker.cs -ToSession $session -Force
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'host-components.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -ToSession $session -Force
  $servicingHash=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'host-components.ps1') -Algorithm SHA256).Hash.ToLowerInvariant()
  Invoke-Command -Session $session -ArgumentList $servicingHash -ScriptBlock {param($hash) if(-not (Test-Path -LiteralPath C:\MuLab\private\package-original.json)){Copy-Item -LiteralPath C:\MuLab\private\package.json -Destination C:\MuLab\private\package-original.json};$m=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json;$m.hostScriptSha256=$hash;$m | ConvertTo-Json -Compress | Set-Content -LiteralPath C:\MuLab\private\package.json}
- $result=Invoke-Command -Session $session -ArgumentList $Phase -ScriptBlock {
-  param($phase)
+ $result=Invoke-Command -Session $session -ArgumentList $Phase,$operatorSource -ScriptBlock {
+  param($phase,$operatorSource)
   $ErrorActionPreference='Stop';$node='C:\MuLab\product\resources\node\node.exe'
   $manifest=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json
   if((Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.nodeSha256){throw 'Packaged Node digest changed'}
   if((Get-FileHash -LiteralPath C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.hostScriptSha256){throw 'Packaged servicing script changed'}
-  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network')){
+  if($phase -in @('before-reboot','after-reboot','ssh-install','ssh-ready','network','ledger-seed','ledger-check','ledger-final','ledger-deny')){
    $build=@'
 import {buildBroker} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/broker.js';
 import {writeFile} from 'node:fs/promises';
@@ -282,14 +318,16 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
   }
   $c=Get-Content -LiteralPath C:\MuLab\private\credentials.json -Raw | ConvertFrom-Json
   $busy=@(Get-CimInstance Win32_Process | Where-Object {$_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*'});if($busy.Count){throw 'Actual Windows servicing is still running; keep its owner and this VM alive'}
-  foreach($process in @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object {$_.ExecutablePath -eq $node -and $_.CommandLine -match ('client\.mjs\s+'+[regex]::Escape($phase)+'(?:\s|$)')})){if((Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid).Sid -eq (Get-LocalUser -Name $c.user).SID.Value){Stop-Process -Id $process.ProcessId -Force}}
   $task='MuCleanHost-'+$phase;$old=Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-  if($old){if($old.Actions.Execute -ne $node -or $old.Principal.UserId -notin @($c.user,($env:COMPUTERNAME+'\'+$c.user),(Get-LocalUser -Name $c.user).SID.Value)){throw 'Existing diagnostic task identity changed'};Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue;Export-ScheduledTask -TaskName $task | Set-Content -LiteralPath ('C:\MuLab\private\'+$task+'-prior.xml');Unregister-ScheduledTask -TaskName $task -Confirm:$false}
   # The supported OOBE autologon opens the synthetic standard user's own
   # interactive desktop. Its fixed Startup link launches the ordinary client.
-  $until=[DateTime]::UtcNow.AddMinutes(3);$ownerFile='C:\MuLab\public\'+$phase+'-owner.json'
+  $ownerClock=[Diagnostics.Stopwatch]::StartNew();$ownerFile='C:\MuLab\public\'+$phase+'-owner.json'
   $live=$false
   if(Test-Path -LiteralPath $ownerFile){$previousOwner=[IO.File]::ReadAllText($ownerFile) | ConvertFrom-Json;$previousProcess=Get-CimInstance Win32_Process -Filter ('ProcessId = '+[int]$previousOwner.pid);$live=$previousProcess -and $previousProcess.ExecutablePath -eq $node -and (Invoke-CimMethod -InputObject $previousProcess -MethodName GetOwnerSid).Sid -eq (Get-LocalUser -Name $c.user).SID.Value}
+  if($old){
+   if($old.Actions.Execute -ne $node -or $old.Principal.UserId -notin @($c.user,($env:COMPUTERNAME+'\'+$c.user),(Get-LocalUser -Name $c.user).SID.Value)){throw 'Existing diagnostic task identity changed'}
+   if(-not $live){if($old.State -eq 'Running'){throw 'The previous diagnostic task is running without a verified owner; inspect it instead of restarting it'};Export-ScheduledTask -TaskName $task | Set-Content -LiteralPath ('C:\MuLab\private\'+$task+'-prior.xml');Unregister-ScheduledTask -TaskName $task -Confirm:$false}
+  }
   if(-not $live){
    $attempt=[guid]::NewGuid().ToString('N');foreach($name in @(($phase+'-owner.json'),($phase+'-result.json'))){$file=Join-Path C:\MuLab\public $name;if(Test-Path -LiteralPath $file){Copy-Item -LiteralPath $file -Destination (Join-Path C:\MuLab\private ($attempt+'-'+$name));Remove-Item -LiteralPath $file}}
    $principal=New-ScheduledTaskPrincipal -UserId ($env:COMPUTERNAME+'\'+$c.user) -LogonType Interactive -RunLevel Limited
@@ -298,7 +336,7 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
    Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Trigger (New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10)) | Out-Null;Start-ScheduledTask -TaskName $task
   }
   while(-not (Test-Path -LiteralPath $ownerFile)){
-   if([DateTime]::UtcNow -gt $until){throw 'The standard-user client did not start'};Start-Sleep -Milliseconds 250
+   if($ownerClock.ElapsedMilliseconds -gt 180000){throw 'The standard-user client did not start'};Start-Sleep -Milliseconds 250
   }
   $owner=[IO.File]::ReadAllText($ownerFile) | ConvertFrom-Json;$ownerPid=$owner.pid;$nonce=$owner.nonce
   if($nonce -notmatch '^[a-f0-9]{64}$' -or [int]$ownerPid -le 0){throw 'Invalid standard-user endpoint'}
@@ -308,7 +346,15 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
   $bin=Join-Path $env:ProgramData 'MuCodeSandbox-HyperVBroker-v1/bin';$meta=Get-Content -LiteralPath (Join-Path $bin 'current.json') -Raw | ConvertFrom-Json
   $broker=Join-Path $bin $meta.brokerFile
   if((Get-FileHash -LiteralPath $broker -Algorithm SHA256).Hash.ToLowerInvariant() -ne $meta.brokerSha256){throw 'Protected broker digest mismatch'}
-  $agent=Start-Process -FilePath $broker -ArgumentList @('--owner',[string]$ownerPid,'--pipe',$nonce,'--detect-host') -WorkingDirectory $bin -WindowStyle Hidden -RedirectStandardOutput ('C:\MuLab\private\'+$phase+'-broker-stdout.log') -RedirectStandardError ('C:\MuLab\private\'+$phase+'-broker-stderr.log') -PassThru
+  if($phase -eq 'ledger-deny'){
+   # Retain the actual process handle when startup is expected to exit quickly.
+   $start=[Diagnostics.ProcessStartInfo]::new($broker,('--owner '+$ownerPid+' --pipe '+$nonce+' --detect-host'));$start.WorkingDirectory=$bin;$start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardError=$true;$start.RedirectStandardOutput=$true
+   $agent=[Diagnostics.Process]::Start($start)
+   if(-not $agent.WaitForExit(30000)){throw 'The missing-registry broker did not refuse startup'}
+   $brokerFailure=$agent.StandardError.ReadToEnd();[IO.File]::WriteAllText('C:\MuLab\private\ledger-deny-broker-stderr.log',$brokerFailure)
+   if($agent.ExitCode -ne 1 -or $brokerFailure -notlike '*Unregistered VM storage remains*'){throw ('The broker failed for an unexpected reason (exit '+$agent.ExitCode+'): '+$brokerFailure)}
+   & ([ScriptBlock]::Create($operatorSource)) -Action deny -Nonce $nonce | Out-Null
+  }else{$agent=Start-Process -FilePath $broker -ArgumentList @('--owner',[string]$ownerPid,'--pipe',$nonce,'--detect-host') -WorkingDirectory $bin -WindowStyle Hidden -RedirectStandardOutput ('C:\MuLab\private\'+$phase+'-broker-stdout.log') -RedirectStandardError ('C:\MuLab\private\'+$phase+'-broker-stderr.log') -PassThru}
   $handled=@{}
   function Invoke-SyntheticNetworkRequests {
    $record=Get-Content -LiteralPath C:\MuLab\approved\network-adapter.json -Raw | ConvertFrom-Json
@@ -329,9 +375,24 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
     [IO.File]::WriteAllText((Join-Path C:\MuLab\approved ($name+'.json')),(@{nonce=$nonce;kind=$kind;operation=$operation;complete=$true;scope='only-the-disconnected-nic-inside-the-windows-evaluation-guest'} | ConvertTo-Json -Compress));$handled[$name]=$true
    }}
   }
-  $until=[DateTime]::UtcNow.AddMinutes(65);$resultFile='C:\MuLab\public\'+$phase+'-result.json'
-  do{if(Test-Path -LiteralPath $resultFile){$finished=[IO.File]::ReadAllText($resultFile) | ConvertFrom-Json;if($finished.pid -eq $ownerPid -and $finished.nonce -eq $nonce){New-Item -ItemType Directory -Path C:\MuLab\approved -Force | Out-Null;[IO.File]::WriteAllText(('C:\MuLab\approved\'+$phase+'-result.json'),($finished | ConvertTo-Json -Depth 16 -Compress));Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue;return $finished}};if($agent.HasExited){throw ('Protected broker exited: '+[IO.File]::ReadAllText(('C:\MuLab\private\'+$phase+'-broker-stderr.log')))};if([DateTime]::UtcNow -gt $until){throw 'Servicing or the client is still running; no process or VM was stopped'};if($phase -eq 'network'){Invoke-SyntheticNetworkRequests};Start-Sleep -Seconds 2}while($true)
+  $probeClock=[Diagnostics.Stopwatch]::StartNew();$resultFile='C:\MuLab\public\'+$phase+'-result.json'
+  $ledgerInspected=$false
+  do{
+   if(Test-Path -LiteralPath $resultFile){$finished=[IO.File]::ReadAllText($resultFile) | ConvertFrom-Json;if($finished.pid -eq $ownerPid -and $finished.nonce -eq $nonce){
+    New-Item -ItemType Directory -Path C:\MuLab\approved -Force | Out-Null;[IO.File]::WriteAllText(('C:\MuLab\approved\'+$phase+'-result.json'),($finished | ConvertTo-Json -Depth 16 -Compress))
+    if($phase -eq 'ledger-check' -and $finished.complete){$scenario=$finished.nested.scenario;if($scenario -notin @('primary-loss','primary-corrupt')){throw 'Unexpected ledger recovery scenario'};[IO.File]::WriteAllText(('C:\MuLab\approved\ledger-'+$scenario+'-result.json'),($finished | ConvertTo-Json -Depth 16 -Compress))}
+    Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue;return $finished
+   }}
+   if($agent.HasExited -and $phase -ne 'ledger-deny'){throw ('Protected broker exited: '+[IO.File]::ReadAllText(('C:\MuLab\private\'+$phase+'-broker-stderr.log')))}
+   if($probeClock.ElapsedMilliseconds -gt 3900000){throw 'Servicing or the client is still running; no process or VM was stopped'}
+   if($phase -eq 'network'){Invoke-SyntheticNetworkRequests}
+   if($phase -in @('ledger-check','ledger-final') -and -not $ledgerInspected -and (Test-Path -LiteralPath C:\MuLab\public\ledger-inspect-request.json)){
+    $request=Get-Content -LiteralPath C:\MuLab\public\ledger-inspect-request.json -Raw | ConvertFrom-Json
+    if($request.nonce -eq $nonce){& ([ScriptBlock]::Create($operatorSource)) -Action inspect -Nonce $nonce | Out-Null;$ledgerInspected=$true}
+   }
+   Start-Sleep -Seconds 2
+  }while($true)
  }
  Assert-LabVM | Out-Null;Save-Probe 'finished' $result;if(-not $result.complete){exit 2};exit 0
-}catch{Save-Probe 'failed' @{message=$_.Exception.Message};throw}
+}catch{Save-Probe 'failed' @{message=$_.Exception.Message;detail=$_.Exception.ToString();scriptStack=$_.ScriptStackTrace};throw}
 finally{if($session){Remove-PSSession $session -ErrorAction SilentlyContinue};$guard.Dispose()}

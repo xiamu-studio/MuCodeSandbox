@@ -36,7 +36,8 @@ public static partial class MuHyperVBroker {
     private static Process Owner;
     private static IntPtr OwnerHandle;
     private static WindowsIdentity OwnerIdentity;
-    private static string OwnerSid, UserRoot, Ledger, ScriptFile;
+    private static string OwnerSid, UserRoot, ScriptFile;
+    private static MuProtectedLedger LedgerStore;
     private static volatile bool Stopping;
     private static bool SetupOnly;
     [DllImport("kernel32.dll", SetLastError=true)] private static extern bool GetNamedPipeClientProcessId(IntPtr pipe, out uint pid);
@@ -92,7 +93,12 @@ public static partial class MuHyperVBroker {
     private static string Digest(Dictionary<string,object> value,string key){string hash=Text(value,key,64);if(hash.Length!=64||hash.Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))throw new ArgumentException("Digest required");return hash;}
     private static string Hash(Stream input){using(var sha=SHA256.Create())return BitConverter.ToString(sha.ComputeHash(input)).Replace("-","").ToLowerInvariant();}
     private static string HashFile(string file){using(var input=File.OpenRead(file))return Hash(input);}
-    private static void Save() {lock(Gate){var next=Ledger+"."+Guid.NewGuid().ToString("N")+".next";using(var stream=new FileStream(next,FileMode.CreateNew,FileAccess.Write,FileShare.None)){byte[] data=Encoding.UTF8.GetBytes(Json().Serialize(Records));stream.Write(data,0,data.Length);stream.Flush(true);}if(File.Exists(Ledger))File.Replace(next,Ledger,null);else File.Move(next,Ledger);}}
+    private static void ValidateLedgerFile(string file){
+        var attributes=File.GetAttributes(file);if((attributes&(FileAttributes.ReparsePoint|FileAttributes.Directory))!=0)throw new UnauthorizedAccessException("Registry must be a regular protected file");
+        var acl=File.GetAccessControl(file);var owner=(SecurityIdentifier)acl.GetOwner(typeof(SecurityIdentifier));if(!owner.Equals(AdminSid)&&!owner.Equals(SystemSid))throw new UnauthorizedAccessException("Registry owner changed");
+        foreach(FileSystemAccessRule rule in acl.GetAccessRules(true,true,typeof(SecurityIdentifier)))if(rule.AccessControlType==AccessControlType.Allow&&!rule.IdentityReference.Equals(AdminSid)&&!rule.IdentityReference.Equals(SystemSid))throw new UnauthorizedAccessException("Registry permissions changed");
+    }
+    private static void Save() {lock(Gate)LedgerStore.Save(Records);}
     private static Dictionary<string,object> Owned(string id){lock(Gate){Dictionary<string,object> record;if(!Records.TryGetValue(id,out record)||Convert.ToString(record["ownerSid"])!=OwnerSid)throw new UnauthorizedAccessException("VM is not registered to this user");return record;}}
     private static Dictionary<string,object>[] RecordSnapshot(){lock(Gate)return Records.Values.Select(record=>new Dictionary<string,object>(record)).ToArray();}
     private static Dictionary<string,object>[] ShutdownSnapshot(){lock(Gate)return Records.Values.OrderByDescending(record=>StartedHere.Contains(Convert.ToString(record["id"]))||Channels.ContainsKey(Convert.ToString(record["id"]))).Select(record=>new Dictionary<string,object>(record)).ToArray();}
@@ -225,7 +231,7 @@ public static partial class MuHyperVBroker {
                 if(action=="begin-base")record["baseBuilder"]=true;if(sealedSource)record["sealedSource"]=source;
                 // Persist ownership before creating any allocation files. Failed
                 // source reads and cancelled imports remain discoverable/removable.
-                lock(Gate){if(Records.ContainsKey(id)||Records.Count>=32)throw new InvalidOperationException("VM allocation refused");Records.Add(id,record);Save();}
+                lock(Gate){if(Records.ContainsKey(id)||Records.Count>=32)throw new InvalidOperationException("VM allocation refused");if(HasStorage(dir))throw new UnauthorizedAccessException("Unregistered allocation storage is preserved; it cannot be replaced by a new VM");Records.Add(id,record);Save();}
                 PrivateDirectory(dir,false);
                 lock(ImportGate){if(!File.Exists(image)){
                     string importLock=Path.Combine(Directory.GetParent(Directory.GetParent(UserRoot).FullName).FullName,"import.lock");
@@ -292,7 +298,7 @@ public static partial class MuHyperVBroker {
             // The previous owner can exit before its agent finishes VM cleanup.
             // Wait for that sealed store to be released, never bypass its lock.
             var waiting=Stopwatch.StartNew();for(;;){if(OwnerExited)throw new OperationCanceledException("Application exited while waiting for storage");try{Held.Add(new FileStream(Path.Combine(UserRoot,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None));break;}catch(IOException){if(waiting.ElapsedMilliseconds>90000)throw;Thread.Sleep(100);}}
-            Ledger=Path.Combine(UserRoot,"vms.json");if(File.Exists(Ledger)){var saved=Json().Deserialize<Dictionary<string,Dictionary<string,object>>>(File.ReadAllText(Ledger));foreach(var pair in saved)Records.Add(pair.Key,pair.Value);}
+            LedgerStore=new MuProtectedLedger(UserRoot,OwnerSid,ValidateLedgerFile);foreach(var pair in LedgerStore.Load())Records.Add(pair.Key,pair.Value);
             byte[] scriptBytes=Convert.FromBase64String(HyperVScript);string scriptHash;using(var sha=SHA256.Create())scriptHash=BitConverter.ToString(sha.ComputeHash(scriptBytes)).Replace("-","").ToLowerInvariant();ScriptFile=Path.Combine(UserRoot,"hyperv-"+scriptHash+".ps1");if(File.Exists(ScriptFile)){if((File.GetAttributes(ScriptFile)&FileAttributes.ReparsePoint)!=0||HashFile(ScriptFile)!=scriptHash)throw new UnauthorizedAccessException("Protected script changed");}else{using(var scriptStream=new FileStream(ScriptFile,FileMode.CreateNew,FileAccess.Write,FileShare.None)){scriptStream.Write(scriptBytes,0,scriptBytes.Length);scriptStream.Flush(true);}}
             if(detectHost){var status=(Dictionary<string,object>)HostStatus();SetupOnly=!Convert.ToBoolean(status["ready"])||HostJobLive(HostJob());}
             if(!SetupOnly)foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}

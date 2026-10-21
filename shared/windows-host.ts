@@ -3,6 +3,6 @@ export interface WindowsHostStatus {
  firmwareVirtualization:boolean|null;slat:boolean|null;hypervisorPresent:boolean;
  hyperV:'enabled'|'disabled'|'pending'|'unavailable'|'error';managementModule:boolean;vmmsRunning:boolean;
  sshCapability:'installed'|'missing'|'pending'|'error';sshClientPresent:boolean;restartRequired:boolean;ready:boolean;
- runtimeActive:boolean;canPrepare:boolean;
+ runtimeActive:boolean;canPrepare:boolean;unregisteredStorage:number;
  operation:null|{id:string;status:'starting'|'running'|'completed'|'failed'|'interrupted';phase:string;changed:string[];restartNeeded:boolean;errorCode:number|null};
 }

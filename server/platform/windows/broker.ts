@@ -32,7 +32,7 @@ export class HyperVBrokerClient{
 }
 
 export async function brokerSourceDigest(){
- const files=['../../native/windows/HyperVBroker.cs','../../native/windows/SealedBases.cs','../../native/windows/HostComponents.cs','../../native/windows/HyperVChannel.cs','hyperv.ps1','host-components.ps1','build-broker.ps1','install-broker.ps1'];const sha=createHash('sha256');for(const file of files){sha.update(file+'\0');sha.update(await readFile(path.resolve(scripts,file)));}return sha.digest('hex');
+ const files=['../../native/windows/HyperVBroker.cs','../../native/windows/SealedBases.cs','../../native/windows/HostComponents.cs','../../native/windows/ProtectedLedger.cs','../../native/windows/HyperVChannel.cs','hyperv.ps1','host-components.ps1','build-broker.ps1','install-broker.ps1'];const sha=createHash('sha256');for(const file of files){sha.update(file+'\0');sha.update(await readFile(path.resolve(scripts,file)));}return sha.digest('hex');
 }
 
 export function cleanWindowsEnvironment(){

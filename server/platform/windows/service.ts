@@ -31,6 +31,7 @@ import {WindowsStorage} from './storage.ts';
 import {WindowsGuestAudio} from './audio.ts';
 import type {Environment} from '../../../shared/types.ts';
 import type {WindowsNetworkSession} from './session.ts';
+import {WindowsFileDirectories} from './file-directories.ts';
 
 export interface WindowsServiceOptions {
  rootDir:string;dataDir?:string;runtimeRoot?:string;port?:number;base?:WindowsBase;
@@ -93,6 +94,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
    try{await controller.assertAccess(e.id);const profile=await controller.profile(e),signal=AbortSignal.any(signals);signal.throwIfAborted();assertExchangeSession(e);const result=await management(profile,command,{...runOptions,signal});assertExchangeSession(e);signal.throwIfAborted();return result;}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   }},authorizeExchange,translationSettings):undefined;
+  const directories=exchange?new WindowsFileDirectories(exchange):undefined;
   controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);translationTransfers.get(id)?.abort.abort();for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
   if(!host||host.snapshot().runtimeActive)await controller.recover();
   monitor=new WindowsHostMonitor(()=>runtime.fingerprint(),()=>{void controller.hostUnavailable('宿主网络发生变化、监测中断或电脑从休眠恢复').catch(()=>{});});
@@ -170,6 +172,11 @@ export async function createWindowsService(options:WindowsServiceOptions){
    const envId=id(req);if(req.query.directory==='1')res.json(await files().listDirectory(envId,transferZone.parse(req.query.zone),transferPath.parse(req.query.path??''),z.string().optional().parse(req.query.cursor)));
    else res.json(await files().listPage(envId,z.string().optional().parse(req.query.cursor)));
   });
+  app.post('/api/environments/:id/transfer-directories',async(req,res)=>{
+   const envId=id(req);files();if(!directories)throw new AppError('Windows 文件夹组件不可用',409,'FEATURE_UNAVAILABLE');
+   const abort=new AbortController(),cancel=()=>{if(!res.writableFinished)abort.abort();};res.once('close',cancel);if(res.destroyed)abort.abort();
+   try{res.status(201).json(await directories.create(envId,req.body,abort.signal));}finally{res.removeListener('close',cancel);}
+  });
   app.post('/api/environments/:id/transfer-files',async(req,res,next)=>{
    const envId=id(req);transferName.parse(req.query.name);files();
    if(Number(req.headers['content-length']??0)>TRANSFER_MAX_BYTES)throw new AppError('单个文件最多150 MiB',413,'CONTENT_TOO_LARGE');
@@ -206,7 +213,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   });
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,translation:!!exchange,diskGrowth:!!runtime.diskGrowthAvailable,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,fileDirectories:!!directories,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,translation:!!exchange,diskGrowth:!!runtime.diskGrowthAvailable,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));

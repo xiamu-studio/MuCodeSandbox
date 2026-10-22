@@ -23,6 +23,7 @@ import {GUEST_TASK_RUN,GUEST_TASK_CANCEL} from '../../guest-task.ts';
 import type {HyperVBrokerClient,BrokerAction} from './broker.ts';
 import {growWindowsDisk} from './disk-growth.ts';
 import {windowsDiskGrowthInfo} from '../../../shared/windows-disk.ts';
+import {runWindowsSsh} from './ssh-process.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../..','scripts/windows');
 const inspection=z.object({digest:z.string().regex(/^[a-f0-9]{64}$/),leaseActive:z.boolean(),remainingMs:z.number().nonnegative().max(45000)}).strict();
@@ -66,8 +67,9 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   private baseBuilders=new Set<string>();
   readonly root:string;
   readonly runner:Runner;
+  private readonly sshRunner:Runner;
   readonly broker:HyperVBrokerClient|undefined;
-  constructor(root:string,runner:Runner=run,broker?:HyperVBrokerClient) {this.root=root;this.runner=runner;this.broker=broker;}
+  constructor(root:string,runner:Runner=run,broker?:HyperVBrokerClient) {this.root=root;this.runner=runner;this.sshRunner=runner===run?runWindowsSsh:runner;this.broker=broker;}
   get deletionAvailable(){return !!this.broker;}
   async allocation(c:WindowsConfig){if(!this.broker)throw new AppError('此入口未启用权限代理恢复',409,'FEATURE_UNAVAILABLE');return allocationSchema.parse(await this.broker.call('allocation',{id:c.id}));}
   private async metadataMarker(c:WindowsConfig){
@@ -185,7 +187,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     };
   }
   async management(c:WindowsConfig,command:string[],options:RunOptions={}) {
-    return this.runner(path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe'),
+    return this.sshRunner(path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe'),
       [...await this.ssh(c),command.map(shellQuote).join(' ')],options);
   }
   private developer(c:WindowsConfig,command:string[]){
@@ -200,7 +202,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     const cancel=()=>{cancellation??=this.management(c,this.developer(c,['python3','-c',GUEST_TASK_CANCEL,token]),{timeoutMs:8000});void cancellation.catch(()=>{});};
     options.signal?.addEventListener('abort',cancel,{once:true});
     try{return await this.management(c,this.developer(c,['python3','-c',GUEST_TASK_RUN,token,String(timeoutMs),...command]),options);}
-    catch(error){if(error instanceof AppError&&['TIMEOUT','CANCELLED'].includes(error.code))cancel();throw error;}
+    catch(error){if(error instanceof AppError&&['TIMEOUT','CANCELLED','PROCESS_INPUT_CLOSED','PROCESS_OUTPUT_TOO_LARGE'].includes(error.code))cancel();throw error;}
     finally{options.signal?.removeEventListener('abort',cancel);if(cancellation)await cancellation;}
   }
   async terminalLaunch(c:WindowsConfig){

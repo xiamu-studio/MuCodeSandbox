@@ -8,6 +8,25 @@ import { CONFIGURE_NETWORKD_SCRIPT } from '../../guest-networkd.ts';
 import { NET_UID, PROBE_UID, PROBE_PORT, RELAY_PORT, vmIdentity, type WindowsConfig } from './config.ts';
 import { GUEST_CHANNEL, GUEST_CHANNEL_UNIT } from './channel.ts';
 
+export const WINDOWS_CLOUD_AGENT_UNITS=['walinuxagent.service','waagent.service'] as const;
+// Local NoCloud guests have no Azure fabric. The inherited agent otherwise
+// waits 1800 seconds and then adds a DHCP broadcast route to the tunnel NIC.
+export const WINDOWS_LOCAL_GUEST_SERVICES=`set -eu
+for unit in ${WINDOWS_CLOUD_AGENT_UNITS.join(' ')}; do
+  state=$(sudo systemctl is-active "$unit" 2>/dev/null || true)
+  case "$state" in
+    active|activating|deactivating|reloading) sudo systemctl stop "$unit" ;;
+    inactive|failed|unknown) ;;
+    *) printf '%s\\n' 'Unexpected cloud agent state; business permission remains closed.' >&2; exit 1 ;;
+  esac
+  sudo systemctl mask "$unit" >/dev/null
+  test "$(sudo systemctl is-enabled "$unit" 2>/dev/null || true)" = masked
+  state=$(sudo systemctl show --property=ActiveState --value "$unit")
+  case "$state" in inactive|failed) ;; *) exit 1 ;; esac
+  test "$(sudo systemctl show --property=MainPID --value "$unit")" = 0
+done
+`;
+
 export function windowsEnvironment(c: WindowsConfig): Environment {
   return { id:c.id, instanceName:vmIdentity(c.id).name, name:'Windows preview', description:'', kind:'vm', color:'blue',
     cpus:c.cpus,memoryGiB:c.memoryGiB,diskGiB:c.diskGiB,mounts:[],ports:[],browserUrl:'about:blank',
@@ -35,7 +54,7 @@ export function cloudInit(c: WindowsConfig, publicKey: string, hostPrivate: stri
     ],
     // No package downloads on boot. Hyper-V ACLs already restrict the NIC to
     // management SSH before the first instruction executes in this VM.
-    runcmd:[['chmod','0700','/home/mu','/home/dev'],['sysctl','--system'],['systemctl','daemon-reload'],['systemctl','enable','--now','mu-hv-ssh.service']],
+    runcmd:[WINDOWS_LOCAL_GUEST_SERVICES,['chmod','0700','/home/mu','/home/dev'],['sysctl','--system'],['systemctl','daemon-reload'],['systemctl','enable','--now','mu-hv-ssh.service']],
   });
   return {'user-data':userData,'meta-data':stringify({'instance-id':c.id,'local-hostname':'mu-linux','dsmode':'local'}),
     'network-config':stringify({version:2,ethernets:{management:{match:{macaddress:n.mac.match(/../g)!.join(':').toLowerCase()},'set-name':'eth0',dhcp4:false,dhcp6:false,'accept-ra':false,addresses:[`${n.guest}/30`],optional:true}}})};
@@ -61,6 +80,7 @@ if ! sudo cloud-init status --wait >/dev/null; then
   exit 1
 fi
 printf 'datasource_list: [NoCloud]\\n' | sudo tee /etc/cloud/cloud.cfg.d/99-mucodesandbox-datasource.cfg >/dev/null
+${WINDOWS_LOCAL_GUEST_SERVICES}
 ${BOOTSTRAP_IP_STACK}
 sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 update -qq
 sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 install -y --no-install-recommends nftables curl ca-certificates python3 iproute2 locales
@@ -114,6 +134,7 @@ export function configureWindowsGuard(c: WindowsConfig, session = randomUUID()) 
   const lease=leaseFiles(leaseRules(n.host,NET_UID,PROBE_UID,NET_UID));
   const tunnel=transparentConfig(e,'127.0.0.1',NET_UID,[n.subnet],PROBE_PORT);
   const script=`set -euo pipefail
+${WINDOWS_LOCAL_GUEST_SERVICES}
 # Management and approved forwarding use Hyper-V sockets. Waiting for an
 # ordinary IP network is unnecessary on this intentionally isolated VM.
 sudo systemctl mask --now systemd-networkd-wait-online.service >/dev/null
@@ -163,6 +184,13 @@ for f in ['/etc/mucodesandbox/network.nft','/etc/mucodesandbox/lease.nft','/etc/
  s=os.lstat(f)
  if not stat.S_ISREG(s.st_mode) or s.st_uid!=0 or s.st_mode & 0o022: raise RuntimeError('Unsafe guard file ownership')
  with open(f,'rb') as h: files[f]=hashlib.sha256(h.read()).hexdigest()
+for unit in ${JSON.stringify(WINDOWS_CLOUD_AGENT_UNITS)}:
+ f='/etc/systemd/system/'+unit
+ s=os.lstat(f)
+ if not stat.S_ISLNK(s.st_mode) or s.st_uid!=0 or os.readlink(f)!='/dev/null': raise RuntimeError('Cloud agent mask changed')
+ if cmd('systemctl','show','--property=UnitFileState','--value',unit).strip()!='masked': raise RuntimeError('Cloud agent is not masked')
+ if cmd('systemctl','show','--property=ActiveState','--value',unit).strip() not in ['inactive','failed'] or cmd('systemctl','show','--property=MainPID','--value',unit).strip()!='0': raise RuntimeError('Cloud agent remains active')
+ files[f]=hashlib.sha256(os.readlink(f).encode()).hexdigest()
 for service in ['mucodesandbox-egress','mucodesandbox-lease','mucodesandbox-tunnel']:
  cmd('systemctl','is-active',service)
  cmd('systemctl','is-enabled',service)

@@ -8,8 +8,7 @@ function Invoke-ProSoakPhase($Session,[string]$Phase,$Guard,[string]$ProNonce,[l
   return Invoke-Command -Session $Session -ArgumentList $meta,$archive,($Phase -eq 'soak-stage-finish') -ScriptBlock {
    param($meta,$archive,$finish)
    $ErrorActionPreference='Stop';$tools='C:\MuLab\soak-tools\'+$meta.caseId
-   $app='C:\MuLab\exchange-tools\'+$meta.appCase+'\app';$previous=[IO.File]::ReadAllText(('C:\MuLab\approved\exchange-'+$meta.appCase+'-result.json'))|ConvertFrom-Json
-   if(-not $previous.complete -or -not $previous.processExitConfirmed -or -not $previous.brokerExitConfirmed -or -not $previous.nested.removed){throw 'Completed unchanged preview app required'}
+   if($meta.packagedApp){$app=Join-Path $tools 'app'}else{$app='C:\MuLab\exchange-tools\'+$meta.appCase+'\app';$previous=[IO.File]::ReadAllText(('C:\MuLab\approved\exchange-'+$meta.appCase+'-result.json'))|ConvertFrom-Json;if(-not $previous.complete -or -not $previous.processExitConfirmed -or -not $previous.brokerExitConfirmed -or -not $previous.nested.removed){throw 'Completed unchanged preview app required'}}
    if((Test-Path -LiteralPath $tools) -ne $finish){throw 'Soak staging state requires inspection'}
    $configFile='C:\MuLab\approved\soak-'+$meta.caseId+'-config.json';$emptyConfig=$false
    if(Test-Path $configFile){$entry=Get-Item -LiteralPath $configFile;if(-not $finish -or $entry.PSIsContainer -or $entry.Length -ne 0 -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Existing soak config requires inspection'};$emptyConfig=$true}

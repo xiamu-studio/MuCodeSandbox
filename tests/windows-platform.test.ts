@@ -5,13 +5,14 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parse } from 'yaml';
 import { windowsConfigSchema, vmIdentity, NET_UID, PROBE_UID } from '../server/platform/windows/config.ts';
-import { cloudInit, configureWindowsGuard } from '../server/platform/windows/guest.ts';
+import { cloudInit, configureWindowsGuard,bootstrapScript,WINDOWS_LOCAL_GUEST_SERVICES,INSPECT_WINDOWS_GUARD } from '../server/platform/windows/guest.ts';
 import { WindowsNetworkSession, type GuardDriver } from '../server/platform/windows/session.ts';
 import { HyperVRuntime, powershellArgs, powershellPath, powershellScript } from '../server/platform/windows/runtime.ts';
 import { run } from '../server/process.ts';
 import { WindowsHostMonitor } from '../server/platform/windows/monitor.ts';
 import {spawn} from 'node:child_process';
 import {setTimeout as delay} from 'node:timers/promises';
+import {runWindowsSsh} from '../server/platform/windows/ssh-process.ts';
 
 const id='12345678-1234-4234-8234-123456789012';
 const config=()=>windowsConfigSchema.parse({version:1,id,image:path.resolve('fixture.vhd'),imageSha256:'a'.repeat(64),proxy:{mode:'http',address:'127.0.0.1',port:12345},expectedIp:'203.0.113.10'});
@@ -20,6 +21,23 @@ test('Windows config refuses direct fallback, unknown fields, hostnames and shel
     {...config(),proxy:{mode:'http',address:'example.test',port:80}}, {...config(),sharedHome:true},
     {...config(),timezone:'UTC; command'}, {...config(),id:'../../other-vm'}])assert.throws(()=>windowsConfigSchema.parse(value));
   assert.notDeepEqual(vmIdentity(id),vmIdentity('22345678-1234-4234-8234-123456789012'));
+});
+
+test('Windows SSH keeps successful diagnostics out of protocol stdout and preserves split UTF-8',async()=>{
+ const script="const data=Buffer.from(JSON.stringify({text:'中文😀'}));process.stdout.write(data.subarray(0,11));process.stderr.write('close - IO is still pending on closed socket. read:1, write:0\\n');setTimeout(()=>process.stdout.write(data.subarray(11)),10);",observed:string[]=[];
+ const text=await runWindowsSsh(process.execPath,['-e',script],{onOutput:part=>observed.push(part)});assert.deepEqual(JSON.parse(text),{text:'中文😀'});assert.equal(text.includes('IO is still pending'),false);assert.ok(observed.join('').includes('IO is still pending'));assert.match(await run(process.execPath,['-e',script]),/IO is still pending/);
+});
+test('Windows SSH passes exact binary stdin while returning only the guest stdout',async()=>{
+ const bytes=Buffer.from([0,1,255,0,65,128]);const result=await runWindowsSsh(process.execPath,['-e',"const chunks=[];process.stdin.on('data',part=>chunks.push(part));process.stdin.on('end',()=>{process.stderr.write('synthetic diagnostic');process.stdout.write(Buffer.concat(chunks).toString('base64'));});"],{inputBytes:bytes});assert.deepEqual(Buffer.from(result,'base64'),bytes);
+});
+test('Windows SSH nonzero exits remain errors and prefer diagnostic text over private stdout',async()=>{
+ await assert.rejects(runWindowsSsh(process.execPath,['-e',"process.stdout.write('synthetic-private-payload');process.stderr.write('synthetic remote failure');process.exitCode=7;"]),error=>error instanceof Error&&error.message==='synthetic remote failure'&&'code' in error&&error.code==='PROCESS_FAILED');
+});
+test('Windows SSH cancellation and deadlines terminate their disposable process instead of returning partial output',async()=>{
+ const abort=new AbortController();let enter!:()=>void;const entered=new Promise<void>(resolve=>enter=resolve),pending=assert.rejects(runWindowsSsh(process.execPath,['-e',"process.stdout.write('ready');setInterval(()=>{},1000);"],{signal:abort.signal,onOutput:()=>enter(),timeoutMs:5000}),{code:'CANCELLED'});await entered;abort.abort();await pending;await assert.rejects(runWindowsSsh(process.execPath,['-e','setInterval(()=>{},1000)'],{timeoutMs:100}),{code:'TIMEOUT'});
+});
+test('Windows SSH refuses oversized protocol output and invalid limits',async()=>{
+ await assert.rejects(runWindowsSsh(process.execPath,['-e',"process.stdout.write('x'.repeat(1024));setInterval(()=>{},1000);"],{maxBytes:16}),{code:'PROCESS_OUTPUT_TOO_LARGE'});for(const options of [{timeoutMs:0},{maxBytes:-1},{maxBytes:1.5}])await assert.rejects(runWindowsSsh(process.execPath,[],options),{code:'INVALID_SSH_LIMIT'});
 });
 test('NoCloud seed contains no default gateway, package downloads, host mounts or dev sudo',()=>{
   const c=config(),key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestFixture';
@@ -43,6 +61,39 @@ test('Windows guest uses shared default-drop firewall and expiring 45-second per
   assert.match(script,/CLOCK_BOOTTIME/);assert.match(script,/172\.29\./);
   assert.match(script,/ipv4_only/);assert.match(script,/127\.0\.0\.1/);
   assert.doesNotMatch(script,/linux-arm64|--no-sandbox|disable-web-security/);
+});
+
+const cloudAgentShell=String.raw`set -eu
+w_state=active; a_state=unknown; w_mask=enabled; a_mask=missing; stops=0; masks=0
+if [ "$MU_AGENT_MODE" = inactive ]; then w_state=inactive; fi
+sudo(){ "$@"; }
+systemctl(){
+ local action=$1 prop=$2 called_unit state mask
+ for called_unit in "$@"; do :; done
+ if [ "$called_unit" = walinuxagent.service ]; then state=$w_state;mask=$w_mask;else state=$a_state;mask=$a_mask;fi
+ case "$action" in
+  is-active) if [ "$MU_AGENT_MODE" = unknown-state ];then printf '%s\n' unexpected;return 3;fi;printf '%s\n' "$state";[ "$state" = active ] ;;
+  stop) [ "$MU_AGENT_MODE" != stop-failed ] || return 1;stops=$((stops+1));if [ "$called_unit" = walinuxagent.service ];then w_state=inactive;else a_state=inactive;fi ;;
+  mask) [ "$MU_AGENT_MODE" != mask-failed ] || return 1;masks=$((masks+1));if [ "$called_unit" = walinuxagent.service ];then w_mask=masked;else a_mask=masked;a_state=inactive;fi ;;
+  is-enabled) if [ "$MU_AGENT_MODE" = unmasked ];then printf '%s\n' enabled;return 0;fi;printf '%s\n' "$mask";return 1 ;;
+  show) case "$prop" in
+   --property=ActiveState) if [ "$MU_AGENT_MODE" = still-active ];then printf '%s\n' active;else printf '%s\n' "$state";fi ;;
+   --property=MainPID) if [ "$MU_AGENT_MODE" = live-pid ];then printf '%s\n' 42;else printf '%s\n' 0;fi ;;
+   *) return 99 ;;
+  esac ;;
+  *) return 99 ;;
+ esac
+}
+`;
+const runCloudAgent=(mode:string)=>run(process.platform==='win32'?'C:/Program Files/Git/bin/bash.exe':'/bin/bash',['-s'],{input:cloudAgentShell+'\n'+WINDOWS_LOCAL_GUEST_SERVICES+'\nprintf "stops=%s masks=%s\\n" "$stops" "$masks"\n',env:{...process.env,MU_AGENT_MODE:mode},timeoutMs:10000});
+test('Windows local guest preparation stops a running cloud agent and persistently masks its absent alias without requiring successful is-enabled exit status',async()=>{
+ assert.match(await runCloudAgent('active'),/stops=1 masks=2/);assert.match(await runCloudAgent('inactive'),/stops=0 masks=2/);
+});
+test('Failed stopping, masking, unexpected states and surviving agent processes prevent local guest admission',async()=>{
+ for(const mode of ['stop-failed','mask-failed','unmasked','still-active','live-pid','unknown-state'])await assert.rejects(runCloudAgent(mode),{code:'PROCESS_FAILED'});
+});
+test('Windows seeds, builders and every runtime admission disable cloud agents, while integrity inspection requires persistent masks and no active process',()=>{
+ const key='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestFixture',seed=parse(cloudInit(config(),key,'fixture-private',key)['user-data']);assert.ok(seed.runcmd.includes(WINDOWS_LOCAL_GUEST_SERVICES));assert.ok(bootstrapScript(config()).includes(WINDOWS_LOCAL_GUEST_SERVICES));assert.ok(configureWindowsGuard(config()).script.includes(WINDOWS_LOCAL_GUEST_SERVICES));assert.match(INSPECT_WINDOWS_GUARD,/Cloud agent mask changed/);assert.match(INSPECT_WINDOWS_GUARD,/--property=UnitFileState/);assert.match(INSPECT_WINDOWS_GUARD,/--property=MainPID/);assert.doesNotMatch(INSPECT_WINDOWS_GUARD,/cmd\('systemctl','is-enabled',unit\)/);
 });
 
 function fixture(){

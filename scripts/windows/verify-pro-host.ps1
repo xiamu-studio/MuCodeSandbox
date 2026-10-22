@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','audio-stage','audio-run','audio-refresh','audio-inspect','translation-stage','translation-run','translation-refresh','translation-inspect','translation-bind','soak-stage','soak-stage-finish','soak-run','soak-retire','soak-cancel','soak-inspect','exchange-stage','exchange-stage-finish','exchange-run','exchange-inspect','compound-stage','compound-run','compound-recover','compound-inspect','compound-collect','volume-stage','volume-run','volume-recover','volume-inspect','volume-console','volume-channel-probe','volume-offline-read','volume-durable-read','volume-preserve','volume-preserve-finish','volume-retire-stage','volume-retire','volume-collect','disk-stage','disk-run','disk-refresh','disk-refresh-continue','disk-resume','disk-inspect','disk-snapshot','upgrade-profile','upgrade-stage','upgrade-old-install','upgrade-old-seed','upgrade-install','upgrade-current','upgrade-reject','upgrade-uninstall','upgrade-cleanup','upgrade-audit','upgrade-permissions','upgrade-repair-fixture','upgrade-inspect','ime-console','ime-stage','ime-run','ime-inspect','ime-stop','collect-state','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','audio-stage','audio-run','audio-refresh','audio-inspect','translation-stage','translation-run','translation-refresh','translation-inspect','translation-bind','soak-stage','soak-stage-finish','soak-run','soak-offline','soak-dispatch-repair-finish','soak-dispatch-repair','soak-preserve-finish','soak-preserve','soak-diagnostics','soak-retire','soak-cancel','soak-inspect','exchange-stage','exchange-stage-finish','exchange-run','exchange-inspect','compound-stage','compound-run','compound-recover','compound-inspect','compound-collect','volume-stage','volume-run','volume-recover','volume-inspect','volume-console','volume-channel-probe','volume-offline-read','volume-durable-read','volume-preserve','volume-preserve-finish','volume-retire-stage','volume-retire','volume-collect','disk-stage','disk-run','disk-refresh','disk-refresh-continue','disk-resume','disk-inspect','disk-snapshot','upgrade-profile','upgrade-stage','upgrade-old-install','upgrade-old-seed','upgrade-install','upgrade-current','upgrade-reject','upgrade-uninstall','upgrade-cleanup','upgrade-audit','upgrade-permissions','upgrade-repair-fixture','upgrade-inspect','ime-console','ime-stage','ime-run','ime-inspect','ime-stop','collect-state','collect-stop')][string]$Phase)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $directoryPath = [IO.Path]::GetFullPath($Directory)
@@ -14,6 +14,7 @@ if ($credentials.adminUser -ne 'MuLabAdmin' -or $credentials.user -ne 'MuLabUser
 $report = $guard.Reserve('probe-' + [guid]::NewGuid().ToString('N') + '.json')
 $session = $null
 function Save-ProProbe([string]$state, $result = $null) { [IO.File]::WriteAllText($report, (@{ phase = $Phase; state = $state; time = [DateTime]::UtcNow.ToString('o'); result = $result } | ConvertTo-Json -Depth 16), [Text.UTF8Encoding]::new($false)) }
+function Assert-ProLegacyPhase([string]$Value){if($Value -notin @('before-reboot','after-reboot','inspect','diagnostics')){throw 'This phase has no dedicated handler; legacy servicing is forbidden'}}
 function Assert-ProFixture {
     if ($config.flavor -ne 'pro26300' -or $config.name -ne $machine.name -or $machine.name -notmatch '^mu-win-pro-[a-f0-9]{32}$') { throw 'Pro fixture identity changed' }
     $vm = Get-VM -Id ([guid]$machine.id)
@@ -105,15 +106,28 @@ try {
         Start-Process -FilePath (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'vmconnect.exe') -ArgumentList @('localhost',$machine.name) -WindowStyle Normal | Out-Null
         Save-ProProbe 'ime-console-requested' @{ complete = $true; scope = 'synthetic-Pro-console-launch-request'; windowsAuthenticationAutomated = $false }; exit 0
     }
+    if($Phase -in @('soak-dispatch-repair','soak-dispatch-repair-finish')){
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-soak-dispatch-repair.ps1'))))
+        $result=Invoke-ProSoakDispatchRepair $session $guard $config.nonce $PSScriptRoot ($Phase -eq 'soak-dispatch-repair-finish')
+        Save-ProProbe 'soak-dispatch-repaired' $result
+        if(-not $result.complete){exit 1};exit 0
+    }
+    if($Phase -eq 'soak-offline'){
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-soak-offline.ps1'))))
+        $result=Invoke-ProSoakOffline $session $guard $config.nonce $PSScriptRoot
+        Save-ProProbe 'soak-offline-observed' $result
+        if(-not $result.complete){exit 1};exit 0
+    }
     if($Phase -eq 'soak-retire'){
         . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-soak-retire.ps1'))))
         $result=Invoke-ProSoakRetire $session $guard $config.nonce $PSScriptRoot
         Save-ProProbe 'soak-retired' $result
         if(-not $result.complete){exit 1};exit 0
     }
-    if($Phase -in @('soak-stage','soak-stage-finish','soak-run','soak-cancel','soak-inspect')){
+    if($Phase.StartsWith('soak-',[StringComparison]::Ordinal)){
         . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-soak-operator.ps1'))))
-        $result=Invoke-ProSoakPhase $session $Phase $guard $config.nonce
+        $maximum=[Math]::Max([long]0,[long]([IO.DriveInfo]::new([IO.Path]::GetPathRoot([string]$machine.disk)).AvailableFreeSpace-64GB))
+        $result=Invoke-ProSoakPhase $session $Phase $guard $config.nonce $maximum
         Save-ProProbe 'soak-result' $result
         if(-not $result.complete){exit 1};exit 0
     }
@@ -293,6 +307,7 @@ try {
             $session = Connect-ProGuest ([string]$previous.before.bootId)
         }
     }
+    Assert-ProLegacyPhase $Phase
     Save-ProProbe 'running-production-client' $initial
     $result = Invoke-Command -Session $session -ArgumentList $Phase,$config.stagedHashes -ScriptBlock {
         param($phase,$hashes)

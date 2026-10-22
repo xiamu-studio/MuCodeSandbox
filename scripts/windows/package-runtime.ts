@@ -23,6 +23,7 @@ export async function prepareWindowsPackage(options:{version?:string}={}){
  const copied:string[]=[];
  for(const name of modules){if(copied.some(parent=>name.startsWith(parent+'/')))continue;const source=path.join(root,name);try{await access(source);}catch{continue;}await cp(source,path.join(app,name),{recursive:true,filter:skip});copied.push(name);}
  await cp(path.join(root,'desktop/windows'),path.join(app,'desktop/windows'),{recursive:true});await cp(path.join(root,'dist'),path.join(app,'dist'),{recursive:true});await cp(path.join(root,'dist-server'),path.join(app,'dist-server'),{recursive:true});
+ await copyFile(path.join(root,'desktop/clipboard-image.cjs'),path.join(app,'desktop/clipboard-image.cjs'));
  await writeFile(path.join(app,'dist-server/windows-release.json'),JSON.stringify({format:1,version:release.version,fileVersion:release.fileVersion},null,2));
  await mkdir(path.join(app,'dist-server/scripts/windows'),{recursive:true});await mkdir(path.join(app,'dist-server/native/windows'),{recursive:true});
  for(const file of ['hyperv.ps1','host-components.ps1','seed-iso.ps1','build-channel.ps1','build-broker.ps1','install-broker.ps1','clean-runtime-metadata.ps1'])await copyFile(path.join(root,'scripts/windows',file),path.join(app,'dist-server/scripts/windows',file));

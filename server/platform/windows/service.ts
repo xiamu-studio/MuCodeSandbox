@@ -16,6 +16,7 @@ import {WindowsHostMonitor} from './monitor.ts';
 import {WindowsTerminalServer,type PtyFactory} from './terminal.ts';
 import {GuestExchange,transferZone,transferName,transferPath,transferRevision} from '../../guest-exchange.ts';
 import {TRANSFER_MAX_BYTES} from '../../../shared/guest-exchange.ts';
+import {IMAGE_CLIPBOARD_MAX_BYTES} from '../../../shared/clipboard-image.ts';
 import {WindowsBrowser} from './browser.ts';
 import {displayRequestSchema} from '../../../shared/guest-display.ts';
 import {clipboardText} from '../../guest-exchange.ts';
@@ -52,7 +53,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   if(runtime instanceof HyperVRuntime&&runtime.broker){host=new WindowsHostComponents(runtime.broker,()=>!controller.tasks.size&&controller.store.list().every(e=>!['running','starting','creating','stopping'].includes(e.state))&&!setup?.running);await host.refresh();setup=new WindowsSetup(runtime,runtimeRoot,{base,canPrepare:()=>!!host&&hostReady(host.snapshot())&&!controller.options.base&&!controller.tasks.size&&controller.store.list().every(e=>e.state==='not_created'),publish:value=>{controller.options.base=value;controller.profiles.clear();}});await setup.initialize();}
   if(runtime instanceof HyperVRuntime&&runtime.broker)storage=new WindowsStorage(runtime.broker,()=>controller.options.base?.imageSha256??null,()=>!!host&&hostReady(host.snapshot())&&!controller.tasks.size&&!setup?.running);
   terminal=runtime.terminalLaunch?new WindowsTerminalServer(controller,{terminalLaunch:runtime.terminalLaunch.bind(runtime)},options.ptyFactory):undefined;
-  const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>();
+  const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>(),imageTransfers=new Map<string,AbortController>();
   const guest=runtime.guest?.bind(runtime),management=runtime.management?.bind(runtime);
   if(runtime.serviceStreamFactory&&management){browser=new WindowsBrowser(controller,{management,serviceStreamFactory:runtime.serviceStreamFactory.bind(runtime)});controller.browserRunning=id=>browser!.running(id);controller.browserAvailable=true;controller.inspectAdditionalProtection=id=>browser!.assertProtection(id);}
   const guestBrowser=browser;
@@ -61,7 +62,14 @@ export async function createWindowsService(options:WindowsServiceOptions){
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
    try{return await guest(await controller.profile(e),command,{...runOptions,signal:runOptions.signal?AbortSignal.any([abort.signal,runOptions.signal]):abort.signal});}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
-  },management:async(e,command,runOptions)=>{await controller.assertAccess(e.id);return management(await controller.profile(e),command,runOptions);}},id=>controller.assertAccess(id)):undefined;
+  },management:async(e,command,runOptions={})=>{
+   await controller.assertAccess(e.id);
+   if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
+   const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
+   const signals=[abort.signal,runOptions.signal,imageTransfers.get(e.id)?.signal].filter((signal):signal is AbortSignal=>!!signal);
+   try{return await management(await controller.profile(e),command,{...runOptions,signal:AbortSignal.any(signals)});}
+   finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
+  }},id=>controller.assertAccess(id)):undefined;
   controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
   if(!host||host.snapshot().runtimeActive)await controller.recover();
   monitor=new WindowsHostMonitor(()=>runtime.fingerprint(),()=>{void controller.hostUnavailable('宿主网络发生变化、监测中断或电脑从休眠恢复').catch(()=>{});});
@@ -143,9 +151,23 @@ export async function createWindowsService(options:WindowsServiceOptions){
   });
   app.post('/api/environments/:id/clipboard/write',async(req,res)=>{const input=z.object({text:clipboardText}).strict().parse(req.body);res.json(await files().writeClipboard(id(req),input.text));});
   app.post('/api/environments/:id/clipboard/read',async(req,res)=>{z.object({}).strict().parse(req.body??{});res.json(await files().readClipboard(id(req)));});
+  app.post('/api/environments/:id/clipboard/image',async(req,res,next)=>{
+   const envId=id(req);files();
+   if(Number(req.headers['content-length']??0)>IMAGE_CLIPBOARD_MAX_BYTES)throw new AppError('图片超过10 MiB，请缩小后再复制。',413,'CLIPBOARD_IMAGE_TOO_LARGE');
+   if(readers.has(envId)||exchange!.busy.has(envId)||readers.size>=2)throw new AppError('当前传输正在进行，请稍后重试',409,'TRANSFER_BUSY');
+   const stop=()=>res.destroy(),release=()=>{clearTimeout(deadline);if(readers.get(envId)===stop)readers.delete(envId);};
+   const deadline=setTimeout(stop,90000);deadline.unref();readers.set(envId,stop);res.once('finish',release);res.once('close',release);
+   try{await controller.assertAccess(envId);res.locals.imageSession=controller.sessions.get(envId)?.id;next();}catch(error){release();next(error);}
+  },express.raw({type:'image/png',limit:IMAGE_CLIPBOARD_MAX_BYTES}),async(req,res)=>{
+   const envId=id(req);if(!Buffer.isBuffer(req.body))throw new AppError('请选择 PNG 图片',400,'INVALID_CLIPBOARD_IMAGE');
+   if(controller.sessions.get(envId)?.id!==res.locals.imageSession)throw new AppError('环境已变化，请重新传入图片',409,'CONFIGURATION_CHANGED');
+   const abort=new AbortController(),cancel=()=>{if(!res.writableFinished)abort.abort();};res.once('close',cancel);imageTransfers.set(envId,abort);
+   try{const result=await files().writeClipboardImage(envId,req.body);abort.signal.throwIfAborted();if(controller.sessions.get(envId)?.id!==res.locals.imageSession)throw new AppError('环境已变化，图片结果不再交付',409,'CONFIGURATION_CHANGED');res.json(result);}
+   finally{res.removeListener('close',cancel);if(imageTransfers.get(envId)===abort)imageTransfers.delete(envId);}
+  });
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,imageClipboard:!!exchange&&!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));

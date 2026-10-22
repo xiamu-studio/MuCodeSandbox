@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','collect-stop')][string]$Phase)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $directoryPath = [IO.Path]::GetFullPath($Directory)
@@ -100,6 +100,13 @@ try {
         Save-ProProbe 'diagnosed' @{ host = $initial; details = $details }; exit 0
     }
     if (-not $initial.userOrdinary -or $initial.oobe -ne 0 -or $initial.setupInProgress -ne 0) { throw 'Ordinary Pro profile and completed system setup required' }
+    if ($Phase -in @('image-stage','image-refresh','image-run','image-inspect')) {
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-image-operator.ps1'))))
+        Save-ProProbe 'running-image-check' $initial
+        $result = Invoke-ProImagePhase $session $Phase $guard $config.nonce $PSScriptRoot
+        Save-ProProbe 'image-result' $result
+        if (-not $result.complete) { exit 1 }; exit 0
+    }
     if ($Phase -in @('vmms-stage','vmms-run','vmms-recover','vmms-inspect')) {
         . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-vmms-operator.ps1'))))
         Save-ProProbe 'running-vmms-check' $initial

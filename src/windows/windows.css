@@ -18,6 +18,7 @@
 .windows-browser{min-width:0}.windows-browser:fullscreen{background:#f2f5f4;padding:16px;overflow:auto}
 .windows-browser-canvas{height:650px;min-height:360px;background:#181d20;overflow:hidden;border-radius:12px}
 .windows-address{display:flex;gap:12px;margin:14px 0}.windows-address input{flex:1;min-width:0}
+.windows-image-clipboard{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:16px;margin-top:12px;border:1px solid #b8d4cb;border-radius:12px;background:#edf7f3;color:#283431}.windows-image-clipboard>div{flex:1;min-width:220px}.windows-image-clipboard small{display:block;margin-top:6px;line-height:1.6;color:#45645c}.windows-image-clipboard p{flex-basis:100%;margin:0;font-size:13px}.windows-image-clipboard:focus-visible{outline:2px solid #2b786b;outline-offset:2px}
 @media(max-width:760px){.windows-preview .windows-environment-row>span:nth-child(2){display:none}.windows-preview .windows-job>time{display:none}}
 .windows-setup{padding:24px;margin-bottom:28px;border:1px solid rgba(255,255,255,.8);border-radius:20px;background:rgba(255,255,255,.58)}
 .windows-setup>p{line-height:1.8;margin:12px 0;color:#45645c}

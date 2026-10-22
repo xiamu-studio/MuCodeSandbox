@@ -1,5 +1,5 @@
 // Windows releases are independent of the shipping Mac package version.
-export const WINDOWS_SOURCE_VERSION='0.4.66-preview.1';
+export const WINDOWS_SOURCE_VERSION='0.4.66-preview.2';
 export interface WindowsRelease {version:string;fileVersion:string;parts:[number,number,number,number]}
 export function windowsRelease(value:unknown):WindowsRelease{
  if(typeof value!=='string')throw Error('Invalid Windows release');

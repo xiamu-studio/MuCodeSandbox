@@ -1,5 +1,5 @@
 'use strict';
-const {app,BrowserWindow,session,Menu,dialog,powerMonitor}=require('electron');
+const {app,BrowserWindow,session,Menu,dialog,powerMonitor,ipcMain,clipboard,nativeImage}=require('electron');
 const path=require('node:path');
 const fs=require('node:fs');
 const crypto=require('node:crypto');
@@ -10,7 +10,8 @@ if(process.platform!=='win32'){app.quit();throw Error('Windows desktop entry req
 app.setName('MuCodeSandbox Windows Preview');app.setAppUserModelId('local.mucodesandbox.windows.preview');
 const preview=path.join(process.env.LOCALAPPDATA||app.getPath('appData'),'MuCodeSandbox-WindowsPreview');app.setPath('userData',process.env.MU_WINDOWS_DESKTOP_USER_DATA_DIR||path.join(preview,'desktop'));
 app.enableSandbox();app.commandLine.appendSwitch('disable-background-networking');app.commandLine.appendSwitch('disable-quic');
-let window,controller,origin,quitting=false,closing,controllerOptions,mode='normal',generation=0;
+let window,controller,origin,quitting=false,closing,controllerOptions,mode='normal',generation=0,clipboardGeneration=0;
+ipcMain.handle('mu-windows:clipboard-image',require('./clipboard-image.cjs').createClipboardImageHandler({clipboard,nativeImage,getState:()=>({window,origin,normal:mode==='normal'&&!quitting&&!closing,epoch:generation+':'+clipboardGeneration})}));
 const locked=app.requestSingleInstanceLock();if(!locked)app.quit();
 function status(title,detail){origin=undefined;if(window&&!window.isDestroyed())void window.loadURL('data:text/html;charset=utf-8,'+encodeURIComponent(statusDocument(title,detail)));}
 async function close(){if(closing)return closing;generation++;closing=(async()=>{status(mode==='recovery'?'正在关闭恢复模式':'正在关闭 Windows 环境',mode==='recovery'?'正在结束核验，原盘和管理资料会保留。':'正在撤销联网许可并确认虚拟机已停止。');try{await controller?.close();quitting=true;app.quit();}catch(error){const result=await dialog.showMessageBox(window,{type:'error',title:'尚未确认环境停止',message:error.message,buttons:['重试停止','退出并交由独立防护组件停机'],defaultId:0,cancelId:0,noLink:true});closing=undefined;if(result.response===0)return close();controller?.terminate();quitting=true;app.quit();}})();return closing;}
@@ -38,7 +39,8 @@ if(locked){
  app.whenReady().then(async()=>{
   const uiSession=session.fromPartition('persist:windows-manager');await uiSession.setProxy({mode:'direct'});uiSession.setPermissionRequestHandler((_web,_permission,callback)=>callback(false));uiSession.setPermissionCheckHandler(()=>false);
   uiSession.webRequest.onBeforeRequest((details,callback)=>callback({cancel:!allowedRequest(origin,details.url,details.resourceType==='mainFrame')}));
-  window=new BrowserWindow({width:1280,height:900,minWidth:720,minHeight:520,title:'MuCodeSandbox · Windows',backgroundColor:'#eef4f1',webPreferences:{session:uiSession,nodeIntegration:false,nodeIntegrationInSubFrames:false,contextIsolation:true,sandbox:true,webSecurity:true,allowRunningInsecureContent:false,webviewTag:false,spellcheck:false,navigateOnDragDrop:false}});
+  window=new BrowserWindow({width:1280,height:900,minWidth:720,minHeight:520,title:'MuCodeSandbox · Windows',backgroundColor:'#eef4f1',webPreferences:{session:uiSession,preload:path.join(__dirname,'preload.cjs'),nodeIntegration:false,nodeIntegrationInSubFrames:false,contextIsolation:true,sandbox:true,webSecurity:true,allowRunningInsecureContent:false,webviewTag:false,spellcheck:false,navigateOnDragDrop:false}});
+  window.webContents.on('did-start-navigation',(_event,_url,_inPlace,isMainFrame)=>{if(isMainFrame)clipboardGeneration++;});
   window.webContents.setWindowOpenHandler(()=>({action:'deny'}));window.webContents.on('will-attach-webview',event=>event.preventDefault());
   window.webContents.on('render-process-gone',()=>{if(!quitting&&!closing)void close();});powerMonitor.on('suspend',()=>{if(!quitting&&!closing)void close();});
   for(const name of ['will-navigate','will-redirect'])window.webContents.on(name,(event,url)=>{if(!allowedRequest(origin,url,true))event.preventDefault();});

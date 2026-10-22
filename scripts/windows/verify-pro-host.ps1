@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','audio-stage','audio-run','audio-refresh','audio-inspect','translation-stage','translation-run','translation-refresh','translation-inspect','translation-bind','disk-stage','disk-run','disk-refresh','disk-refresh-continue','disk-resume','disk-inspect','disk-snapshot','ime-console','ime-stage','ime-run','ime-inspect','ime-stop','collect-state','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','audio-stage','audio-run','audio-refresh','audio-inspect','translation-stage','translation-run','translation-refresh','translation-inspect','translation-bind','disk-stage','disk-run','disk-refresh','disk-refresh-continue','disk-resume','disk-inspect','disk-snapshot','upgrade-profile','upgrade-stage','upgrade-old-install','upgrade-old-seed','upgrade-install','upgrade-current','upgrade-reject','upgrade-uninstall','upgrade-cleanup','upgrade-audit','upgrade-permissions','upgrade-repair-fixture','upgrade-inspect','ime-console','ime-stage','ime-run','ime-inspect','ime-stop','collect-state','collect-stop')][string]$Phase)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $directoryPath = [IO.Path]::GetFullPath($Directory)
@@ -104,6 +104,12 @@ try {
         if ($initial.interactiveUser -ne 'MU-PRO-LAB\MuLabUser') { throw 'Synthetic ordinary desktop required for IME observation' }
         Start-Process -FilePath (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'vmconnect.exe') -ArgumentList @('localhost',$machine.name) -WindowStyle Normal | Out-Null
         Save-ProProbe 'ime-console-requested' @{ complete = $true; scope = 'synthetic-Pro-console-launch-request'; windowsAuthenticationAutomated = $false }; exit 0
+    }
+    if($Phase -in @('upgrade-profile','upgrade-stage','upgrade-old-install','upgrade-old-seed','upgrade-install','upgrade-current','upgrade-reject','upgrade-uninstall','upgrade-cleanup','upgrade-audit','upgrade-permissions','upgrade-repair-fixture','upgrade-inspect')){
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-upgrade-operator.ps1'))))
+        $result=Invoke-ProUpgradePhase $session $Phase $guard $config.nonce $PSScriptRoot
+        Save-ProProbe 'upgrade-result' $result
+        if(-not $result.complete){exit 1};exit 0
     }
     if ($Phase -in @('disk-stage','disk-run','disk-refresh','disk-refresh-continue','disk-resume','disk-inspect','disk-snapshot')) {
         . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-disk-operator.ps1'))))

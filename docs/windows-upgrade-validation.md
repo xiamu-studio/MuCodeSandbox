@@ -1,5 +1,7 @@
 # Windows 独立版本与安装升级
 
+后续实际 preview.5 → preview.6 已在独立 Pro 普通用户下验证，覆盖原 Linux/加密配置读回、原盘扩容及卸载保留，详见 [Pro 跨版升级验收](windows-pro-upgrade-validation.md)。下文保留首次版本分离与早期安装矩阵的记录。
+
 Windows 使用独立预览版号 `0.4.66-preview.1`。根 `package.json` 与 Mac 的 `shared/version.ts` 保持 `0.4.65`；Mac 的打包入口与发布流程未接入 Windows 版号。
 
 ## 版本与安装规则

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies','resource-inventory','review-allocation')][string]$Action)
+param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies','resource-inventory','review-allocation','disk-growth-facts','grow-disk')][string]$Action)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -145,8 +145,7 @@ function StopAllocation {
   if($v -and $v.State -ne 'Off'){throw 'Allocation shutdown was not confirmed'}
   return $v
 }
-switch ($Action) {
-  'review-allocation' {
+function ReviewAllocation {
     # Read-only admission for an explicit recovery session. No missing or changed
     # resource is repaired here and a running guest is never stopped implicitly.
     $v=AllocationVM
@@ -177,6 +176,25 @@ switch ($Action) {
     }}
     @{platformId=[string]$v.Id;cpus=[int]$processor.Count;memoryGiB=[int]($memory.Startup/1GB);diskGiB=[int]($disk.Size/1GB)} | ConvertTo-Json -Compress
   }
+switch ($Action) {
+  'disk-growth-facts' {
+    $review=ReviewAllocation | ConvertFrom-Json
+    $disk=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($disk.Attached -or [string]$disk.VhdFormat -ne 'VHDX' -or [string]$disk.VhdType -ne 'Dynamic' -or $disk.ParentPath){throw 'Disk growth requires a detached standalone dynamic VHDX'}
+    @{platformId=$review.platformId;diskGiB=$review.diskGiB;diskIdentifier=([guid]$disk.DiskIdentifier).ToString('D');bytes=[long]$disk.Size} | ConvertTo-Json -Compress
+  }
+  'grow-disk' {
+    $review=ReviewAllocation | ConvertFrom-Json
+    $disk=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($disk.Attached -or [string]$disk.VhdFormat -ne 'VHDX' -or [string]$disk.VhdType -ne 'Dynamic' -or $disk.ParentPath -or ([guid]$disk.DiskIdentifier).ToString('D') -ne [string]$c.growthDiskIdentifier){throw 'Disk growth input identity changed'}
+    [long]$target=[long]$c.diskGiB*1GB
+    if(($c.diskGiB -isnot [int] -and $c.diskGiB -isnot [long]) -or $c.diskGiB -lt 16 -or $c.diskGiB -gt 256 -or $disk.Size -gt $target){throw 'Disk shrinking and unknown capacities are forbidden'}
+    if($disk.Size -lt $target){Resize-VHD -Path $c.disk -SizeBytes $target -ErrorAction Stop}
+    $actual=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($actual.Size -ne $target -or ([guid]$actual.DiskIdentifier).ToString('D') -ne [string]$c.growthDiskIdentifier -or (OwnedVM).State -ne 'Off'){throw 'Disk growth completion is unconfirmed'}
+    @{platformId=$review.platformId;diskGiB=[int]$c.diskGiB;diskIdentifier=([guid]$actual.DiskIdentifier).ToString('D');bytes=[long]$actual.Size} | ConvertTo-Json -Compress
+  }
+  'review-allocation' { ReviewAllocation }
   'allocation-absence' {
     if(-not $c.brokerResourceLimit){throw 'Allocation absence checks require the protected broker'}
     $matches=@(Get-VM -ErrorAction Stop | Where-Object {$_.Name -eq $c.name -or ($c.expectedPlatformId -and [string]$_.Id -eq [string]$c.expectedPlatformId)})

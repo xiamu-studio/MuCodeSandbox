@@ -74,6 +74,8 @@ npm run windows:ui
 
 Windows `0.4.66-preview.5` 可用“中文与翻译”打开浮窗，`Ctrl+Shift+Y` 展开/收起，`Ctrl+Enter` 仅粘贴。草稿在收起后保留，候选输入时不触发快捷键；译文可以修改和放大阅读。翻译设置位于帮助中的折叠区，Key 加密保存在本机 Windows，只有点击翻译才经当前沙箱网络调用。终端“取回并翻译”读取当前选择，浏览器则读取 Linux 剪贴板。详见 [翻译验收与范围](windows-translation-validation.md)；外部服务、真实输入法和桌面文字剪贴板手势仍单独验收。
 
+Windows `0.4.66-preview.6` 增加“磁盘扩容”。先停止环境，核对实际容量并输入完整环境名称；当前支持独立动态 VHDX 和默认 Linux ext4 根分区，最大 256 GiB，只增不减。维护时业务联网关闭，完成后保持停止。中断后保留已扩大容量并继续原目标；已提交容量与工作区不一致时可同步记录。详见 [原盘扩容与恢复验收](windows-disk-growth-validation.md)。
+
 ## 独立 Windows 桌面测试包
 
 Windows 使用 `desktop/windows/main.cjs` 和独立打包配置。应用身份为 `local.mucodesandbox.windows.preview`，与 Mac 应用不同；根目录的 Mac Electron 入口及 `package:mac` 保持原有配置。

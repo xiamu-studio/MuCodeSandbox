@@ -11,6 +11,7 @@ import WindowsStoragePanel from './WindowsStoragePanel.tsx';
 import WindowsResourcesPanel from './WindowsResourcesPanel.tsx';
 import WindowsPowerPanel from './WindowsPowerPanel.tsx';
 import WindowsRecoveryWorkspace from './WindowsRecoveryWorkspace.tsx';
+import WindowsDiskPanel from './WindowsDiskPanel.tsx';
 const TerminalPanel=lazy(()=>import('../TerminalPanel.tsx'));
 const WindowsBrowserView=lazy(()=>import('./WindowsBrowserView.tsx'));
 
@@ -85,7 +86,7 @@ function WindowsNormalWorkspace(){
      {guardError&&<Notice kind="error">{guardError}</Notice>}
      <SectionHeading title="环境配置" action={<Button disabled={!!active||selected.state==='running'} onClick={()=>setDialog(selected)}>编辑配置</Button>}/>
      <dl className="facts"><div><dt>资源</dt><dd>{selected.cpus} 核心 · {selected.memoryGiB} GiB 内存 · {selected.diskGiB} GiB 磁盘</dd></div><div><dt>代理</dt><dd>{selected.network.mode.toUpperCase()} · {selected.network.host}:{selected.network.port}</dd></div><div><dt>批准的出口</dt><dd>{selected.network.egressLock?.expectedIp}</dd></div><div><dt>时区</dt><dd>{selected.identity.timezone}</dd></div><div><dt>凭据</dt><dd>{selected.network.passwordConfigured?'已加密保存':'未设置密码'}</dd></div></dl>
-     {window.__MU_CONFIG__.capabilities?.remove&&<div className="button-row"><Button disabled={!connected||!!active||['running','starting','creating'].includes(selected.state)} onClick={()=>setDeleting(selected)}>删除环境</Button></div>}
+     <div className="button-row">{window.__MU_CONFIG__.capabilities?.diskGrowth&&<WindowsDiskPanel key={selected.id+':'+selected.diskGiB+':'+selected.state} environment={selected} disabled={!connected||!!active} onChange={refresh}/ >}{window.__MU_CONFIG__.capabilities?.remove&&<Button disabled={!connected||!!active||['running','starting','creating'].includes(selected.state)} onClick={()=>setDeleting(selected)}>删除环境</Button>}</div>
      <div className="button-row windows-tools">{window.__MU_CONFIG__.capabilities?.terminal&&<Button disabled={selected.state!=='running'||!!active} onClick={()=>setTool(tool==='terminal'?null:'terminal')} icon={<TerminalSquare size={15}/>}>Linux 终端</Button>}{window.__MU_CONFIG__.capabilities?.files&&<Button disabled={selected.state!=='running'||!!active} onClick={()=>setTool(tool==='files'?null:'files')}>文件传输</Button>}</div>
      {window.__MU_CONFIG__.capabilities?.browser&&<div className="button-row windows-tools"><Button disabled={selected.state!=='running'||!!active} onClick={()=>selected.browserRunning?setTool(tool==='browser'?null:'browser'):void browserAction('open')}>{selected.browserRunning?'浏览器画面':'打开浏览器'}</Button>{selected.browserRunning&&<Button disabled={!!active} onClick={()=>void browserAction('close')}>关闭浏览器</Button>}</div>}
      {selected.state==='running'&&!active&&tool==='terminal'&&<Suspense fallback={<p>加载终端…</p>}><TerminalPanel key={selected.id} environment={selected} quickTools="text"/></Suspense>}
@@ -98,7 +99,7 @@ function WindowsNormalWorkspace(){
      <div className="env-table">{snapshot.environments.map(e=><button key={e.id} className="windows-environment-row" onClick={()=>select(e.id)}><span className="env-table-name"><ShieldCheck size={20}/><strong>{e.name}</strong></span><span>{e.cpus} 核心 · {e.memoryGiB} GiB</span><Status state={e.state}/></button>)}</div>
      {!snapshot.environments.length&&<div className="workspace-empty"><Box size={32}/><h2>创建第一个 Windows Linux 环境</h2></div>}
     </>}
-    {snapshot&&<><SectionHeading title="操作记录"/>{snapshot.jobs.filter(j=>!selectedId||j.environmentId===selectedId).slice(0,8).map(j=><div className="windows-job" key={j.id}><strong>{({start:'启动',stop:'停止',restart:'重启',delete:'删除环境','open-browser':'打开浏览器','close-browser':'关闭浏览器','browser-navigate':'打开网页'} as Record<string,string>)[j.action]??j.action}</strong><span>{({running:'进行中',succeeded:'完成',failed:'失败',cancelled:'已取消'} as Record<string,string>)[j.status]} {displayIssue(j.message)}</span>{j.status==='running'&&j.action!=='delete'&&<Button onClick={()=>void api.cancel(j.id).catch(e=>setError(e.message))}>取消</Button>}<time>{dateLabel(j.createdAt)}</time></div>)}
+    {snapshot&&<><SectionHeading title="操作记录"/>{snapshot.jobs.filter(j=>!selectedId||j.environmentId===selectedId).slice(0,8).map(j=><div className="windows-job" key={j.id}><strong>{({start:'启动',stop:'停止',restart:'重启',delete:'删除环境','open-browser':'打开浏览器','close-browser':'关闭浏览器','browser-navigate':'打开网页','disk-grow':'磁盘扩容'} as Record<string,string>)[j.action]??j.action}</strong><span>{({running:'进行中',succeeded:'完成',failed:'失败',cancelled:'已取消'} as Record<string,string>)[j.status]} {displayIssue(j.message)}</span>{j.status==='running'&&j.action!=='delete'&&<Button onClick={()=>void api.cancel(j.id).catch(e=>setError(e.message))}>取消</Button>}<time>{dateLabel(j.createdAt)}</time></div>)}
      <SectionHeading title="本地日志"/><div className="log-surface">{logs.length?logs.map(row=><div className="log-entry" key={row.id}><time>{dateLabel(row.createdAt)}</time><span>{row.level}</span><p>{row.message}</p></div>):<p>暂无日志</p>}</div></>}
    </div>
   </main>

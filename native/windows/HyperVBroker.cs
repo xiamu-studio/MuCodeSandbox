@@ -199,7 +199,7 @@ public static partial class MuHyperVBroker {
         }
         if(SetupOnly)throw new UnauthorizedAccessException("This session only prepares Windows components; reopen the application for virtual machines");
         if(ResourceMutation(action)||action=="channel")CheckPower();if(ResourceIssue!=null&&(ResourceMutation(action)||action=="channel"))throw new MuStorageException("RESOURCE_FENCED","Host resource protection has closed this session; reopen the application");
-        if((action=="disk"||action=="begin-base"||action=="create"||action=="start")&&HostServicingBusy())throw new InvalidOperationException("Windows component servicing is running");
+        if((action=="disk"||action=="begin-base"||action=="create"||action=="start"||action=="grow-disk"||action=="start-disk-growth"||action=="start-disk-review"||action=="finish-disk-growth")&&HostServicingBusy())throw new InvalidOperationException("Windows component servicing is running");
         string id=Id(request);
         if(action=="seal-base"){ValidateKeys(request,"action","id");return SealBase(id,cancellation);}
         if(action=="discard-base-builder"){ValidateKeys(request,"action","id");lock(VmGate(id)){var builder=Owned(id);if(!builder.ContainsKey("baseBuilder")||!Convert.ToBoolean(builder["baseBuilder"]))throw new UnauthorizedAccessException("Only a marked base builder may be discarded by setup");return Dispatch(pipe,new Dictionary<string,object>{{"action","delete"},{"id",id}},cancellation);}}
@@ -209,6 +209,7 @@ public static partial class MuHyperVBroker {
             var state=Json().Deserialize<Dictionary<string,object>>(Invoke("allocation-absence",parameters,15000,cancellation));return new {absent=Convert.ToBoolean(state["absent"])&&!HasStorage(Convert.ToString(parameters["directory"]))};
         }
         if(action=="allocation"){ValidateKeys(request,"action","id");return Allocation(id);}
+        if(new[]{"disk-growth-status","grow-disk","start-disk-growth","start-disk-review","finish-disk-growth"}.Contains(action))return DiskGrowthAction(action,request,cancellation);
         if(action=="recover"||action=="prepare"||action=="delete"){
             if(action=="prepare")ValidateKeys(request,"action","id","image");else ValidateKeys(request,"action","id");lock(VmGate(id)){
                 var record=Owned(id);CloseChannel(id);cancellation.ThrowIfCancellationRequested();var recovered=RecoverAllocation(record);
@@ -274,6 +275,7 @@ public static partial class MuHyperVBroker {
                 if((action=="status"||action=="stop")&&(!owned.ContainsKey("platformId")||Convert.ToString(owned["stage"])!="ready"))return Json().Serialize(RecoverAllocation(owned));
                 if(!owned.ContainsKey("platformId")||action=="start"&&Convert.ToString(owned["stage"])!="ready")throw new InvalidOperationException("VM is not ready");
                 if(action=="start"&&owned.ContainsKey("baseSealedDigest"))throw new InvalidOperationException("A sealed builder cannot be started again");
+                if(action=="start"&&GrowthJournal(owned)!=null)throw new MuStorageException("DISK_GROWTH_PENDING","Resume pending disk growth before starting the environment");
                 if(action=="start")lock(Gate)StartedHere.Add(id);
                 if(action=="stop")CloseChannel(id);try{
                     if(action=="start"){

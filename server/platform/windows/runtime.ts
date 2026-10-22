@@ -21,6 +21,8 @@ import { measureEgress } from '../../egress.ts';
 import {AppError} from '../../errors.ts';
 import {GUEST_TASK_RUN,GUEST_TASK_CANCEL} from '../../guest-task.ts';
 import type {HyperVBrokerClient,BrokerAction} from './broker.ts';
+import {growWindowsDisk} from './disk-growth.ts';
+import {windowsDiskGrowthInfo} from '../../../shared/windows-disk.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../..','scripts/windows');
 const inspection=z.object({digest:z.string().regex(/^[a-f0-9]{64}$/),leaseActive:z.boolean(),remainingMs:z.number().nonnegative().max(45000)}).strict();
@@ -258,9 +260,14 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     await this.publishManifest(c,platformId);
   }
   async start(c:WindowsConfig,options:RunOptions={}) {
+    return this.startGuest(c,options,'normal');
+  }
+  async startDiskMaintenance(c:WindowsConfig,options:RunOptions={}) {if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');return this.startGuest(c,options,'growth');}
+  async startDiskReview(c:WindowsConfig,options:RunOptions={}) {if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');return this.startGuest(c,options,'review');}
+  private async startGuest(c:WindowsConfig,options:RunOptions,maintenance:'normal'|'growth'|'review') {
     await access(windowsPaths(this.root,c.id).manifest);
     try {
-      const started=JSON.parse(await this.powershell('start',c,{...options,timeoutMs:options.timeoutMs??120000}));this.vmIds.set(c.id,z.uuid().parse(started.platformId));
+      const started=JSON.parse(maintenance!=='normal'?String(await this.broker!.call(maintenance==='review'?'start-disk-review':'start-disk-growth',{id:c.id,targetGiB:c.diskGiB},{...options,timeoutMs:options.timeoutMs??120000})):await this.powershell('start',c,{...options,timeoutMs:options.timeoutMs??120000}));this.vmIds.set(c.id,z.uuid().parse(started.platformId));
       // First boot may expand the vendor filesystem. Management readiness has
       // a separate bounded wait; business traffic remains closed throughout.
       const deadline=Date.now()+(options.timeoutMs??600000);
@@ -272,6 +279,9 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     } catch(error) {await this.stop(c);throw error;}
   }
   async resources(){return this.broker?windowsResourcesSchema.parse(await this.broker.call('resource-status')):null;}
+  get diskGrowthAvailable(){return !!this.broker;}
+  async diskGrowthInfo(c:WindowsConfig,options:RunOptions={}){if(!this.broker)throw new AppError('此入口不支持磁盘扩容',409,'FEATURE_UNAVAILABLE');return windowsDiskGrowthInfo.parse(await this.broker.call('disk-growth-status',{id:c.id},{...options,timeoutMs:90000}));}
+  growDisk(c:WindowsConfig,targetGiB:number,options:RunOptions={}){return growWindowsDisk(this,c,targetGiB,options);}
   async power(){return this.broker?windowsPowerSchema.parse(await this.broker.call('power-status')):null;}
   async stop(c:WindowsConfig,options:RunOptions={}) {
     // A stuck SSH child must never prevent the independent hypervisor stop.
@@ -381,9 +391,9 @@ sudo sync
     const file=path.join(windowsPaths(this.root,c.id).directory,'protected-base.vhdx');
     return {file,sha256:await fileHash(file)};
   }
-  async configure(c:WindowsConfig) {
+  async configure(c:WindowsConfig,options:RunOptions={}) {
     const guard=configureWindowsGuard(c);
-    await this.management(c,['bash','-s'],{input:guard.script,timeoutMs:60000});
+    await this.management(c,['bash','-s'],{...options,input:guard.script,timeoutMs:60000});
     return guard.session;
   }
   async inspectGuard(c:WindowsConfig) {

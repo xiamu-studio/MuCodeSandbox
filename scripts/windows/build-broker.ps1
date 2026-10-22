@@ -12,6 +12,7 @@ $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirecto
 $metrics=[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/ResourceMetrics.cs'))
 $source+=[Environment]::NewLine+$metrics
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/Resources.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/DiskGrowth.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/Recovery.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/RecoveryPermissions.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/PowerWatch.cs'))

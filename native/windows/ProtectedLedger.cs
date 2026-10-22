@@ -32,7 +32,7 @@ public sealed class MuProtectedLedger {
     private static bool IsId(string value){Guid id;return Guid.TryParseExact(value,"D",out id)&&id!=Guid.Empty&&id.ToString("D")==value;}
     private void ValidateRecord(string id,Dictionary<string,object> record){
         if(!IsId(id)||StringValue(record,"id")!=id||StringValue(record,"ownerSid")!=sid)throw new UnauthorizedAccessException("Registry ownership changed");
-        var fields=new[]{"id","ownerSid","image","imageSha256","cpus","memoryGiB","diskGiB","stage","platformId","everReady","baseBuilder","sealedSource","baseSealedDigest"};
+        var fields=new[]{"id","ownerSid","image","imageSha256","cpus","memoryGiB","diskGiB","stage","platformId","everReady","baseBuilder","sealedSource","baseSealedDigest","diskGrowth"};
         if(record.Keys.Any(key=>!fields.Contains(key)))throw new UnauthorizedAccessException("Unknown registry field");
         string digest=StringValue(record,"imageSha256"),image=StringValue(record,"image");
         if(!IsDigest(digest)||!new[]{".vhd",".vhdx"}.Any(extension=>string.Equals(image,Path.Combine(root,"images",digest+extension),StringComparison.OrdinalIgnoreCase)))throw new UnauthorizedAccessException("Registry image boundary changed");
@@ -45,6 +45,12 @@ public sealed class MuProtectedLedger {
         bool builder=record.ContainsKey("baseBuilder")&&(bool)record["baseBuilder"];
         if(builder&&(digest!="c74a7d3b3476ffb2715bfcaf9c216e9dd1d6c7e01bc6d0380b1744518dfae15c"||Convert.ToInt64(record["cpus"])!=2||Convert.ToInt64(record["memoryGiB"])!=4||Convert.ToInt64(record["diskGiB"])!=32||record.ContainsKey("sealedSource")))throw new UnauthorizedAccessException("Registry builder authority changed");
         if(record.ContainsKey("baseSealedDigest")&&(!builder||!IsDigest(StringValue(record,"baseSealedDigest"))))throw new UnauthorizedAccessException("Registry sealed builder changed");
+        if(record.ContainsKey("diskGrowth")){
+            var growth=record["diskGrowth"] as Dictionary<string,object>;
+            if(growth==null||growth.Count!=4||growth.Keys.Any(key=>!new[]{"fromGiB","targetGiB","diskIdentifier","fileIdentity"}.Contains(key))||builder||!record.ContainsKey("platformId"))throw new UnauthorizedAccessException("Invalid disk growth authority");
+            long from=IntegerValue(growth,"fromGiB",16,255),target=IntegerValue(growth,"targetGiB",from+1,256);if(target!=Convert.ToInt64(record["diskGiB"])||!IsId(StringValue(growth,"diskIdentifier")))throw new UnauthorizedAccessException("Disk growth capacity or disk changed");
+            string identity=StringValue(growth,"fileIdentity");if(identity.Length!=24||identity.Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))throw new UnauthorizedAccessException("Disk file identity required");
+        }
     }
     private Dictionary<string,Dictionary<string,object>> ParseRecords(Dictionary<string,object> values){
         if(values==null||values.Count>32)throw new UnauthorizedAccessException("Registry allocation limit changed");

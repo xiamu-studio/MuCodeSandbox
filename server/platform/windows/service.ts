@@ -107,6 +107,8 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.post('/api/environments/:id/actions/delete',async(req,res)=>{const input=z.object({confirmation:z.string().min(1).max(60)}).strict().parse(req.body);res.status(202).json(await controller.remove(id(req),input.confirmation));});
   app.post('/api/environments/:id/actions/:action',async(req,res)=>{const action=z.enum(['start','stop','restart']).parse(req.params.action);if(action!=='stop'&&host&&!hostReady(await host.refresh()))throw new AppError('系统组件尚未就绪，请按系统准备提示处理',409,'HOST_REQUIREMENTS');res.status(202).json(await controller.action(id(req),action));});
   app.get('/api/environments/:id/network/protection',async(req,res)=>res.json(await controller.protection(id(req))));
+  app.get('/api/environments/:id/disk-growth',async(req,res)=>{const abort=new AbortController(),cancel=()=>{if(!res.writableFinished)abort.abort();};res.once('close',cancel);try{res.json(await controller.diskGrowthInfo(id(req),{signal:abort.signal}));}finally{res.removeListener('close',cancel);}});
+  app.post('/api/environments/:id/disk-growth',async(req,res)=>{const input=z.object({targetGiB:z.number().int().min(16).max(256),confirmation:z.string().min(1).max(60)}).strict().parse(req.body);res.status(202).json(await controller.growDisk(id(req),input.targetGiB,input.confirmation));});
   app.get('/api/logs',(req,res)=>res.json(controller.store.logs(req.query.environmentId?z.uuid().parse(req.query.environmentId):null,z.coerce.number().int().min(0).parse(req.query.after??0))));
   app.post('/api/jobs/:id/cancel',(req,res)=>{controller.cancel(id(req));res.json({ok:true});});
   const setupHost=()=>{if(!setup)throw new AppError('此入口不支持自动准备，请使用普通用户桌面入口',409,'SETUP_UNAVAILABLE');return setup;};
@@ -188,7 +190,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   });
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,translation:!!exchange,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,translation:!!exchange,diskGrowth:!!runtime.diskGrowthAvailable,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));

@@ -15,9 +15,10 @@ import {windowsConfigSchema,windowsPaths,vmIdentity,isSealedBase,type WindowsCon
 import type {WindowsNetworkSession} from './session.ts';
 import {resourceIssue} from './resources.ts';
 import {powerIssue} from './power.ts';
+import {windowsDiskSize} from '../../../shared/windows-disk.ts';
 
 export interface WindowsBase {image:string;imageSha256:string}
-export type WindowsBackend=Pick<HyperVRuntime,'info'|'create'|'start'|'stop'|'state'|'session'|'connect'|'inspectGuard'>&Partial<Pick<HyperVRuntime,'remove'|'recoverCreation'|'deletionAvailable'|'resources'|'power'>>;
+export type WindowsBackend=Pick<HyperVRuntime,'info'|'create'|'start'|'stop'|'state'|'session'|'connect'|'inspectGuard'>&Partial<Pick<HyperVRuntime,'remove'|'recoverCreation'|'deletionAvailable'|'resources'|'power'|'diskGrowthAvailable'|'diskGrowthInfo'|'growDisk'>>;
 export interface WindowsManagerOptions {runtimeRoot:string;base?:WindowsBase;probe?:(config:WindowsConfig)=>()=>Promise<{receiver:string;ip:string}[]>}
 
 // Windows owns its lifecycle and storage integration. The shipping Mac
@@ -104,6 +105,28 @@ export class WindowsManager {
   const promise=Promise.resolve().then(async()=>{
    this.onAccessRevoked?.(id);await this.runtime.remove!(await this.profile(e,false));this.store.remove(id);this.profiles.delete(id);this.store.finishJob(job.id,'succeeded','环境及专属虚拟磁盘已删除');
   }).catch(error=>{this.store.state(id,'error','删除未完成，保留环境记录：'+redact(errorMessage(error)));this.store.finishJob(job.id,'failed',errorMessage(error));}).finally(()=>{this.active.delete(id);this.deletions.delete(job.id);this.tasks.delete(job.id);});
+  this.tasks.set(job.id,{controller,promise});return job;
+ }
+ async diskGrowthInfo(id:string,options:RunOptions={}){
+  if(!this.runtime.diskGrowthAvailable||!this.runtime.diskGrowthInfo)throw new AppError('此入口不支持磁盘扩容，请使用 Windows 桌面权限代理',409,'FEATURE_UNAVAILABLE');
+  const e=this.store.get(id);if(this.active.has(id)||this.sessions.has(id)||!['stopped','error'].includes(e.state))throw new AppError('请先停止环境并等待当前操作完成',409,'ENVIRONMENT_BUSY');
+  return this.runtime.diskGrowthInfo(await this.profile(e,false),options);
+ }
+ async growDisk(id:string,targetGiB:number,confirmation:string){
+  windowsDiskSize.parse(targetGiB);const e=this.store.get(id);
+  if(this.closing)throw new AppError('应用正在退出',409,'CLOSING');
+  if(this.hostIssue||this.resourceIssue||this.powerIssue)throw new AppError('请处理宿主防护问题并重新打开软件后维护磁盘',409,'GUARD_FAILED');
+  if(!this.runtime.diskGrowthAvailable||!this.runtime.growDisk)throw new AppError('此入口不支持磁盘扩容',409,'FEATURE_UNAVAILABLE');
+  if(confirmation!==e.name)throw new AppError('请输入完整环境名称以确认磁盘扩容',400,'DISK_GROWTH_CONFIRMATION');
+  if(e.kind!=='vm'||this.active.has(id)||this.sessions.has(id)||!['stopped','error'].includes(e.state))throw new AppError('请先停止环境并等待当前操作完成',409,'ENVIRONMENT_BUSY');
+  if(targetGiB<e.diskGiB)throw new AppError('磁盘容量不能缩小',400,'DISK_GROWTH_SIZE');
+  const job=this.store.newJob(id,'disk-grow'),controller=new AbortController();this.active.set(id,job.id);this.lifecycleIds.add(id);this.store.state(id,'starting');
+  const promise=Promise.resolve().then(async()=>{
+   this.onAccessRevoked?.(id);controller.signal.throwIfAborted();const result=await this.runtime.growDisk!(await this.profile(e,false),targetGiB,{signal:controller.signal});
+   if(result.diskGiB!==targetGiB)throw Error('Disk growth result changed');controller.signal.throwIfAborted();
+   this.store.save({...e,diskGiB:targetGiB,state:'stopped',lastError:null});this.profiles.delete(id);this.store.finishJob(job.id,'succeeded',result.reconciled?'已同步磁盘容量记录；环境保持停止':'磁盘与文件系统已扩容；环境保持停止');
+  }).catch(error=>{this.profiles.delete(id);this.store.state(id,'error','磁盘扩容未完成，请保留现有磁盘并按维护提示继续：'+redact(errorMessage(error)));this.store.finishJob(job.id,controller.signal.aborted?'cancelled':'failed',errorMessage(error));})
+   .finally(()=>{this.active.delete(id);this.lifecycleIds.delete(id);this.tasks.delete(job.id);});
   this.tasks.set(job.id,{controller,promise});return job;
  }
  private async lifecycle(e:Environment,action:'start'|'stop'|'restart',signal:AbortSignal){

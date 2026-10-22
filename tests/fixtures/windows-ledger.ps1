@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$Directory,[string]$Source,[ValidateSet('fresh','legacy','orphans','loss','corruption','interrupted','conflict','missing','schema','links','permissions','limit','recovery-missing','recovery-corrupt','recovery-stale','recovery-trust')][string]$Case)
+param([string]$Directory,[string]$Source,[ValidateSet('fresh','legacy','orphans','loss','corruption','interrupted','conflict','missing','schema','links','permissions','limit','recovery-missing','recovery-corrupt','recovery-stale','recovery-trust','disk-growth','disk-growth-schema')][string]$Case)
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Web.Extensions
 $header='using System;using System.IO;using System.Linq;using System.Text;using System.Collections.Generic;using System.Runtime.InteropServices;using System.Web.Script.Serialization;'
@@ -19,6 +19,22 @@ function Check-Copies {
  $a=[IO.File]::ReadAllText($primary);$b=[IO.File]::ReadAllText($backup);Check ($a -ceq $b) 'Replicated copies differ';$saved=$json.DeserializeObject($a);Check ($saved.version -eq 2 -and $saved.ownerSid -eq $sid -and $saved.records.Count -eq 1 -and $saved.records[$id].platformId -eq $vmId) 'Allocation identity changed';Check ([IO.File]::ReadAllText($canary) -ceq 'original guest bytes') 'Guest bytes changed'
 }
 switch($Case){
+ 'disk-growth' {
+  $s=Seed;$script:denyPrimary=$false
+  $validator=[Action[string]]{param($file) if($script:denyPrimary -and $file -eq $primary){throw [IO.IOException]::new('Synthetic growth publication interruption')}}
+  $s=[MuProtectedLedger]::new($root,$sid,$validator);$loaded=$s.Load()
+  $loaded[$id]['diskGiB']=40;$growth=[Collections.Generic.Dictionary[string,object]]::new();$growth.Add('fromGiB',32);$growth.Add('targetGiB',40);$growth.Add('diskIdentifier','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');$growth.Add('fileIdentity',('a'*24));$loaded[$id]['diskGrowth']=$growth
+  $script:denyPrimary=$true;Reject {$s.Save($loaded)} 'IOException';$script:denyPrimary=$false
+  $loaded=(Store).Load();Check ($loaded[$id].diskGrowth.targetGiB -eq 40 -and $loaded[$id].diskGiB -eq 40 -and $loaded[$id].diskGrowth.fromGiB -eq 32) 'Interrupted growth intent was not restored from the newer durable copy';Check-Copies
+  $loaded[$id].Remove('diskGrowth')|Out-Null;(Store).Save($loaded);Check-Copies;Check (-not (Store).Load()[$id].ContainsKey('diskGrowth')) 'Completed growth journal did not clear'
+ }
+ 'disk-growth-schema' {
+  $record['diskGiB']=40;$growth=[Collections.Generic.Dictionary[string,object]]::new();$growth.Add('fromGiB',32);$growth.Add('targetGiB',40);$growth.Add('diskIdentifier','aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa');$growth.Add('fileIdentity',('a'*24));$record['diskGrowth']=$growth;Seed|Out-Null;$valid=[IO.File]::ReadAllText($primary)
+  foreach($kind in @('shrink','target','identifier','file','unknown','missing-vm','null','builder')){
+   $x=$json.DeserializeObject($valid);$r=$x.records[$id];switch($kind){'shrink'{$r.diskGrowth.fromGiB=40};'target'{$r.diskGrowth.targetGiB=41};'identifier'{$r.diskGrowth.diskIdentifier='wrong'};'file'{$r.diskGrowth.fileIdentity='wrong'};'unknown'{$r.diskGrowth['path']='C:\foreign.vhdx'};'missing-vm'{$r.Remove('platformId')|Out-Null};'null'{$r.diskGrowth=$null};'builder'{$r['baseBuilder']=$true}}
+   $text=$json.Serialize($x);[IO.File]::WriteAllText($primary,$text);[IO.File]::WriteAllText($backup,$text);Reject {(Store).Load()|Out-Null} 'UnauthorizedAccessException';Check ([IO.File]::ReadAllText($primary) -ceq $text -and [IO.File]::ReadAllText($backup) -ceq $text) 'Invalid growth evidence was overwritten';Check ([IO.File]::ReadAllText($canary) -ceq 'original guest bytes') 'Guest data changed'
+  }
+ }
  'recovery-missing' {
   $s=Store;$loaded=$s.InspectRecovery();Check ($loaded.Count -eq 0 -and $s.UnregisteredStorageCount -eq 1) 'Recovery silently adopted orphan data';Check (-not [IO.File]::Exists($primary) -and -not [IO.File]::Exists($backup)) 'Read-only recovery initialized a registry'
   Reject {(Store).Load() | Out-Null} 'UnauthorizedAccessException';$fingerprint=$s.RecoveryFingerprint();$s.SaveRecovery($records,$fingerprint);Check-Copies;Check ((Store).Load().Count -eq 1) 'Explicit recovered registration could not reopen normally'

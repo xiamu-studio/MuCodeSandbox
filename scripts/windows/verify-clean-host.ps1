@@ -121,7 +121,7 @@ try{
   if($Phase -in @('adoption-collect','adoption-ui-collect')){
    $action=if($Phase -eq 'adoption-ui-collect'){'collect-ui'}else{'collect'}
    $value=Invoke-Command -Session $session -ArgumentList $operatorSource,$action -ScriptBlock {param($source,$action) & ([ScriptBlock]::Create($source)) -Action $action}
-   if($Phase -eq 'adoption-ui-collect'){$screenshot=$guard.Reserve('recovery-ui.png');Copy-Item -LiteralPath C:\MuLab\public\adoption-ui.png -Destination $screenshot -FromSession $session -Force;$value.screenshot=$screenshot}
+   if($Phase -eq 'adoption-ui-collect'){$screenshot=$guard.Reserve(('recovery-ui-'+[guid]::NewGuid().ToString('N')+'.png'));Copy-Item -LiteralPath C:\MuLab\public\adoption-ui.png -Destination $screenshot -FromSession $session -Force;$value.screenshot=$screenshot}
    Assert-LabVM | Out-Null;Save-Probe 'adoption-evidence-collected' $value
    try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
    Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
@@ -135,6 +135,18 @@ try{
   Save-Probe 'cache-progress-inspected' $evidence;exit 0
  }
  if($Phase -in @('cache-ui-stage','adoption-ui-stage')){
+  # Retain older renderer evidence separately. Merging hashed asset directories
+  # leaves stale executable files and cannot prove an exact current payload.
+  Invoke-Command -Session $session -ScriptBlock {
+   if($env:COMPUTERNAME -ne 'MU-CLEAN-LAB' -or @(Get-VM|Where-Object{$_.State -ne 'Off'}).Count){throw 'Renderer staging requires stopped diagnostic VMs'}
+   $busy=@(Get-CimInstance Win32_Process|Where-Object{$_.ExecutablePath -like 'C:\MuLab\product\*' -or $_.ExecutablePath -like 'C:\MuLab\test-tools\electron\*' -or $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*'})
+   if($busy.Count){throw 'A diagnostic product process is still using the payload; inspect before restaging'}
+   $renderer='C:\MuLab\product\resources\app\dist';if(Test-Path -LiteralPath $renderer){
+    $entries=@(Get-Item -LiteralPath $renderer)+@(Get-ChildItem -LiteralPath $renderer -Recurse -Force);if(@($entries|Where-Object{$_.Attributes -band [IO.FileAttributes]::ReparsePoint}).Count){throw 'Renderer archive rejects reparse entries'}
+    $archive='C:\MuLab\private\renderer-before-stage-'+[guid]::NewGuid().ToString('N');[IO.Directory]::Move($renderer,$archive)
+   }
+   [void][IO.Directory]::CreateDirectory($renderer)
+  }
   Invoke-Command -Session $session -ScriptBlock {[IO.Directory]::CreateDirectory('C:\MuLab\test-tools') | Out-Null}
   foreach($tool in @(@{source='../../node_modules/electron/dist';target='C:\MuLab\test-tools\electron';file='electron.exe'},@{source='../../node_modules/playwright-core';target='C:\MuLab\test-tools\playwright-core';file='index.mjs'})){
    $source=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot $tool.source));$present=Invoke-Command -Session $session -ArgumentList $tool.target,$tool.file -ScriptBlock {param($root,$file) Test-Path -LiteralPath (Join-Path $root $file)}
@@ -424,7 +436,7 @@ try{
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ProtectedLedger.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HostComponents.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ImageCache.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ImageCache.cs -ToSession $session -Force
-  foreach($name in @('ResourceMetrics.cs','Resources.cs','Recovery.cs','RecoveryPermissions.cs','PowerWatch.cs','PowerProtection.cs','HyperVChannel.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
+  foreach($name in @('ResourceMetrics.cs','Resources.cs','DiskGrowth.cs','Recovery.cs','RecoveryPermissions.cs','PowerWatch.cs','PowerProtection.cs','HyperVChannel.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-channel.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-channel.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-broker.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-broker.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/broker.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js -ToSession $session -Force
@@ -545,7 +557,7 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
     $request=Get-Content -LiteralPath C:\MuLab\public\power-pause-request.json -Raw|ConvertFrom-Json;if($request.nonce -eq $nonce){& ([ScriptBlock]::Create($operatorSource)) -Action broker-pause -Nonce $nonce -OwnerPid $ownerPid|Out-Null;$handled['native-pause']=$true}
    }
    if($phase -in @('adoption-review','adoption-approve','adoption-ui')){
-    foreach($action in @('inspect-plan','change-seed','restore-seed','break-acl','restore-acl','break-permissions','restore-permissions','add-dependency','remove-dependency','inspect-adopted')){
+    foreach($action in @('inspect-plan','inspect-material-known-hosts','inspect-material-manifest','inspect-material-DPAPI','change-seed','restore-seed','break-acl','restore-acl','break-permissions','restore-permissions','add-dependency','remove-dependency','inspect-adopted')){
      $name='adoption-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'
      if(-not $handled.ContainsKey($name) -and (Test-Path -LiteralPath $file)){$request=Get-Content -LiteralPath $file -Raw|ConvertFrom-Json;if($request.nonce -eq $nonce){if($request.action -ne $action){throw 'Unexpected adoption operator action'};& ([ScriptBlock]::Create($operatorSource)) -Action $action -Nonce $nonce|Out-Null;$handled[$name]=$true}}
     }

@@ -83,14 +83,14 @@ export async function createWindowsService(options:WindowsServiceOptions){
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
    const translation=translationTransfers.get(e.id),signals=[abort.signal,runOptions.signal,translation?.abort.signal].filter((signal):signal is AbortSignal=>!!signal);
-   try{const profile=await controller.profile(e);assertExchangeSession(e);if(translation&&controller.sessions.get(e.id)?.id!==translation.sessionId)throw new AppError('环境已变化，请重新翻译。',409,'CONFIGURATION_CHANGED');const signal=AbortSignal.any(signals);signal.throwIfAborted();const result=await guest(profile,command,{...runOptions,signal});signal.throwIfAborted();assertExchangeSession(e);return result;}
+   try{const profile=await controller.profile(e);assertExchangeSession(e);if(translation&&controller.sessions.get(e.id)?.id!==translation.sessionId)throw new AppError('环境已变化，请重新翻译。',409,'CONFIGURATION_CHANGED');const signal=AbortSignal.any(signals);signal.throwIfAborted();const result=await guest(profile,command,{...runOptions,signal});assertExchangeSession(e);signal.throwIfAborted();return result;}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   },management:async(e,command,runOptions={})=>{
    assertExchangeSession(e);
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
    const signals=[abort.signal,runOptions.signal,imageTransfers.get(e.id)?.signal].filter((signal):signal is AbortSignal=>!!signal);
-   try{await controller.assertAccess(e.id);const profile=await controller.profile(e),signal=AbortSignal.any(signals);signal.throwIfAborted();assertExchangeSession(e);const result=await management(profile,command,{...runOptions,signal});signal.throwIfAborted();assertExchangeSession(e);return result;}
+   try{await controller.assertAccess(e.id);const profile=await controller.profile(e),signal=AbortSignal.any(signals);signal.throwIfAborted();assertExchangeSession(e);const result=await management(profile,command,{...runOptions,signal});assertExchangeSession(e);signal.throwIfAborted();return result;}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   }},authorizeExchange,translationSettings):undefined;
   controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);translationTransfers.get(id)?.abort.abort();for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};

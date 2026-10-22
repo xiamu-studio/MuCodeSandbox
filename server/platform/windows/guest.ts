@@ -55,7 +55,11 @@ export function bootstrapScript(c: WindowsConfig) {
   const url = new URL(`${c.proxy.mode==='socks5'?'socks5h':c.proxy.mode}://127.0.0.1:${RELAY_PORT}`);
   url.username=c.proxy.username;url.password=c.proxy.password;
   return `set -euo pipefail
-sudo cloud-init status --wait >/dev/null
+if ! sudo cloud-init status --wait >/dev/null; then
+  printf '%s\n' 'Guest initialization failed; business permission remains closed.' >&2
+  sudo cloud-init status --long >&2 || true
+  exit 1
+fi
 printf 'datasource_list: [NoCloud]\\n' | sudo tee /etc/cloud/cloud.cfg.d/99-mucodesandbox-datasource.cfg >/dev/null
 ${BOOTSTRAP_IP_STACK}
 sudo env DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true -o APT::Update::Error-Mode=any -o Acquire::http::Proxy=${shellQuote(url.href)} -o Acquire::https::Proxy=${shellQuote(url.href)} -o Acquire::Retries=0 update -qq
@@ -113,6 +117,10 @@ export function configureWindowsGuard(c: WindowsConfig, session = randomUUID()) 
 # Management and approved forwarding use Hyper-V sockets. Waiting for an
 # ordinary IP network is unnecessary on this intentionally isolated VM.
 sudo systemctl mask --now systemd-networkd-wait-online.service >/dev/null
+# First SSH readiness can precede cloud-init's final writes. A resource or
+# network fence may force power-off immediately after admission, so finish
+# initialization and persist its management identity before opening business.
+sudo cloud-init status --wait >/dev/null
 test "$(id -u mu-net)" = '${NET_UID}'
 test "$(id -u mu-probe)" = '${PROBE_UID}'
 test "$(id -u dev)" = '2001'
@@ -126,6 +134,9 @@ sudo systemctl enable mucodesandbox-lease.service >/dev/null
 sudo systemctl restart mucodesandbox-lease.service
 sudo python3 -c ${shellQuote(`import json,os\nwith open('/proc/sys/kernel/random/boot_id') as f: boot=f.read().strip()\nwith open('/run/mucodesandbox-lease/state','w') as f: json.dump({'session':'${session}','boot':boot,'state':'pending','deadline':0},f)\nos.chmod('/run/mucodesandbox-lease/state',0o600)`)}
 ${startTransparentScript(tunnel)}
+# Includes cloud-init host keys/cache and the persistent closed boot rules.
+# This must finish successfully before configure returns an activation token.
+sudo sync
 `;
   return {session,script};
 }

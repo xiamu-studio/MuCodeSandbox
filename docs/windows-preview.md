@@ -76,6 +76,8 @@ Windows `0.4.66-preview.5` 可用“中文与翻译”打开浮窗，`Ctrl+Shift
 
 Windows `0.4.66-preview.6` 增加“磁盘扩容”。先停止环境，核对实际容量并输入完整环境名称；当前支持独立动态 VHDX 和默认 Linux ext4 根分区，最大 256 GiB，只增不减。维护时业务联网关闭，完成后保持停止。中断后保留已扩大容量并继续原目标；已提交容量与工作区不一致时可同步记录。详见 [原盘扩容与恢复验收](windows-disk-growth-validation.md)。
 
+Windows `0.4.66-preview.7` 修复首次初始化资料未落盘时很快触发强制停机、导致原环境无法重新建立管理连接的问题。业务开放前完成初始化并同步关键资料；真实多卷及活动业务压力后的原盘恢复已通过，详见 [启动持久化与多卷压力](windows-guest-durability-validation.md)。
+
 ## 独立 Windows 桌面测试包
 
 Windows 使用 `desktop/windows/main.cjs` 和独立打包配置。应用身份为 `local.mucodesandbox.windows.preview`，与 Mac 应用不同；根目录的 Mac Electron 入口及 `package:mac` 保持原有配置。

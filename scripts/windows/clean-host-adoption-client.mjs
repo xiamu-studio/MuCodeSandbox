@@ -20,6 +20,9 @@ export async function adoptionAcceptance(phase,client,nonce,pass){
   pass('A real protected Linux disk is seeded by dev and stopped with business networking closed');return {config,canary,platformId,stopped:true,removed:false};
  }
  const seed=JSON.parse(await readFile('C:/MuLab/approved/adoption-seed-result.json','utf8')).nested,c=windowsConfigSchema.parse(seed.config);
+ if(phase==='adoption-backup'){
+  const {backupReadAcceptance}=await import('file:///C:/MuLab/backup-read-client.mjs');return backupReadAcceptance(client,nonce,pass,runtime,c,seed);
+ }
  if(phase==='adoption-review'){
   const denied=JSON.parse(await readFile('C:/MuLab/approved/adoption-default-denied.json','utf8'));assert.equal(denied.nonce,nonce);assert.equal(denied.normalStartupRejected,true);pass('Normal startup still refuses both missing copies; recovery requires an explicit separate mode');
   for(const action of ['start','stop','delete','channel','prepare-host','host-status','resource-status','cache-status'])await assert.rejects(client.call(action,{id:c.id}),{code:'DENIED'});

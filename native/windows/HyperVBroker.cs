@@ -201,6 +201,9 @@ public static partial class MuHyperVBroker {
         if(ResourceMutation(action)||action=="channel")CheckPower();if(ResourceIssue!=null&&(ResourceMutation(action)||action=="channel"))throw new MuStorageException("RESOURCE_FENCED","Host resource protection has closed this session; reopen the application");
         if((action=="disk"||action=="begin-base"||action=="create"||action=="start"||action=="grow-disk"||action=="start-disk-growth"||action=="start-disk-review"||action=="finish-disk-growth")&&HostServicingBusy())throw new InvalidOperationException("Windows component servicing is running");
         string id=Id(request);
+        lock(VmGate(id)){
+        CheckBackupBusy(id,action);
+        if(action=="backup-begin"||action=="backup-read"||action=="backup-stream"||action=="backup-close")return BackupReadAction(action,request,cancellation);
         if(action=="seal-base"){ValidateKeys(request,"action","id");return SealBase(id,cancellation);}
         if(action=="discard-base-builder"){ValidateKeys(request,"action","id");lock(VmGate(id)){var builder=Owned(id);if(!builder.ContainsKey("baseBuilder")||!Convert.ToBoolean(builder["baseBuilder"]))throw new UnauthorizedAccessException("Only a marked base builder may be discarded by setup");return Dispatch(pipe,new Dictionary<string,object>{{"action","delete"},{"id",id}},cancellation);}}
         if(action=="absence"){
@@ -287,6 +290,7 @@ public static partial class MuHyperVBroker {
             }
         }
         throw new ArgumentException("Operation is not permitted");
+        }
     }
     private static void Serve(NamedPipeServerStream pipe) {
         var cancel=new CancellationTokenSource();var closingRegistration=Closing.Token.Register(()=>cancel.Cancel());var resourceRegistration=default(CancellationTokenRegistration);var powerRegistration=default(CancellationTokenRegistration);bool counted=false,resourceCounted=false;try {
@@ -324,7 +328,7 @@ public static partial class MuHyperVBroker {
             if(detectHost){var status=(Dictionary<string,object>)HostStatus();SetupOnly=!Convert.ToBoolean(status["ready"])||HostJobLive(HostJob());}
             StartPowerProtection();if(!SetupOnly&&!RecoveryOnly)foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
             var watcher=new Thread(()=>{WaitForSingleObject(OwnerHandle,0xffffffff);Shutdown();});watcher.IsBackground=true;watcher.Start();
-            if(!RecoveryOnly)StartResourceGuardian();
+            if(!RecoveryOnly){StartResourceGuardian();StartBackupCleanup();}
             var security=new PipeSecurity();security.SetAccessRuleProtection(true,false);security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(OwnerSid),PipeAccessRights.ReadWrite,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(SystemSid,PipeAccessRights.FullControl,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(AdminSid,PipeAccessRights.FullControl,AccessControlType.Allow));
             while(!Stopping){NamedPipeServerStream pipe=null;try{pipe=new NamedPipeServerStream("MuCodeSandbox-Broker-"+args[3],PipeDirection.InOut,16,PipeTransmissionMode.Byte,PipeOptions.Asynchronous,65536,65536,security);lock(Gate)Pipes.Add(pipe);pipe.WaitForConnection();ThreadPool.QueueUserWorkItem(_=>Serve(pipe));}catch{if(pipe!=null){pipe.Dispose();lock(Gate)Pipes.Remove(pipe);}if(!Stopping)Thread.Sleep(100);}}
             return 0;

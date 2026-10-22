@@ -88,3 +88,10 @@ test('Windows backup rejects Mac architecture, unknown authority, host grants an
  }
  for(const value of ['short','x'.repeat(257)])await assert.rejects(writeWindowsBackupArchive(sink(),input(f.disk),f.manifest,value));
 });
+test('Windows backup permits VHDX format overhead while bounding both virtual capacity and its file footprint',()=>{
+ const f=fixture(512),virtual=256*2**30,maximum=virtual+Math.floor(virtual/100);
+ assert.equal(windowsBackupManifest.parse({...f.manifest,config:{...f.manifest.config,diskGiB:256},disk:{...f.manifest.disk,bytes:maximum}}).disk.bytes,maximum);
+ assert.throws(()=>windowsBackupManifest.parse({...f.manifest,config:{...f.manifest.config,diskGiB:257}}));
+ assert.throws(()=>windowsBackupManifest.parse({...f.manifest,disk:{...f.manifest.disk,bytes:40*2**30}}));
+ assert.throws(()=>windowsBackupManifest.parse({...f.manifest,config:{...f.manifest.config,diskGiB:256},disk:{...f.manifest.disk,bytes:maximum+1}}));
+});

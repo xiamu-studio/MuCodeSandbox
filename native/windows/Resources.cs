@@ -20,7 +20,7 @@ public static partial class MuHyperVBroker {
     private static volatile bool ResourceCleanupRunning,ResourceStopsConfirmed;
     private static long LastReservedGrowth,LastAssignedMemory;
     private static int ResourceMutations;
-    private static bool ResourceMutation(string action){return new[]{"disk","begin-base","prepare","create","start","seal-base","grow-disk","start-disk-growth","start-disk-review","finish-disk-growth"}.Contains(action);}
+    private static bool ResourceMutation(string action){return new[]{"disk","begin-base","prepare","create","start","seal-base","grow-disk","start-disk-growth","start-disk-review","finish-disk-growth","backup-begin"}.Contains(action);}
     private static FileStream ImportReservation(){
         string common=Directory.GetParent(Directory.GetParent(UserRoot).FullName).FullName;
         try{return new FileStream(Path.Combine(common,"import.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None);}catch(IOException){throw new MuStorageException("STORAGE_BUSY","Another image operation is still running");}

@@ -10,10 +10,10 @@ const magic=Buffer.from('MUCWIN01'),headerBytes=32,tagBytes=16,chunkBytes=1024*1
 const passwordSchema=z.string().min(12).max(256);
 export const windowsBackupManifest=z.object({
  version:z.literal(1),architecture:z.literal('x86_64'),platform:z.literal('hyperv'),
- config:environmentSchema.refine(value=>value.kind==='vm'&&value.cpus<=16&&value.memoryGiB>=2&&value.memoryGiB<=32&&value.diskGiB>=16&&value.mounts.length===0&&value.ports.length===0&&value.network.strict&&value.network.transparent&&!!value.network.egressLock&&['http','https','socks5'].includes(value.network.mode)&&!value.network.tls?.certificate,'Unsupported Windows backup configuration'),
+ config:environmentSchema.refine(value=>value.kind==='vm'&&value.cpus<=16&&value.memoryGiB>=2&&value.memoryGiB<=32&&value.diskGiB>=16&&value.diskGiB<=256&&value.mounts.length===0&&value.ports.length===0&&value.network.strict&&value.network.transparent&&!!value.network.egressLock&&['http','https','socks5'].includes(value.network.mode)&&!value.network.tls?.certificate,'Unsupported Windows backup configuration'),
  imageSha256:z.string().regex(/^[a-f0-9]{64}$/),
- disk:z.object({bytes:z.number().int().positive().max(256*2**30).safe(),sha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict(),
-}).strict();
+ disk:z.object({bytes:z.number().int().positive().max(260*2**30).safe(),sha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict(),
+}).strict().refine(value=>{const virtual=value.config.diskGiB*2**30;return value.disk.bytes<=virtual+Math.max(64*2**20,Math.floor(virtual/100));},'Disk file exceeds its declared virtual capacity and format allowance');
 export type WindowsBackupManifest=z.infer<typeof windowsBackupManifest>;
 export interface BackupSink {write:(bytes:Uint8Array)=>Promise<void>}
 type Input=AsyncIterable<Uint8Array>;
@@ -52,15 +52,16 @@ class Reader {
 export async function writeWindowsBackupArchive(output:BackupSink,source:Input,manifest:WindowsBackupManifest,password:string,signal?:AbortSignal){
  const parsed=windowsBackupManifest.parse(manifest),metadata=Buffer.from(JSON.stringify(parsed));
  if(metadata.length>manifestBytes)throw integrity();aborted(signal);
- const header=Buffer.concat([magic,randomBytes(16),randomBytes(8)]),key=await derive(password,header.subarray(8,24));
+ const header=Buffer.concat([magic,randomBytes(16),randomBytes(8)]);let key:Buffer|undefined;
  let index=0,total=0;const hash=createHash('sha256');
  const record=async(type:number,plain:Buffer)=>{
   aborted(signal);const prefix=Buffer.alloc(5);prefix[0]=type;prefix.writeUInt32BE(plain.length,1);
-  const cipher=createCipheriv('aes-256-gcm',key,nonce(header,index));cipher.setAAD(aad(header,index,prefix));
+  const cipher=createCipheriv('aes-256-gcm',key!,nonce(header,index));cipher.setAAD(aad(header,index,prefix));
   const encrypted=Buffer.concat([cipher.update(plain),cipher.final()]);index++;
   await output.write(prefix);await output.write(encrypted);await output.write(cipher.getAuthTag());aborted(signal);
  };
  try{
+  key=await derive(password,header.subarray(8,24));
   aborted(signal);await output.write(header);await record(1,metadata);
   for await(const chunk of source){
    aborted(signal);if(!(chunk instanceof Uint8Array))throw integrity();
@@ -71,7 +72,7 @@ export async function writeWindowsBackupArchive(output:BackupSink,source:Input,m
   }
   const digest=hash.digest();if(total!==parsed.disk.bytes||digest.toString('hex')!==parsed.disk.sha256)throw integrity();
   await record(3,commit(total,digest));
- }finally{key.fill(0);metadata.fill(0);}
+ }finally{key?.fill(0);metadata.fill(0);}
 }
 
 // A successful return is the publication boundary. Until then, the caller must

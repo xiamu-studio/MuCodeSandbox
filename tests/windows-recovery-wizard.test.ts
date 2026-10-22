@@ -1,11 +1,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,writeFile,readFile,rm,unlink} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,unlink,link} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {request as httpRequest} from 'node:http';
-import {openWindowsStore} from '../server/platform/windows/credentials.ts';
+import {openWindowsStore,protectCurrentUser} from '../server/platform/windows/credentials.ts';
 import {recoveryCandidates} from '../server/platform/windows/recovery-candidates.ts';
 import {WindowsRecoveryWizard} from '../server/platform/windows/recovery-wizard.ts';
 import {createWindowsRecoveryService} from '../server/platform/windows/recovery-service.ts';
@@ -18,7 +18,7 @@ const candidate:WindowsRecoveryCandidate={id,name:'原环境合成验收',cpus:1
 const reviewed={review:{version:1,id,name:'mu-win-'+id.replaceAll('-',''),platformId,cpus:1,memoryGiB:2,diskGiB:32,imageSha256:digest,diskSha256:'c'.repeat(64),seedSha256:'d'.repeat(64),registryFingerprint:'e'.repeat(64),registeredDiskGiB:0},plan,registered:false,state:'Off',diskPreserved:true};
 const approved={registered:true,id,platformId,state:'Off',diskPreserved:true,reopenRequired:true};
 function broker(call:(action:string,body:Record<string,unknown>,options?:{signal?:AbortSignal})=>Promise<unknown>){return {call} as HyperVBrokerClient;}
-const loaded=()=>Promise.resolve({candidates:[structuredClone(candidate)],issue:null});
+const loaded=()=>Promise.resolve({candidates:[structuredClone(candidate)],issue:null,bindings:new Map([[id,'synthetic-private-binding']])});
 test('Recovery requires an unchanged original VM identity before presenting a confirmation',async()=>{
  const calls:string[]=[];const wizard=new WindowsRecoveryWizard(broker(async action=>{calls.push(action);return {...reviewed,review:{...reviewed.review,platformId:randomUUID()}};}),loaded);await wizard.refresh();wizard.review(id);await wizard.wait();assert.equal(wizard.snapshot().phase,'failed');assert.equal(wizard.snapshot().review,null);assert.deepEqual(calls,['recovery-review']);
 });
@@ -33,7 +33,14 @@ test('Recovery cancels a real pending broker request and serializes refresh with
  const refresh=wizard.refresh();assert.throws(()=>wizard.review(id),{code:'RECOVERY_BUSY'});release();await refresh;wizard.review(id);await Promise.resolve();assert.throws(()=>wizard.review(id),{code:'RECOVERY_BUSY'});await assert.rejects(wizard.refresh(),{code:'RECOVERY_BUSY'});wizard.cancel();await wizard.wait();assert.equal(cancelled,true);assert.equal(wizard.snapshot().phase,'cancelled');assert.equal(wizard.snapshot().review,null);await wizard.close();
 });
 test('Changed local management records cannot use an earlier reviewed approval',async()=>{
- let current=structuredClone(candidate),published=false;const wizard=new WindowsRecoveryWizard(broker(async action=>{if(action==='recovery-adopt')published=true;return action==='recovery-review'?reviewed:approved;}),async()=>({candidates:[current],issue:null}));await wizard.refresh();wizard.review(id);await wizard.wait();current={...current,imageSha256:'f'.repeat(64)};wizard.adopt(id,plan,candidate.name);await wizard.wait();assert.equal(wizard.snapshot().phase,'failed');assert.equal(published,false);await wizard.close();
+ let current=structuredClone(candidate),published=false;const wizard=new WindowsRecoveryWizard(broker(async action=>{if(action==='recovery-adopt')published=true;return action==='recovery-review'?reviewed:approved;}),async()=>({...await loaded(),candidates:[current]}));await wizard.refresh();wizard.review(id);await wizard.wait();current={...current,imageSha256:'f'.repeat(64)};wizard.adopt(id,plan,candidate.name);await wizard.wait();assert.equal(wizard.snapshot().phase,'failed');assert.equal(published,false);await wizard.close();
+});
+
+test('Cancelling during the final local material read cannot publish a reviewed approval',async()=>{
+ let reads=0,release!:()=>void,started!:()=>void;
+ const pending=new Promise<void>(resolve=>{release=resolve;}),reading=new Promise<void>(resolve=>{started=resolve;});
+ const wizard=new WindowsRecoveryWizard(broker(async()=>reviewed),async()=>{if(++reads===2){started();await pending;}return loaded();});
+ try{await wizard.refresh();wizard.review(id);await reading;wizard.cancel();release();await wizard.wait();assert.equal(wizard.snapshot().phase,'cancelled');assert.equal(wizard.snapshot().review,null);}finally{release?.();await wizard.close();}
 });
 async function fixture(){
  const root=await mkdtemp(path.join(tmpdir(),'mu-recovery-ui-')),dataDir=path.join(root,'app'),runtimeRoot=path.join(root,'runtime');await mkdir(runtimeRoot);await mkdir(path.join(root,'dist'));await writeFile(path.join(root,'dist/index.html'),'<!doctype html><html><head><!-- MU_BOOTSTRAP --></head><body>fixture</body></html>');
@@ -44,6 +51,47 @@ async function fixture(){
 }
 test('Recovery reads existing DPAPI and SQLite records without creating keys, exposing credentials or rewriting interrupted jobs',{skip:process.platform!=='win32'},async()=>{
  const f=await fixture();try{const before=await f.hash(),data=await recoveryCandidates(f.dataDir,f.runtimeRoot);assert.equal(data.candidates.length,1);assert.equal(data.candidates[0].ready,true);assert.ok(!JSON.stringify(data).includes('password'));assert.ok(!JSON.stringify(data).includes(f.root));assert.deepEqual(await f.hash(),before);assert.equal(f.store.jobs()[0].status,'running');await unlink(path.join(f.dataDir,'credentials.dpapi'));assert.equal((await recoveryCandidates(f.dataDir,f.runtimeRoot)).candidates.length,0);await assert.rejects(readFile(path.join(f.dataDir,'credentials.dpapi')),{code:'ENOENT'});}finally{await f.dispose();}
+});
+
+test('Recovery refuses changed original material before adopting a reviewed VM',{skip:process.platform!=='win32'},async t=>{
+ for(const material of ['management','hostKey','knownHosts','manifest','network','credentials'] as const)await t.test(material,async()=>{
+  const f=await fixture();let published=false;
+  const wizard=new WindowsRecoveryWizard(broker(async action=>{if(action==='recovery-adopt')published=true;return action==='recovery-review'?reviewed:approved;}),()=>recoveryCandidates(f.dataDir,f.runtimeRoot));
+  try{
+   await wizard.refresh();wizard.review(id);await wizard.wait();assert.equal(wizard.snapshot().phase,'reviewed');
+   const p=windowsPaths(f.runtimeRoot,id);
+   if(material==='network'){const e=f.store.get(id);e.network.password='replacement-synthetic-password';f.store.save(e);}
+   else if(material==='credentials')await writeFile(path.join(f.dataDir,'credentials.dpapi'),await protectCurrentUser(f.store.key,'protect'));
+   else if(material==='manifest')await writeFile(p.manifest,JSON.stringify({...JSON.parse(await readFile(p.manifest,'utf8')),note:'changed synthetic metadata'}));
+   else await writeFile(material==='management'?p.key:material==='hostKey'?p.hostKey:p.knownHosts,'replacement synthetic material');
+   wizard.adopt(id,plan,candidate.name);await wizard.wait();assert.equal(wizard.snapshot().phase,'failed');assert.equal(published,false);
+   assert.ok(!JSON.stringify(wizard.snapshot()).includes('replacement'));assert.equal(f.store.jobs()[0].status,'running');
+  }finally{await wizard.close();await f.dispose();}
+ });
+});
+
+test('Recovery refuses material changed during native review and permits a fresh review without exposing its binding',{skip:process.platform!=='win32'},async()=>{
+ const f=await fixture();let change=true,published=0;
+ const wizard=new WindowsRecoveryWizard(broker(async action=>{
+  if(action==='recovery-review'&&change){change=false;await writeFile(windowsPaths(f.runtimeRoot,id).key,'changed during synthetic native review');}
+  if(action==='recovery-adopt')published++;return action==='recovery-review'?reviewed:approved;
+ }),()=>recoveryCandidates(f.dataDir,f.runtimeRoot));
+ try{
+  const snapshot=await wizard.refresh();assert.equal(Object.hasOwn(snapshot,'bindings'),false);
+  const privateBinding=(await recoveryCandidates(f.dataDir,f.runtimeRoot)).bindings.get(id)!;assert.equal(privateBinding.length,64);assert.ok(!JSON.stringify(snapshot).includes(privateBinding));
+  wizard.review(id);await wizard.wait();assert.equal(wizard.snapshot().phase,'failed');assert.equal(wizard.snapshot().review,null);assert.equal(published,0);
+  await wizard.refresh();wizard.review(id);await wizard.wait();assert.equal(wizard.snapshot().phase,'reviewed');wizard.adopt(id,plan,candidate.name);await wizard.wait();assert.equal(wizard.snapshot().phase,'completed');assert.equal(published,1);
+  assert.equal(Object.hasOwn(wizard.snapshot(),'bindings'),false);assert.equal(f.store.jobs()[0].status,'running');
+ }finally{await wizard.close();await f.dispose();}
+});
+
+test('Recovery refuses hardlinked management material and leaves the original bytes intact',{skip:process.platform!=='win32'},async()=>{
+ const f=await fixture();const p=windowsPaths(f.runtimeRoot,id),alias=path.join(f.root,'synthetic-management-alias');
+ try{
+  const before=await f.hash(),key=await readFile(p.key);await link(p.key,alias);
+  const data=await recoveryCandidates(f.dataDir,f.runtimeRoot);assert.equal(data.candidates[0].ready,false);assert.equal(data.bindings.has(id),false);assert.deepEqual(await readFile(alias),key);assert.deepEqual(await f.hash(),before);
+  await unlink(alias);assert.equal((await recoveryCandidates(f.dataDir,f.runtimeRoot)).candidates[0].ready,true);
+ }finally{await f.dispose();}
 });
 test('Recovery loopback service authenticates its exact UI and offers no ordinary VM operations',{skip:process.platform!=='win32'},async()=>{
  const f=await fixture();let service:Awaited<ReturnType<typeof createWindowsRecoveryService>>|undefined,returns=0;const calls:string[]=[];

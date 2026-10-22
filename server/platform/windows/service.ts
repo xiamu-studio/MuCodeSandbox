@@ -29,6 +29,8 @@ import {WindowsSetup} from './setup.ts';
 import {WindowsHostComponents,hostReady} from './host-components.ts';
 import {WindowsStorage} from './storage.ts';
 import {WindowsGuestAudio} from './audio.ts';
+import type {Environment} from '../../../shared/types.ts';
+import type {WindowsNetworkSession} from './session.ts';
 
 export interface WindowsServiceOptions {
  rootDir:string;dataDir?:string;runtimeRoot?:string;port?:number;base?:WindowsBase;
@@ -59,24 +61,38 @@ export async function createWindowsService(options:WindowsServiceOptions){
   if(runtime instanceof HyperVRuntime&&runtime.broker)storage=new WindowsStorage(runtime.broker,()=>controller.options.base?.imageSha256??null,()=>!!host&&hostReady(host.snapshot())&&!controller.tasks.size&&!setup?.running);
   terminal=runtime.terminalLaunch?new WindowsTerminalServer(controller,{terminalLaunch:runtime.terminalLaunch.bind(runtime)},options.ptyFactory):undefined;
   const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>(),imageTransfers=new Map<string,AbortController>(),translationTransfers=new Map<string,{abort:AbortController;sessionId:string}>();
+  // GuestExchange can issue several commands for one operation. Bind its
+  // authorized Environment object to the original session, so a late command
+  // completion cannot continue private work in a newly started guest.
+  const exchangeSessions=new WeakMap<Environment,WindowsNetworkSession>();
+  const assertExchangeSession=(e:Environment)=>{
+   const session=exchangeSessions.get(e);
+   if(!session||controller.sessions.get(e.id)!==session||session.state!=='active'||controller.active.has(e.id)||controller.store.get(e.id).state!=='running')throw new AppError('环境已变化，请重新操作',409,'CONFIGURATION_CHANGED');
+  };
+  const authorizeExchange=async(id:string)=>{
+   const session=controller.sessions.get(id),e=await controller.assertAccess(id);
+   if(!session||controller.sessions.get(id)!==session||session.state!=='active'||controller.active.has(id))throw new AppError('环境防护尚未通过或已失效',409,'GUARD_FAILED');
+   const authorized={...e};exchangeSessions.set(authorized,session);return authorized;
+  };
   const guest=runtime.guest?.bind(runtime),management=runtime.management?.bind(runtime);
   if(runtime.serviceStreamFactory&&management){browser=new WindowsBrowser(controller,{management,serviceStreamFactory:runtime.serviceStreamFactory.bind(runtime)});controller.browserRunning=id=>browser!.running(id);controller.browserAvailable=true;controller.inspectAdditionalProtection=id=>browser!.assertProtection(id);}
   const guestBrowser=browser;
   if(guestBrowser&&runtime.audioLaunch){guestAudio=new WindowsGuestAudio(controller,guestBrowser,{audioLaunch:runtime.audioLaunch.bind(runtime)});guestBrowser.revokeAudio=id=>guestAudio!.revoke(id);}
   const exchange=guest&&management?new GuestExchange({guest:async(e,command,runOptions={})=>{
+   assertExchangeSession(e);
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
    const translation=translationTransfers.get(e.id),signals=[abort.signal,runOptions.signal,translation?.abort.signal].filter((signal):signal is AbortSignal=>!!signal);
-   try{const profile=await controller.profile(e);if(translation&&controller.sessions.get(e.id)?.id!==translation.sessionId)throw new AppError('环境已变化，请重新翻译。',409,'CONFIGURATION_CHANGED');const signal=AbortSignal.any(signals);signal.throwIfAborted();return await guest(profile,command,{...runOptions,signal});}
+   try{const profile=await controller.profile(e);assertExchangeSession(e);if(translation&&controller.sessions.get(e.id)?.id!==translation.sessionId)throw new AppError('环境已变化，请重新翻译。',409,'CONFIGURATION_CHANGED');const signal=AbortSignal.any(signals);signal.throwIfAborted();const result=await guest(profile,command,{...runOptions,signal});signal.throwIfAborted();assertExchangeSession(e);return result;}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   },management:async(e,command,runOptions={})=>{
-   await controller.assertAccess(e.id);
+   assertExchangeSession(e);
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
    const signals=[abort.signal,runOptions.signal,imageTransfers.get(e.id)?.signal].filter((signal):signal is AbortSignal=>!!signal);
-   try{return await management(await controller.profile(e),command,{...runOptions,signal:AbortSignal.any(signals)});}
+   try{await controller.assertAccess(e.id);const profile=await controller.profile(e),signal=AbortSignal.any(signals);signal.throwIfAborted();assertExchangeSession(e);const result=await management(profile,command,{...runOptions,signal});signal.throwIfAborted();assertExchangeSession(e);return result;}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
-  }},id=>controller.assertAccess(id),translationSettings):undefined;
+  }},authorizeExchange,translationSettings):undefined;
   controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);translationTransfers.get(id)?.abort.abort();for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
   if(!host||host.snapshot().runtimeActive)await controller.recover();
   monitor=new WindowsHostMonitor(()=>runtime.fingerprint(),()=>{void controller.hostUnavailable('宿主网络发生变化、监测中断或电脑从休眠恢复').catch(()=>{});});

@@ -11,6 +11,42 @@ import {acquireWindowsServiceLock} from '../server/platform/windows/service-lock
 import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
 import type {WindowsBackend} from '../server/platform/windows/manager.ts';
 import type {HyperVRuntime} from '../server/platform/windows/runtime.ts';
+import {WindowsNetworkSession} from '../server/platform/windows/session.ts';
+import {windowsPaths} from '../server/platform/windows/config.ts';
+
+for(const phase of ['clipboard-completion','clipboard-authorization','download-completion','download-authorization'] as const)test(`Old Windows exchange work cannot cross a restart at ${phase}`,{skip:process.platform!=='win32',timeout:30000},async()=>{
+ const root=await mkdtemp(path.join(tmpdir(),'mu-windows-exchange-session-')),runtimeRoot=path.join(root,'runtime');
+ await mkdir(path.join(root,'dist'));await writeFile(path.join(root,'dist/index.html'),'<!-- MU_BOOTSTRAP -->');
+ let state='Off',lease=false,calls=0,release!:()=>void,entered!:()=>void,signal:AbortSignal|undefined;
+ const began=new Promise<void>(resolve=>entered=resolve),gate=new Promise<void>(resolve=>release=resolve);
+ const inspection=async()=>({digest:'a'.repeat(64),leaseActive:lease,remainingMs:lease?40000:0});
+ const driver={inspect:inspection,probe:async()=>[{receiver:'local-a',ip:'203.0.113.10'},{receiver:'local-b',ip:'203.0.113.10'}],activate:async()=>{lease=true;},renew:async()=>{},revoke:async()=>{lease=false;},disconnect:async()=>{},stop:async()=>{state='Off';lease=false;}};
+ const complete=async(options:Parameters<HyperVRuntime['guest']>[2])=>{calls++;if(calls===1&&phase.endsWith('completion')){signal=options?.signal;entered();await gate;}};
+ const runtime:WindowsBackend&Pick<HyperVRuntime,'fingerprint'|'guest'|'management'>={info:async()=>({available:true,issues:[]}),fingerprint:async()=>'fixture',state:async()=>({state}),stop:driver.stop,create:async c=>{const file=windowsPaths(runtimeRoot,c.id).manifest;await mkdir(path.dirname(file),{recursive:true});await writeFile(file,'{}');},start:async()=>{state='Running';},session:async()=>new WindowsNetworkSession(driver,'203.0.113.10'),connect:async()=>{},inspectGuard:inspection,guest:async(_c,_command,options)=>{assert.ok(phase.startsWith('download'));await complete(options);return JSON.stringify({data:Buffer.from('Synthetic download').toString('base64')});},management:async(_c,_command,options)=>{assert.ok(phase.startsWith('clipboard'));await complete(options);return '';}};
+ const service=await createWindowsService({rootDir:root,dataDir:path.join(root,'app'),runtimeRoot,runtime,base:{image:path.join(root,'base.vhdx'),imageSha256:'b'.repeat(64)}});
+ try{
+  const e=await service.manager.create({name:'Synthetic clipboard session',cpus:1,memoryGiB:2,diskGiB:16,network:{mode:'http',host:'127.0.0.1',port:12345,strict:true,transparent:true,egressLock:{expectedIp:'203.0.113.10'}}});
+  const start=await service.manager.action(e.id,'start');await service.manager.wait(start.id);assert.equal(service.manager.store.jobs().find(job=>job.id===start.id)!.status,'succeeded');
+  const oldSession=service.manager.sessions.get(e.id)!;
+  const exchange=service.exchange!,authorize=exchange.authorize;
+  if(phase.endsWith('authorization')){
+   let first=true;exchange.authorize=async id=>{const authorized=await authorize(id);if(first){first=false;entered();await gate;}return authorized;};
+  }
+  const operate=()=>phase.startsWith('clipboard')?exchange.writeClipboard(e.id,'合成旧会话文字'):exchange.download(e.id,'downloads','synthetic.txt');
+  const pending=assert.rejects(operate());
+  await began;
+  const stop=await service.manager.action(e.id,'stop');await service.manager.wait(stop.id);assert.equal(signal?.aborted,phase.endsWith('completion')?true:undefined);
+  const restart=await service.manager.action(e.id,'start');await service.manager.wait(restart.id);assert.equal(service.manager.store.jobs().find(job=>job.id===restart.id)!.status,'succeeded');assert.notEqual(service.manager.sessions.get(e.id),oldSession);
+  // Model a late successful SSH completion after cancellation, rather than
+  // assuming cancellation always wins the race with process exit.
+  release();await pending;
+  const oldCalls=phase.endsWith('completion')?1:0;
+  assert.equal(calls,oldCalls,'Old private work must never execute in the new guest session');
+  assert.equal(service.manager.sessions.get(e.id)?.state,'active');
+  assert.equal(service.exchange!.busy.has(e.id),false);
+  await operate();assert.equal(calls,oldCalls+(phase.startsWith('clipboard')?3:1));
+ }finally{release();await service.close();assert.equal(path.dirname(path.resolve(root)),path.resolve(tmpdir()));await rm(root,{recursive:true,force:true});}
+});
 
 test('Windows API requires its launch cookie, bearer token, valid Host and same Origin',{skip:process.platform!=='win32'},async()=>{
  const root=await mkdtemp(path.join(tmpdir(),'mu-windows-service-'));

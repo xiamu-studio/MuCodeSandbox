@@ -20,10 +20,11 @@ import {WINDOWS_CHROME_EXECUTABLE,WINDOWS_CHROME} from './browser-assets.ts';
 import {ENSURE_FILE_MANAGER} from '../../guest-file-manager.ts';
 
 export type WindowsBrowserRuntime=Pick<HyperVRuntime,'management'|'serviceStreamFactory'>;
-interface Entry{environment:Environment;config:WindowsConfig;sessionId:string;password:string;ready:boolean;closed:boolean;streams:Set<Duplex>;tools?:DevTools;vnc?:()=>Duplex;pages:Map<string,string>;configuration:Set<Promise<void>>;failure?:Error;display?:GuestDisplay}
+interface Entry{environment:Environment;config:WindowsConfig;sessionId:string;password:string;ready:boolean;closed:boolean;streams:Set<Duplex>;tools?:DevTools;vnc?:()=>Duplex;pages:Map<string,string>;configuration:Set<Promise<void>>;failure?:Error;display?:GuestDisplay;protection?:Promise<void>}
 interface Ticket{id:string;sessionId:string;expires:number}
 
 export class WindowsBrowser{
+ revokeAudio:((id:string)=>void)|undefined;
  readonly entries=new Map<string,Entry>();readonly tickets=new Map<string,Ticket>();readonly peers=new Map<string,Set<WebSocket>>();
  readonly wss=new WebSocketServer({noServer:true,maxPayload:1024*1024});private pending=new Map<string,number>();private closing=false;
  readonly manager:WindowsManager;readonly runtime:WindowsBrowserRuntime;
@@ -68,7 +69,13 @@ export class WindowsBrowser{
  }
  private page(entry:Entry){const value=[...entry.pages.entries()].find(([,id])=>entry.tools?.activeSessions.has(id));if(!value)throw new AppError('浏览器页面尚未就绪',409,'BROWSER_PAGE_MISSING');return {targetId:value[0],sessionId:value[1]};}
  private async sandbox(entry:Entry){this.assertCurrent(entry);const result=await this.runtime.management(entry.config,['sudo','python3','-',WINDOWS_CHROME_EXECUTABLE],{input:INSPECT_GUEST_BROWSER_SANDBOX,timeoutMs:10000,maxBytes:1024*1024});return assertGuestBrowserSandbox(JSON.parse(result));}
- async assertProtection(id:string){const entry=this.entries.get(id);if(entry?.ready){await this.sandbox(entry);this.assertCurrent(entry);}}
+ async assertProtection(id:string){
+  const entry=this.entries.get(id);if(!entry?.ready)return;if(entry.protection)return entry.protection;
+  const inspection=this.sandbox(entry).then(()=>{
+   if(this.entries.get(id)!==entry||!entry.ready||entry.closed)return;this.assertCurrent(entry);
+  },error=>{if(this.entries.get(id)!==entry||!entry.ready||entry.closed)return;throw error;}).finally(()=>{if(entry.protection===inspection)entry.protection=undefined;});
+  entry.protection=inspection;return inspection;
+ }
  async inspect(id:string):Promise<BrowserInspection>{
   const entry=this.entries.get(id);if(!entry?.ready)throw new AppError('浏览器未运行',409);this.assertCurrent(entry);
   const result=await entry.tools!.send('Runtime.evaluate',{expression:'JSON.stringify({timezone:Intl.DateTimeFormat().resolvedOptions().timeZone,locale:Intl.DateTimeFormat().resolvedOptions().locale,language:navigator.language,languages:[...navigator.languages],platform:navigator.platform,userAgent:navigator.userAgent,hardwareConcurrency:navigator.hardwareConcurrency,deviceMemoryGiB:navigator.deviceMemory??null,screenWidth:screen.width,screenHeight:screen.height})',returnByValue:true},this.page(entry).sessionId);
@@ -109,6 +116,7 @@ export class WindowsBrowser{
   }catch{socket.destroy();}finally{const count=(this.pending.get(ticket.id)??1)-1;if(count)this.pending.set(ticket.id,count);else this.pending.delete(ticket.id);}
  }
  revoke(id:string){
+  this.revokeAudio?.(id);
   for(const [key,ticket] of this.tickets)if(ticket.id===id)this.tickets.delete(key);for(const peer of this.peers.get(id)??[])peer.terminate();this.peers.delete(id);
   const entry=this.entries.get(id);if(!entry)return;entry.closed=true;entry.ready=false;this.entries.delete(id);entry.tools?.socket.terminate();for(const stream of entry.streams)stream.destroy();entry.streams.clear();
  }

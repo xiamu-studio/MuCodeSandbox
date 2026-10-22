@@ -212,6 +212,14 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     for(const key of ['SystemDrive','TEMP','TMP','USERPROFILE','LOCALAPPDATA','PROGRAMDATA'])if(process.env[key])env[key]=process.env[key]!;
     return {file:path.join(systemRoot,'System32/OpenSSH/ssh.exe'),args,env,cwd:this.root};
   }
+  async audioLaunch(c:WindowsConfig){
+    const {GUEST_AUDIO_CAPTURE_PYTHON,GUEST_AUDIO_ENV}=await import('../../guest-audio.ts');
+    const args=await this.ssh(c);
+    args.unshift('-a','-x','-o','EscapeChar=none','-o','ClearAllForwardings=yes','-o','PermitLocalCommand=no','-o','IdentityAgent=none');
+    args.push(['sudo','-n','-H','-u','dev','--','env','-i','HOME=/home/dev','PATH=/usr/bin:/bin',...Object.entries(GUEST_AUDIO_ENV).map(([key,value])=>key+'='+value),'python3','-c',GUEST_AUDIO_CAPTURE_PYTHON].map(shellQuote).join(' '));
+    const {cleanWindowsEnvironment}=await import('./broker.ts');
+    return {file:path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe'),args,env:cleanWindowsEnvironment(),cwd:this.root};
+  }
   async create(input:WindowsConfig,options:RunOptions={},purpose:'environment'|'base-builder'='environment') {
     const c=windowsConfigSchema.parse(input),p=windowsPaths(this.root,c.id),n=vmIdentity(c.id);
     if(purpose==='base-builder'){if(!this.broker||c.imageSha256!==CANONICAL_NOCLOUD_PATCH.sourceSha256||c.cpus!==2||c.memoryGiB!==4||c.diskGiB!==32)throw Error('Only the fixed official source can create a base builder');this.baseBuilders.add(c.id);}

@@ -25,10 +25,11 @@ import {windowsBaseSchema} from './config.ts';
 import {WindowsSetup} from './setup.ts';
 import {WindowsHostComponents,hostReady} from './host-components.ts';
 import {WindowsStorage} from './storage.ts';
+import {WindowsGuestAudio} from './audio.ts';
 
 export interface WindowsServiceOptions {
  rootDir:string;dataDir?:string;runtimeRoot?:string;port?:number;base?:WindowsBase;
- runtime?:WindowsBackend&Pick<HyperVRuntime,'fingerprint'>&Partial<Pick<HyperVRuntime,'terminalLaunch'|'guest'|'management'|'serviceStreamFactory'>>;
+ runtime?:WindowsBackend&Pick<HyperVRuntime,'fingerprint'>&Partial<Pick<HyperVRuntime,'terminalLaunch'|'guest'|'management'|'serviceStreamFactory'|'audioLaunch'>>;
  probe?:WindowsManagerOptions['probe'];
  ptyFactory?:PtyFactory;
 }
@@ -39,7 +40,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
  const runtimeRoot=windowsRuntimeDirectory(options.runtimeRoot,dataDir);
  await secureWindowsDirectory(dataDir);
  const unlock=await acquireWindowsServiceLock(dataDir);
- let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined,setup:WindowsSetup|undefined,host:WindowsHostComponents|undefined,storage:WindowsStorage|undefined;
+ let manager:WindowsManager|undefined,monitor:WindowsHostMonitor|undefined,terminal:WindowsTerminalServer|undefined,browser:WindowsBrowser|undefined,setup:WindowsSetup|undefined,host:WindowsHostComponents|undefined,storage:WindowsStorage|undefined,guestAudio:WindowsGuestAudio|undefined;
  try{
   await secureWindowsDirectory(runtimeRoot);
   const runtime=options.runtime??new HyperVRuntime(runtimeRoot);
@@ -57,6 +58,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   const guest=runtime.guest?.bind(runtime),management=runtime.management?.bind(runtime);
   if(runtime.serviceStreamFactory&&management){browser=new WindowsBrowser(controller,{management,serviceStreamFactory:runtime.serviceStreamFactory.bind(runtime)});controller.browserRunning=id=>browser!.running(id);controller.browserAvailable=true;controller.inspectAdditionalProtection=id=>browser!.assertProtection(id);}
   const guestBrowser=browser;
+  if(guestBrowser&&runtime.audioLaunch){guestAudio=new WindowsGuestAudio(controller,guestBrowser,{audioLaunch:runtime.audioLaunch.bind(runtime)});guestBrowser.revokeAudio=id=>guestAudio!.revoke(id);}
   const exchange=guest&&management?new GuestExchange({guest:async(e,command,runOptions={})=>{
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
@@ -121,6 +123,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   app.post('/api/environments/:id/browser/navigate',async(req,res)=>{const input=z.object({url:z.url().max(2048)}).strict().parse(req.body);const envId=id(req);res.status(202).json(await controller.submit(envId,'browser-navigate',()=>browserHost().navigate(envId,input.url)));});
   app.get('/api/environments/:id/browser/inspect',async(req,res)=>{const envId=id(req);await controller.assertAccess(envId);res.json(await browserHost().inspect(envId));});
   app.post('/api/environments/:id/guest-browser-ticket',async(req,res)=>{const envId=id(req);await controller.assertAccess(envId);res.json(browserHost().issue(envId));});
+  app.post('/api/environments/:id/guest-audio-ticket',async(req,res)=>{z.object({}).strict().parse(req.body??{});if(!guestAudio)throw new AppError('此入口的音频组件尚未就绪',409,'FEATURE_UNAVAILABLE');res.json(await guestAudio.issue(id(req)));});
   app.post('/api/environments/:id/guest-browser/display',async(req,res)=>{const envId=id(req),input=displayRequestSchema.parse(req.body);await controller.assertAccess(envId);res.json(await browserHost().resize(envId,input));});
   app.post('/api/environments/:id/terminal-ticket',async(req,res)=>{
    const input=z.object({command:z.literal('shell').default('shell'),cols:z.number().int().min(20).max(300).default(100),rows:z.number().int().min(5).max(100).default(28)}).strict().parse(req.body??{});
@@ -167,7 +170,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   });
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,imageClipboard:!!exchange&&!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));
@@ -184,6 +187,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   server.on('upgrade',(req,socket,head)=>{
    if(closing){socket.destroy();return;}const authorize=(request:import('node:http').IncomingMessage)=>!!request.headers.host&&origins().some(origin=>new URL(origin).host===request.headers.host)&&!!request.headers.origin&&allowedOrigin(request.headers.origin)&&ui.isAuthorized(request as express.Request);
    if(new URL(req.url??'/','http://127.0.0.1').pathname==='/guest-browser'&&guestBrowser){void guestBrowser.upgrade(req,socket,head,authorize).catch(()=>socket.destroy());return;}
+   if(new URL(req.url??'/','http://127.0.0.1').pathname==='/guest-audio'&&guestAudio){void guestAudio.host.upgrade(req,socket,head,request=>{const query=new URL(request.url!,'http://127.0.0.1').searchParams;return authorize(request)&&query.size===1&&query.getAll('ticket').length===1&&/^[a-f0-9]{48}$/.test(query.get('ticket')??'');}).catch(()=>socket.destroy());return;}
    if(!terminals){socket.destroy();return;}void terminals.upgrade(req,socket,head,authorize).catch(()=>socket.destroy());
   });
   await new Promise<void>((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',resolve);});
@@ -191,8 +195,8 @@ export async function createWindowsService(options:WindowsServiceOptions){
   const url=`http://127.0.0.1:${port}`;
   const close=()=>closing??=(async()=>{
    watcher.stop();terminals?.close();guestBrowser?.dispose();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
-   try{await setup?.close();await controller.close();}finally{await closed;await unlock();}
+   try{await guestAudio?.dispose();await setup?.close();await controller.close();}finally{await closed;await unlock();}
   })();
-  return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,exchange,setup,host,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};
- }catch(error){monitor?.stop();terminal?.close();browser?.dispose();try{await setup?.close();await manager?.close();}finally{await unlock();}throw error;}
+  return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,guestAudio,exchange,setup,host,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};
+ }catch(error){monitor?.stop();terminal?.close();browser?.dispose();try{await guestAudio?.dispose();await setup?.close();await manager?.close();}finally{await unlock();}throw error;}
 }

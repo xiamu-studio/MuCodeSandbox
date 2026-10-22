@@ -61,7 +61,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   if(runtime instanceof HyperVRuntime&&runtime.broker){host=new WindowsHostComponents(runtime.broker,()=>!controller.tasks.size&&controller.store.list().every(e=>!['running','starting','creating','stopping'].includes(e.state))&&!setup?.running);await host.refresh();setup=new WindowsSetup(runtime,runtimeRoot,{base,canPrepare:()=>!!host&&hostReady(host.snapshot())&&!controller.options.base&&!controller.tasks.size&&controller.store.list().every(e=>e.state==='not_created'),publish:value=>{controller.options.base=value;controller.profiles.clear();}});await setup.initialize();}
   if(runtime instanceof HyperVRuntime&&runtime.broker)storage=new WindowsStorage(runtime.broker,()=>controller.options.base?.imageSha256??null,()=>!!host&&hostReady(host.snapshot())&&!controller.tasks.size&&!setup?.running);
   terminal=runtime.terminalLaunch?new WindowsTerminalServer(controller,{terminalLaunch:runtime.terminalLaunch.bind(runtime)},options.ptyFactory):undefined;
-  const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>(),imageTransfers=new Map<string,AbortController>(),translationTransfers=new Map<string,{abort:AbortController;sessionId:string}>();
+  const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>(),imageTransfers=new Map<string,AbortController>(),translationTransfers=new Map<string,{abort:AbortController;sessionId:string}>(),fileOpens=new Map<string,{abort:AbortController;sessionId:string}>();
   // GuestExchange can issue several commands for one operation. Bind its
   // authorized Environment object to the original session, so a late command
   // completion cannot continue private work in a newly started guest.
@@ -83,19 +83,19 @@ export async function createWindowsService(options:WindowsServiceOptions){
    assertExchangeSession(e);
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
-   const translation=translationTransfers.get(e.id),signals=[abort.signal,runOptions.signal,translation?.abort.signal].filter((signal):signal is AbortSignal=>!!signal);
+   const translation=translationTransfers.get(e.id),signals=[abort.signal,runOptions.signal,translation?.abort.signal,fileOpens.get(e.id)?.abort.signal].filter((signal):signal is AbortSignal=>!!signal);
    try{const profile=await controller.profile(e);assertExchangeSession(e);if(translation&&controller.sessions.get(e.id)?.id!==translation.sessionId)throw new AppError('环境已变化，请重新翻译。',409,'CONFIGURATION_CHANGED');const signal=AbortSignal.any(signals);signal.throwIfAborted();const result=await guest(profile,command,{...runOptions,signal});assertExchangeSession(e);signal.throwIfAborted();return result;}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   },management:async(e,command,runOptions={})=>{
    assertExchangeSession(e);
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
-   const signals=[abort.signal,runOptions.signal,imageTransfers.get(e.id)?.signal].filter((signal):signal is AbortSignal=>!!signal);
+   const signals=[abort.signal,runOptions.signal,imageTransfers.get(e.id)?.signal,fileOpens.get(e.id)?.abort.signal].filter((signal):signal is AbortSignal=>!!signal);
    try{await controller.assertAccess(e.id);const profile=await controller.profile(e),signal=AbortSignal.any(signals);signal.throwIfAborted();assertExchangeSession(e);const result=await management(profile,command,{...runOptions,signal});assertExchangeSession(e);signal.throwIfAborted();return result;}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   }},authorizeExchange,translationSettings):undefined;
   const directories=exchange?new WindowsFileDirectories(exchange):undefined;
-  controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);translationTransfers.get(id)?.abort.abort();for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
+  controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);translationTransfers.get(id)?.abort.abort();fileOpens.get(id)?.abort.abort();for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
   if(!host||host.snapshot().runtimeActive)await controller.recover();
   monitor=new WindowsHostMonitor(()=>runtime.fingerprint(),()=>{void controller.hostUnavailable('宿主网络发生变化、监测中断或电脑从休眠恢复').catch(()=>{});});
   await monitor.start();
@@ -177,6 +177,14 @@ export async function createWindowsService(options:WindowsServiceOptions){
    const abort=new AbortController(),cancel=()=>{if(!res.writableFinished)abort.abort();};res.once('close',cancel);if(res.destroyed)abort.abort();
    try{res.status(201).json(await directories.create(envId,req.body,abort.signal));}finally{res.removeListener('close',cancel);}
   });
+  app.post('/api/environments/:id/transfer-folder/open',async(req,res)=>{
+   const envId=id(req),input=z.object({zone:transferZone,path:transferPath.default('')}).strict().parse(req.body),host=files();
+   await controller.assertAccess(envId);if(!guestBrowser?.info(envId).ready)throw new AppError('请先打开浏览器画面，再打开沙箱文件夹',409,'FILE_DISPLAY_REQUIRED');
+   if(fileOpens.has(envId)||host.busy.has(envId)||readers.has(envId))throw new AppError('当前环境正在传输，请稍后重试',409,'TRANSFER_BUSY');
+   const context={abort:new AbortController(),sessionId:controller.sessions.get(envId)!.id};fileOpens.set(envId,context);const cancel=()=>{if(!res.writableFinished)context.abort.abort();};res.once('close',cancel);if(res.destroyed)context.abort.abort();
+   try{context.abort.signal.throwIfAborted();const result=await host.openFolder(envId,input);context.abort.signal.throwIfAborted();if(controller.sessions.get(envId)?.id!==context.sessionId)throw new AppError('环境已变化，请重新打开文件夹',409,'CONFIGURATION_CHANGED');res.json(result);}
+   finally{res.removeListener('close',cancel);if(fileOpens.get(envId)===context)fileOpens.delete(envId);}
+  });
   app.post('/api/environments/:id/transfer-files',async(req,res,next)=>{
    const envId=id(req);transferName.parse(req.query.name);files();
    if(Number(req.headers['content-length']??0)>TRANSFER_MAX_BYTES)throw new AppError('单个文件最多150 MiB',413,'CONTENT_TOO_LARGE');
@@ -213,7 +221,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   });
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,fileDirectories:!!directories,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,translation:!!exchange,diskGrowth:!!runtime.diskGrowthAvailable,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,fileDirectories:!!directories,fileManager:!!exchange&&!!guestBrowser,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,translation:!!exchange,diskGrowth:!!runtime.diskGrowthAvailable,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));
@@ -237,7 +245,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   const address=server.address();if(typeof address==='object'&&address)port=address.port;
   const url=`http://127.0.0.1:${port}`;
   const close=()=>closing??=(async()=>{
-   watcher.stop();terminals?.close();guestBrowser?.dispose();cancelTranslations();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
+   watcher.stop();terminals?.close();guestBrowser?.dispose();cancelTranslations();for(const context of fileOpens.values())context.abort.abort();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
    try{await guestAudio?.dispose();await setup?.close();await controller.close();}finally{await closed;await unlock();}
   })();
   return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,guestAudio,exchange,setup,host,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};

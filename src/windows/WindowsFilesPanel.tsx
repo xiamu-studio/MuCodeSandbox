@@ -7,7 +7,7 @@ import {TRANSFER_MAX_BYTES,TRANSFER_FOLDERS,type TransferFile,type TransferFileP
 import {windowsDirectoryNameIssue,type WindowsTransferDirectory} from '../../shared/windows-files.ts';
 
 interface FilesContext {id:string;zone:TransferZone;folder:string;abort:AbortController;scope:symbol}
-export default function WindowsFilesPanel({id,canCreateDirectories=false}:{id:string;canCreateDirectories?:boolean}){
+export default function WindowsFilesPanel({id,canCreateDirectories=false,canOpenFolder=false,viewerReady=false,onShowFolder}:{id:string;canCreateDirectories?:boolean;canOpenFolder?:boolean;viewerReady?:boolean;onShowFolder?:()=>void}){
  const [zone,setZone]=useState<TransferZone>('downloads'),[folder,setFolder]=useState(''),[page,setPage]=useState<TransferFilePage|null>(null),[error,setError]=useState(''),[message,setMessage]=useState(''),[busy,setBusy]=useState(false),[progress,setProgress]=useState<number|null>(null);
  const [creating,setCreating]=useState(false),[name,setName]=useState(''),[composing,setComposing]=useState(false),composition=useRef(false),current=useRef<FilesContext|null>(null),input=useRef<HTMLInputElement>(null);
  const active=(context:FilesContext)=>current.current===context;
@@ -42,12 +42,18 @@ export default function WindowsFilesPanel({id,canCreateDirectories=false}:{id:st
   try{const saved=await request<WindowsTransferDirectory>(`/environments/${value.id}/transfer-directories`,{method:'POST',body:JSON.stringify({zone:value.zone,path:value.folder,name}),signal:value.abort.signal});if(active(value)){setMessage(`已创建 ${saved.path}`);setCreating(false);setName('');await list(value);}}
   catch(e){if(active(value))setError((e as Error).message);}finally{if(active(value))setBusy(false);}
  }
+ async function openFolder(){
+  const value=context();if(!value||!canOpenFolder||!viewerReady||busy)return;setBusy(true);setError('');setMessage('');
+  try{await request(`/environments/${value.id}/transfer-folder/open`,{method:'POST',body:JSON.stringify({zone:value.zone,path:value.folder}),signal:value.abort.signal});if(active(value)){setMessage('已在沙箱画面中打开文件夹');onShowFolder?.();}}
+  catch(e){if(active(value))setError((e as Error).message);}finally{if(active(value))setBusy(false);}
+ }
  const nameIssue=windowsDirectoryNameIssue(name);
  return <section>
   <SectionHeading title="文件传输" subtitle="上传到客体下载目录；每个文件最多150 MiB。" action={<div className="button-row"><Button disabled={busy||creating} onClick={()=>input.current?.click()} icon={<ArrowUpToLine size={15}/>}>上传文件</Button>{canCreateDirectories&&<Button disabled={busy||creating} onClick={()=>{setCreating(true);setError('');}} icon={<FolderPlus size={15}/>}>新建文件夹</Button>}<Button disabled={busy} aria-label="刷新文件" onClick={()=>{const value=context();if(value)void reload(value);}} icon={<RefreshCw size={15}/>}/></div>}/>
   <input hidden type="file" ref={input} onChange={event=>{const file=event.target.files?.[0];event.target.value='';if(file)void upload(file);}}/>
   <div className="button-row">{(['downloads','incoming','outgoing'] as const).map(value=><Button key={value} disabled={busy} className={zone===value?'primary':''} onClick={()=>{setZone(value);setFolder('');}}>{({downloads:'下载',incoming:'传入',outgoing:'导出'})[value]}</Button>)}<Button disabled={busy||!folder} onClick={()=>setFolder(folder.split('/').slice(0,-1).join('/'))}>上一级</Button></div>
   <p className="mono path-text">{TRANSFER_FOLDERS[zone]}{folder?'/'+folder:''}</p>
+  {canOpenFolder&&<div className="button-row"><Button disabled={busy||creating||!viewerReady} title={viewerReady?'在软件的沙箱画面中浏览、移动和重命名文件':'请先打开浏览器画面'} icon={<Folder size={15}/>} onClick={()=>void openFolder()}>在沙箱中打开文件夹</Button>{!viewerReady&&<small>请先打开浏览器画面</small>}</div>}
   {error&&<Notice kind="error">{error}</Notice>}{message&&<Notice kind="success">{message}</Notice>}
   {creating&&canCreateDirectories&&<form onSubmit={event=>{event.preventDefault();void createDirectory();}} onKeyDown={event=>{if(event.key==='Enter'&&(composition.current||event.nativeEvent.isComposing||event.keyCode===229)){event.preventDefault();event.stopPropagation();}}}>
    <Field label="文件夹名称" hint={name?nameIssue??undefined:undefined}><input autoFocus value={name} disabled={busy} onChange={event=>setName(event.target.value)} onCompositionStart={()=>{composition.current=true;setComposing(true);}} onCompositionEnd={()=>{composition.current=false;setComposing(false);}}/></Field>

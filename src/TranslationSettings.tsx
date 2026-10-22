@@ -3,7 +3,7 @@ import { Button, Notice } from './components.tsx';
 import { request } from './api.ts';
 import type { TranslationSettingsStatus } from '../shared/translation.ts';
 
-export default function TranslationSettings({onSaved}:{onSaved?:()=>void}) {
+export default function TranslationSettings({onSaved,hostName='Mac'}:{onSaved?:()=>void;hostName?:'Mac'|'Windows'}) {
   const [open,setOpen] = useState(false);
   const [status, setStatus] = useState<TranslationSettingsStatus | null>(null);
   const [key, setKey] = useState(''), [busy, setBusy] = useState(false), [error, setError] = useState(''), [message, setMessage] = useState('');
@@ -31,7 +31,7 @@ export default function TranslationSettings({onSaved}:{onSaved?:()=>void}) {
     <div className="guest-translation-settings-body">
       <label>DeepSeek API Key<input aria-label="DeepSeek API Key" type="password" autoComplete="off" spellCheck={false} maxLength={256} value={key} disabled={busy} placeholder={status?.configured ? '已保存，填写新 Key 可替换' : '仅在本机填写，不要发聊天'} onChange={event => setKey(event.target.value)} /></label>
       <div className="guest-input-actions"><Button disabled={busy || !key.trim()} onClick={() => void save()}>保存 Key</Button><Button disabled={busy || !status?.configured} onClick={() => void save(true)}>移除 Key</Button></div>
-      <p>使用你的 API 额度，Flash 非思考模式。Key 加密保存在此 Mac，供本应用的翻译工具使用，不随环境备份导出；不会回显或自动测试。请求经过当前沙箱网络。</p>
+      <p>使用你的 API 额度，Flash 非思考模式。Key 加密保存在此 {hostName}，供本应用的翻译工具使用，不随环境备份导出；不会回显或自动测试。请求经过当前沙箱网络。</p>
       {error && <Notice kind="error">{error}</Notice>}{message && <p role="status">{message}</p>}
     </div>
   </details>;

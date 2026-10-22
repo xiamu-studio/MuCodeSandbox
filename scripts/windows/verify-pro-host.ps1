@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','audio-stage','audio-run','audio-refresh','audio-inspect','ime-console','ime-stage','ime-run','ime-inspect','ime-stop','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','audio-stage','audio-run','audio-refresh','audio-inspect','translation-stage','translation-run','translation-refresh','translation-inspect','translation-bind','ime-console','ime-stage','ime-run','ime-inspect','ime-stop','collect-state','collect-stop')][string]$Phase)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $directoryPath = [IO.Path]::GetFullPath($Directory)
@@ -105,6 +105,14 @@ try {
         Start-Process -FilePath (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'vmconnect.exe') -ArgumentList @('localhost',$machine.name) -WindowStyle Normal | Out-Null
         Save-ProProbe 'ime-console-requested' @{ complete = $true; scope = 'synthetic-Pro-console-launch-request'; windowsAuthenticationAutomated = $false }; exit 0
     }
+    if ($Phase -in @('translation-stage','translation-run','translation-refresh','translation-inspect','translation-bind')) {
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-image-operator.ps1'))))
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-translation-operator.ps1'))))
+        Save-ProProbe 'running-translation-check' $initial
+        $result = Invoke-ProTranslationPhase $session $Phase $guard $config.nonce $PSScriptRoot
+        Save-ProProbe 'translation-result' $result
+        if(-not $result.complete){exit 1};exit 0
+    }
     if ($Phase -in @('ime-stage','ime-run','ime-inspect','ime-stop')) {
         . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-ime-operator.ps1'))))
         $result = Invoke-ProImePhase $session $Phase $guard $config.nonce
@@ -184,7 +192,7 @@ try {
         if ($count) { throw 'Unexpected nested VM after restart' }
         Save-ProProbe 'restart-verified' @{ complete = $true; previousBootId = $initial.bootId; newBootId = $ready.bootId; vmmsReady = $true; ordinaryDesktopReady = $true; nestedGuests = [int]$count; hostRestarted = $false }; exit 0
     }
-    if ($Phase -eq 'collect-stop') {
+    if ($Phase -in @('collect-state','collect-stop')) {
         $collected = Invoke-Command -Session $session -ScriptBlock {
             $busy = @(Get-CimInstance Win32_Process | Where-Object { ($_.ExecutablePath -and $_.ExecutablePath.StartsWith('C:\MuLab\public\package-',[StringComparison]::OrdinalIgnoreCase) -and $_.Name -in @('MuCodeSandbox Windows Preview.exe','node.exe')) -or $_.ExecutablePath -eq 'C:\MuLab\installers\current-preview.exe' -or ($_.CommandLine -like '*--host-once*' -and $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*') })
             if ($busy.Count) { throw 'Installed application or servicing is active; close it before stopping the Pro VM' }
@@ -212,6 +220,9 @@ try {
             $moduleHashes = @{}
             foreach ($name in @('broker','runtime','manager','session','service','config')) { $moduleHashes[$name] = (Get-FileHash -LiteralPath ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\' + $name + '.js') -Algorithm SHA256).Hash.ToLowerInvariant() }
             return @{ nestedGuests = $count; privateSwitches = $switches; registrationCopiesEqual = $true; registeredGuests = 0; runtimeDirectories = 0; brokerSourceDigest = $meta.sourceDigest; backendModuleHashes = $moduleHashes; vmmsRunning = $true }
+        }
+        if($Phase -eq 'collect-state') {
+            Save-ProProbe 'collected-with-test-desktop-preserved' @{independent=$collected;syntheticAutologonDisabled=$true;proVmRunning=((Assert-ProFixture).State -eq 'Running');networkDisconnected=$true;hostRestarted=$false};exit 0
         }
         Remove-PSSession $session; $session = $null
         $vm = Assert-ProFixture; Stop-VM -VM $vm -TurnOff -Force

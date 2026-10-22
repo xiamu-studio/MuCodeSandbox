@@ -7,7 +7,7 @@ import {useFloatingTool} from './useFloatingTool.ts';
 import {CLIPBOARD_MAX_BYTES} from '../shared/guest-exchange.ts';
 import {TRANSLATION_INPUT_LIMIT,TRANSLATION_OUTPUT_LIMIT,translationTarget,type TranslationDirection,type TextTranslation} from '../shared/translation.ts';
 
-export default function GuestTextInput({id,connected,onPaste,onKey,onClose,onReadText,terminal=false,floating=false,visible=true,anchorRef}:{id:string;connected:boolean;onClose?:()=>void;onPaste:(text:string)=>Promise<void>;onKey:(key:'backspace'|'enter')=>void;onReadText?:()=>Promise<string>;terminal?:boolean;floating?:boolean;visible?:boolean;anchorRef?:RefObject<HTMLButtonElement|null>}){
+export default function GuestTextInput({id,connected,onPaste,onKey,onClose,onReadText,terminal=false,floating=false,visible=true,anchorRef,hostName='Mac',hostClipboard}:{id:string;connected:boolean;onClose?:()=>void;onPaste:(text:string)=>Promise<void>;onKey:(key:'backspace'|'enter')=>void;onReadText?:()=>Promise<string>;terminal?:boolean;floating?:boolean;visible?:boolean;anchorRef?:RefObject<HTMLButtonElement|null>;hostName?:'Mac'|'Windows';hostClipboard?:{readText:()=>Promise<string>;writeText:(text:string)=>Promise<unknown>}}){
  const [text,setText]=useState(''),[busy,setBusy]=useState(false),[error,setError]=useState(''),[message,setMessage]=useState('');
  const [translated,setTranslated]=useState<string|null>(null),[translating,setTranslating]=useState(false);
  const [direction,setDirection]=useState<TranslationDirection>('auto'),[expanded,setExpanded]=useState(false),[fontSize,setFontSize]=useState(16);
@@ -39,17 +39,17 @@ export default function GuestTextInput({id,connected,onPaste,onKey,onClose,onRea
   working.current=true;setBusy(true);setError('');setMessage('');
   try{
    if(action==='copy'){
-    await navigator.clipboard.writeText(start===end?value:value.slice(start,end));
-    if(current(token))setMessage('已复制到 Mac 剪贴板。');
+    await (hostClipboard??navigator.clipboard).writeText(start===end?value:value.slice(start,end));
+    if(current(token))setMessage(`已复制到 ${hostName} 剪贴板。`);
    }else{
-    const incoming=await navigator.clipboard.readText();if(!current(token))return;
+    const incoming=await (hostClipboard??navigator.clipboard).readText();if(!current(token))return;
     const next=value.slice(0,start)+incoming+value.slice(end),limit=target==='original'?TRANSLATION_INPUT_LIMIT:TRANSLATION_OUTPUT_LIMIT;
     if(next.length>limit||next.includes('\0'))throw new Error(`粘贴内容须为 ${limit.toLocaleString()} 字以内的普通文本。`);
     if(target==='original')editOriginal(next);else setTranslated(next);
     requestAnimationFrame(()=>{if(current(token)){input.focus();input.setSelectionRange(start+incoming.length,start+incoming.length);}});
     setMessage('已粘贴到小窗，未发送到沙箱。');
    }
-  }catch(e){if(current(token))setError((e as Error).message||'剪贴板不可用，请使用右键菜单或 ⌘C / ⌘V。');}
+  }catch(e){if(current(token))setError((e as Error).message||`剪贴板不可用，请使用右键菜单或 ${hostName==='Windows'?'Ctrl+C / Ctrl+V':'⌘C / ⌘V'}。`);}
   finally{if(current(token)){working.current=false;setBusy(false);}}
  }
  function nativePaste(event:ClipboardEvent<HTMLTextAreaElement>,limit:number){
@@ -61,7 +61,7 @@ export default function GuestTextInput({id,connected,onPaste,onKey,onClose,onRea
  function inputKeyDown(event:KeyboardEvent<HTMLTextAreaElement>,value:string){
   if(event.nativeEvent.isComposing||composing.current||event.keyCode===229)return;
   if(event.key==='Escape'){event.preventDefault();event.stopPropagation();if(expanded)closeExpanded();else onClose?.();}
-  if(event.key==='Enter'&&(event.metaKey||event.ctrlKey)){event.preventDefault();void paste(value);}
+  if(event.key==='Enter'&&(hostName==='Windows'?event.ctrlKey&&!event.metaKey&&!event.altKey&&!event.shiftKey:event.metaKey||event.ctrlKey)){event.preventDefault();void paste(value);}
  }
  function textTools(target:'original'|'translation'){
   const value=target==='original'?text:translated;
@@ -104,23 +104,23 @@ export default function GuestTextInput({id,connected,onPaste,onKey,onClose,onRea
   }catch(e){if(current(token))setError((e as Error).message);}finally{if(current(token)){working.current=false;setBusy(false);setTranslating(false);pending.current=null;}}
  }
  const content=<section className={`guest-text-input ${expanded?'guest-text-input-expanded':''}`} aria-label="中文快捷输入" style={expanded?{'--translation-font-size':`${fontSize}px`} as CSSProperties:undefined}>
-  {!expanded&&<div className={`guest-input-heading ${floating?'floating-tool-drag':''}`} {...(floating?placement.drag:{})} title={floating?'拖动标题可移动小窗':undefined}><strong>中文输入</strong><span>Mac 输入法</span><button ref={expandButton} type="button" className="guest-input-expand" onClick={()=>setExpanded(true)}>放大查看</button><button type="button" className="guest-input-close" aria-label="收起中文输入" title="收起，保留草稿" onClick={onClose}>×</button></div>}
+  {!expanded&&<div className={`guest-input-heading ${floating?'floating-tool-drag':''}`} {...(floating?placement.drag:{})} title={floating?'拖动标题可移动小窗':undefined}><strong>中文输入</strong><span>{hostName} 输入法</span><button ref={expandButton} type="button" className="guest-input-expand" onClick={()=>setExpanded(true)}>放大查看</button><button type="button" className="guest-input-close" aria-label="收起中文输入" title="收起，保留草稿" onClick={onClose}>×</button></div>}
   {expanded&&<div className="guest-reader-toolbar"><span>原文 {text.length.toLocaleString()} / {TRANSLATION_INPUT_LIMIT.toLocaleString()} 字</span><div><Button aria-label="缩小阅读字号" disabled={fontSize<=14} onClick={()=>setFontSize(size=>size-2)}>A−</Button><span aria-live="polite">{fontSize}px</span><Button aria-label="放大阅读字号" disabled={fontSize>=24} onClick={()=>setFontSize(size=>size+2)}>A＋</Button><Button onClick={closeExpanded}>返回小窗</Button></div></div>}
   <div className={`guest-translation-editors ${translated!==null?'has-translation':''}`}>
    <div className="guest-original-editor">{textTools('original')}
     <textarea ref={originalInput} onPaste={event=>nativePaste(event,TRANSLATION_INPUT_LIMIT)} aria-label="中文或其他文字" rows={2} maxLength={TRANSLATION_INPUT_LIMIT} value={text} disabled={busy} placeholder={terminal?'输入文字，粘贴到当前终端；不自动执行…':'先点沙箱输入框，再在这里输入…'} onChange={event=>editOriginal(event.target.value)}
      onCompositionStart={()=>{composing.current=true;}} onCompositionEnd={()=>{composing.current=false;}}
      onKeyDown={event=>inputKeyDown(event,text)}/>
-    <div className="guest-translation-actions"><div className="guest-translation-options"><select className="guest-translation-direction" aria-label="翻译方向" value={direction} disabled={busy} onChange={event=>{directionChosen.current=true;setDirection(event.target.value as TranslationDirection);setTranslated(null);setError('');}}><option value="auto">自动互译</option><option value="en">中 → 英</option><option value="zh">英 → 中</option></select></div><div className="guest-translation-submit"><Button title="仅点击时将原文交给 DeepSeek，使用沙箱网络与已配置的 Key" disabled={busy||!connected||!text.trim()} onClick={()=>void translate()}>{translating?'翻译中…':direction==='auto'&&!/\p{L}/u.test(text)?'翻译':translationTarget(text,direction)==='en'?'翻译成英文':'翻译成中文'}</Button><Button className="primary" title="⌘Enter / Ctrl+Enter；粘贴后自动收起，不发送" disabled={busy||!connected||!text} onClick={()=>void paste()}>粘贴原文</Button></div></div>
+    <div className="guest-translation-actions"><div className="guest-translation-options"><select className="guest-translation-direction" aria-label="翻译方向" value={direction} disabled={busy} onChange={event=>{directionChosen.current=true;setDirection(event.target.value as TranslationDirection);setTranslated(null);setError('');}}><option value="auto">自动互译</option><option value="en">中 → 英</option><option value="zh">英 → 中</option></select></div><div className="guest-translation-submit"><Button title="仅点击时将原文交给 DeepSeek，使用沙箱网络与已配置的 Key" disabled={busy||!connected||!text.trim()} onClick={()=>void translate()}>{translating?'翻译中…':direction==='auto'&&!/\p{L}/u.test(text)?'翻译':translationTarget(text,direction)==='en'?'翻译成英文':'翻译成中文'}</Button><Button className="primary" title={`${hostName==='Windows'?'Ctrl+Enter':'⌘Enter / Ctrl+Enter'}；粘贴后自动收起，不发送`} disabled={busy||!connected||!text} onClick={()=>void paste()}>粘贴原文</Button></div></div>
    </div>
    {translated!==null&&<div className="guest-translation-result">{textTools('translation')}<textarea ref={translatedInput} onPaste={event=>nativePaste(event,TRANSLATION_OUTPUT_LIMIT)} id={`translation-${id}`} aria-label="译文" value={translated} maxLength={TRANSLATION_OUTPUT_LIMIT} rows={3} disabled={busy} onChange={event=>setTranslated(event.target.value)} onCompositionStart={()=>{composing.current=true;}} onCompositionEnd={()=>{composing.current=false;}} onKeyDown={event=>inputKeyDown(event,translated)}/><Button className="primary" disabled={busy||!connected||!translated.trim()} onClick={()=>void paste(translated)}>粘贴译文</Button></div>}
   </div>
   <small className="guest-translation-disclosure">DeepSeek Flash · 点击翻译才发送原文</small>
   {error&&<Notice kind="error">{error}</Notice>}{message&&<p role="status">{message}</p>}
-  <details ref={more} className="guest-input-more"><summary>帮助与更多操作 <span>⌘Enter 粘贴</span></summary>
-   <TranslationSettings onSaved={()=>{if(more.current)more.current.open=false;}} />
-   <p>{terminal?'选中当前终端中的文字，点击“取回并翻译”。文字粘贴到终端光标处，不自动按回车执行；多行需要终端支持安全粘贴。':'在 Linux 内复制文字，再点“取回并翻译”；只想取回文字可用下方按钮。先点沙箱输入框，再粘贴原文或译文，不会按回车发送。'}取回并翻译默认英 → 中，可手选方向；清空原文后恢复自动互译。点小窗外部可收起并保留草稿，拖动标题可移动，右下角可调整大小。文本框支持右键剪切、复制、粘贴、全选；复制和粘贴小按钮操作的是 Mac 剪贴板。</p>
-   <p>每次最多翻译 {TRANSLATION_INPUT_LIMIT.toLocaleString()} 字，保留段落、换行和列表；模型可能改变格式，请核对译文。自动互译：有中文时译成英文，纯英文时译成中文；混合文本可手选方向。模型只翻译，不回答问题。失败时保留原文，不自动重试、不改用 Mac 直连。原文、译文和 Key 不写入应用日志。</p>
+  <details ref={more} className="guest-input-more"><summary>帮助与更多操作 <span>{hostName==='Windows'?'Ctrl+Enter':'⌘Enter'} 粘贴</span></summary>
+   <TranslationSettings hostName={hostName} onSaved={()=>{if(more.current)more.current.open=false;}} />
+   <p>{terminal?'选中当前终端中的文字，点击“取回并翻译”。文字粘贴到终端光标处，不自动按回车执行；多行需要终端支持安全粘贴。':'在 Linux 内复制文字，再点“取回并翻译”；只想取回文字可用下方按钮。先点沙箱输入框，再粘贴原文或译文，不会按回车发送。'}取回并翻译默认英 → 中，可手选方向；清空原文后恢复自动互译。点小窗外部可收起并保留草稿，拖动标题可移动，右下角可调整大小。文本框支持右键剪切、复制、粘贴、全选；复制和粘贴小按钮操作的是 {hostName} 剪贴板。</p>
+   <p>每次最多翻译 {TRANSLATION_INPUT_LIMIT.toLocaleString()} 字，保留段落、换行和列表；模型可能改变格式，请核对译文。自动互译：有中文时译成英文，纯英文时译成中文；混合文本可手选方向。模型只翻译，不回答问题。失败时保留原文，不自动重试、不改用 {hostName} 直连。原文、译文和 Key 不写入应用日志。</p>
    <div className="guest-input-actions"><Button disabled={busy||!connected} onClick={()=>void receive()}>{terminal?'取回终端选中文字':'取回沙箱文字'}</Button><Button disabled={busy||!text} onClick={clearOriginal}>清空草稿</Button><Button disabled={busy||!connected} onClick={()=>onKey('backspace')}>退格</Button><Button disabled={busy||!connected} onClick={()=>onKey('enter')}>回车</Button></div>
   </details>
  </section>;

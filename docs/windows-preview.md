@@ -72,6 +72,8 @@ npm run windows:ui
 
 中文输入框支持普通 Unicode 文字粘贴，不自动执行；多行粘贴要求客体终端支持括号粘贴。上传文件保存到 `/home/dev/Downloads`，单个文件最多 150 MiB，最多两个并发传输。下载、传入和导出目录只能通过客体文件描述符访问，拒绝符号链接、硬链接、跨挂载点及路径跳转；下载前检查文件版本。文件任务使用客体进程组监督器，取消时终止对应开发任务。没有持续共享宿主目录，也没有自动同步宿主剪贴板。
 
+Windows `0.4.66-preview.5` 可用“中文与翻译”打开浮窗，`Ctrl+Shift+Y` 展开/收起，`Ctrl+Enter` 仅粘贴。草稿在收起后保留，候选输入时不触发快捷键；译文可以修改和放大阅读。翻译设置位于帮助中的折叠区，Key 加密保存在本机 Windows，只有点击翻译才经当前沙箱网络调用。终端“取回并翻译”读取当前选择，浏览器则读取 Linux 剪贴板。详见 [翻译验收与范围](windows-translation-validation.md)；外部服务、真实输入法和桌面文字剪贴板手势仍单独验收。
+
 ## 独立 Windows 桌面测试包
 
 Windows 使用 `desktop/windows/main.cjs` 和独立打包配置。应用身份为 `local.mucodesandbox.windows.preview`，与 Mac 应用不同；根目录的 Mac Electron 入口及 `package:mac` 保持原有配置。

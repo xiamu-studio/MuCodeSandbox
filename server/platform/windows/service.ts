@@ -19,7 +19,10 @@ import {TRANSFER_MAX_BYTES} from '../../../shared/guest-exchange.ts';
 import {IMAGE_CLIPBOARD_MAX_BYTES} from '../../../shared/clipboard-image.ts';
 import {WindowsBrowser} from './browser.ts';
 import {displayRequestSchema} from '../../../shared/guest-display.ts';
-import {clipboardText} from '../../guest-exchange.ts';
+import {clipboardText,inlineTranslationText} from '../../guest-exchange.ts';
+import {WindowsTranslationSettings} from './translation-settings.ts';
+import {translationApiKey} from '../../translation-settings.ts';
+import {translationDirection} from '../../deepseek-translation.ts';
 import {windowsAppDirectory,windowsRuntimeDirectory} from './paths.ts';
 import {windowsBaseSchema} from './config.ts';
 import {WindowsSetup} from './setup.ts';
@@ -51,10 +54,11 @@ export async function createWindowsService(options:WindowsServiceOptions){
   }
   manager=new WindowsManager(await openWindowsStore(dataDir),runtime,{runtimeRoot,base,probe:options.probe});
   const controller=manager;
+  const translationSettings=new WindowsTranslationSettings(controller.store);
   if(runtime instanceof HyperVRuntime&&runtime.broker){host=new WindowsHostComponents(runtime.broker,()=>!controller.tasks.size&&controller.store.list().every(e=>!['running','starting','creating','stopping'].includes(e.state))&&!setup?.running);await host.refresh();setup=new WindowsSetup(runtime,runtimeRoot,{base,canPrepare:()=>!!host&&hostReady(host.snapshot())&&!controller.options.base&&!controller.tasks.size&&controller.store.list().every(e=>e.state==='not_created'),publish:value=>{controller.options.base=value;controller.profiles.clear();}});await setup.initialize();}
   if(runtime instanceof HyperVRuntime&&runtime.broker)storage=new WindowsStorage(runtime.broker,()=>controller.options.base?.imageSha256??null,()=>!!host&&hostReady(host.snapshot())&&!controller.tasks.size&&!setup?.running);
   terminal=runtime.terminalLaunch?new WindowsTerminalServer(controller,{terminalLaunch:runtime.terminalLaunch.bind(runtime)},options.ptyFactory):undefined;
-  const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>(),imageTransfers=new Map<string,AbortController>();
+  const terminals=terminal,transfers=new Map<string,Set<AbortController>>(),readers=new Map<string,()=>void>(),imageTransfers=new Map<string,AbortController>(),translationTransfers=new Map<string,{abort:AbortController;sessionId:string}>();
   const guest=runtime.guest?.bind(runtime),management=runtime.management?.bind(runtime);
   if(runtime.serviceStreamFactory&&management){browser=new WindowsBrowser(controller,{management,serviceStreamFactory:runtime.serviceStreamFactory.bind(runtime)});controller.browserRunning=id=>browser!.running(id);controller.browserAvailable=true;controller.inspectAdditionalProtection=id=>browser!.assertProtection(id);}
   const guestBrowser=browser;
@@ -62,7 +66,8 @@ export async function createWindowsService(options:WindowsServiceOptions){
   const exchange=guest&&management?new GuestExchange({guest:async(e,command,runOptions={})=>{
    if([...transfers.values()].reduce((n,set)=>n+set.size,0)>=2)throw new AppError('同时传输数量已达到上限',429,'TRANSFER_LIMIT');
    const abort=new AbortController(),set=transfers.get(e.id)??new Set<AbortController>();set.add(abort);transfers.set(e.id,set);
-   try{return await guest(await controller.profile(e),command,{...runOptions,signal:runOptions.signal?AbortSignal.any([abort.signal,runOptions.signal]):abort.signal});}
+   const translation=translationTransfers.get(e.id),signals=[abort.signal,runOptions.signal,translation?.abort.signal].filter((signal):signal is AbortSignal=>!!signal);
+   try{const profile=await controller.profile(e);if(translation&&controller.sessions.get(e.id)?.id!==translation.sessionId)throw new AppError('环境已变化，请重新翻译。',409,'CONFIGURATION_CHANGED');const signal=AbortSignal.any(signals);signal.throwIfAborted();return await guest(profile,command,{...runOptions,signal});}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
   },management:async(e,command,runOptions={})=>{
    await controller.assertAccess(e.id);
@@ -71,8 +76,8 @@ export async function createWindowsService(options:WindowsServiceOptions){
    const signals=[abort.signal,runOptions.signal,imageTransfers.get(e.id)?.signal].filter((signal):signal is AbortSignal=>!!signal);
    try{return await management(await controller.profile(e),command,{...runOptions,signal:AbortSignal.any(signals)});}
    finally{set.delete(abort);if(!set.size&&transfers.get(e.id)===set)transfers.delete(e.id);}
-  }},id=>controller.assertAccess(id)):undefined;
-  controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
+  }},id=>controller.assertAccess(id),translationSettings):undefined;
+  controller.onAccessRevoked=id=>{terminals?.closeEnvironment(id);guestBrowser?.revoke(id);translationTransfers.get(id)?.abort.abort();for(const abort of transfers.get(id)??[])abort.abort();readers.get(id)?.();};
   if(!host||host.snapshot().runtimeActive)await controller.recover();
   monitor=new WindowsHostMonitor(()=>runtime.fingerprint(),()=>{void controller.hostUnavailable('宿主网络发生变化、监测中断或电脑从休眠恢复').catch(()=>{});});
   await monitor.start();
@@ -130,6 +135,19 @@ export async function createWindowsService(options:WindowsServiceOptions){
    if(!terminals)throw new AppError('Windows 终端组件不可用',409,'FEATURE_UNAVAILABLE');const envId=id(req);await controller.assertAccess(envId);res.json({ticket:terminals.issue(envId,input.cols,input.rows)});
   });
   const files=()=>{if(!exchange)throw new AppError('Windows 文件传输组件不可用',409,'FEATURE_UNAVAILABLE');return exchange;};
+  const cancelTranslations=()=>{for(const request of translationTransfers.values())request.abort.abort();};
+  app.get('/api/translation-settings',(_req,res)=>res.json(translationSettings.status()));
+  app.post('/api/translation-settings',(req,res)=>{const input=z.object({apiKey:translationApiKey}).strict().parse(req.body);const status=translationSettings.save(input.apiKey);cancelTranslations();res.json(status);});
+  app.delete('/api/translation-settings',(req,res)=>{z.object({}).strict().parse(req.body??{});const status=translationSettings.clear();cancelTranslations();res.json(status);});
+  app.post('/api/environments/:id/translate-text',async(req,res)=>{
+   const envId=id(req),input=z.object({text:inlineTranslationText,direction:translationDirection.optional()}).strict().parse(req.body);files();
+   if(translationTransfers.has(envId))throw new AppError('当前翻译尚未结束，请稍后重试。',409,'TRANSLATION_BUSY');
+   await controller.assertAccess(envId);const context={abort:new AbortController(),sessionId:controller.sessions.get(envId)!.id};
+   if(translationTransfers.has(envId))throw new AppError('当前翻译尚未结束，请稍后重试。',409,'TRANSLATION_BUSY');
+   translationTransfers.set(envId,context);const cancel=()=>{if(!res.writableFinished)context.abort.abort();};res.once('close',cancel);
+   try{if(res.destroyed)context.abort.abort();context.abort.signal.throwIfAborted();const result=await files().translate(envId,input.text,input.direction);context.abort.signal.throwIfAborted();if(controller.sessions.get(envId)?.id!==context.sessionId)throw new AppError('环境已变化，译文不再交付。原文已保留。',409,'CONFIGURATION_CHANGED');res.json(result);}
+   finally{res.removeListener('close',cancel);if(translationTransfers.get(envId)===context)translationTransfers.delete(envId);}
+  });
   app.get('/api/environments/:id/transfer-files',async(req,res)=>{
    const envId=id(req);if(req.query.directory==='1')res.json(await files().listDirectory(envId,transferZone.parse(req.query.zone),transferPath.parse(req.query.path??''),z.string().optional().parse(req.query.cursor)));
    else res.json(await files().listPage(envId,z.string().optional().parse(req.query.cursor)));
@@ -170,7 +188,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   });
   app.use('/api',(_req,res)=>res.status(409).json({error:'此功能尚未完成 Windows 适配',code:'FEATURE_UNAVAILABLE'}));
   app.get('/favicon.ico',(_req,res)=>res.status(204).end());
-  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
+  const bootstrap=`<script nonce="${nonce}">window.__MU_CONFIG__=${JSON.stringify({token,version:VERSION,platform:'win32',capabilities:{terminal:!!terminals,files:!!exchange,browser:!!guestBrowser,audio:!!guestAudio,imageClipboard:!!exchange&&!!guestBrowser,translation:!!exchange,remove:!!runtime.deletionAvailable,setup:!!setup,hostSetup:!!host,storage:!!storage}})};</script>`;
   app.get('/',async(_req,res)=>{
    let html:string;try{html=await readFile(path.join(options.rootDir,'dist/index.html'),'utf8');}catch{throw new AppError('请先构建界面：npm run build',503,'UI_MISSING');}
    res.type('html').send(html.replace('<!-- MU_BOOTSTRAP -->',bootstrap));
@@ -194,7 +212,7 @@ export async function createWindowsService(options:WindowsServiceOptions){
   const address=server.address();if(typeof address==='object'&&address)port=address.port;
   const url=`http://127.0.0.1:${port}`;
   const close=()=>closing??=(async()=>{
-   watcher.stop();terminals?.close();guestBrowser?.dispose();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
+   watcher.stop();terminals?.close();guestBrowser?.dispose();cancelTranslations();for(const stop of readers.values())stop();for(const set of transfers.values())for(const abort of set)abort.abort();const closed=new Promise<void>(resolve=>server.close(()=>resolve()));server.closeAllConnections();
    try{await guestAudio?.dispose();await setup?.close();await controller.close();}finally{await closed;await unlock();}
   })();
   return {app,server,manager:controller,terminal:terminals,browser:guestBrowser,guestAudio,exchange,setup,host,url,port,launchUrl:(pathname='/')=>ui.launchUrl(url,pathname),close};

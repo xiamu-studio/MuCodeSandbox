@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','audio-stage','audio-run','audio-refresh','audio-inspect','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][int]$OwnerPid, [Parameter(Mandatory)][ValidateSet('host-state','console','stop-boot','diagnostics','inspect','before-reboot','after-reboot','restart-check','package-logon','package-stage','package-install','package-inventory','package-repair','package-uninstall','package-diagnostics','package-show-list','package-open-main','vmms-stage','vmms-run','vmms-recover','vmms-inspect','image-stage','image-refresh','image-run','image-inspect','audio-stage','audio-run','audio-refresh','audio-inspect','ime-console','ime-stage','ime-run','ime-inspect','ime-stop','collect-stop')][string]$Phase)
 $ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $directoryPath = [IO.Path]::GetFullPath($Directory)
@@ -100,6 +100,17 @@ try {
         Save-ProProbe 'diagnosed' @{ host = $initial; details = $details }; exit 0
     }
     if (-not $initial.userOrdinary -or $initial.oobe -ne 0 -or $initial.setupInProgress -ne 0) { throw 'Ordinary Pro profile and completed system setup required' }
+    if ($Phase -eq 'ime-console') {
+        if ($initial.interactiveUser -ne 'MU-PRO-LAB\MuLabUser') { throw 'Synthetic ordinary desktop required for IME observation' }
+        Start-Process -FilePath (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) 'vmconnect.exe') -ArgumentList @('localhost',$machine.name) -WindowStyle Normal | Out-Null
+        Save-ProProbe 'ime-console-requested' @{ complete = $true; scope = 'synthetic-Pro-console-launch-request'; windowsAuthenticationAutomated = $false }; exit 0
+    }
+    if ($Phase -in @('ime-stage','ime-run','ime-inspect','ime-stop')) {
+        . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-ime-operator.ps1'))))
+        $result = Invoke-ProImePhase $session $Phase $guard $config.nonce
+        Save-ProProbe 'ime-result' $result
+        if(-not $result.complete){exit 1};exit 0
+    }
     if ($Phase -in @('audio-stage','audio-run','audio-refresh','audio-inspect')) {
         . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-image-operator.ps1'))))
         . ([ScriptBlock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'pro-audio-operator.ps1'))))

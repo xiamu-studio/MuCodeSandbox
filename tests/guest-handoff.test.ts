@@ -52,7 +52,7 @@ test('Starting a second client preserves the first; only a starting client is ex
  const runtime=new LimaRuntime('/unused'),desktop=new GuestDesktop(runtime),e=env(),calls:string[]=[];
  let broken=false;
  runtime.management=async(_e,args,options)=>{
-  if(args[0]==='python3')return JSON.stringify({apps:[{id:'grok-bot',running:true,rendererProtected:!broken},{id:'claude-desktop',running:false,rendererProtected:null}]});
+  if(args[0]==='python3')return JSON.stringify({supported:true,displaySharedWithBrowser:true,accountTested:false,apps:[{id:'grok-bot',installed:true,installedVersion:'0.68.1',running:true,pid:42,profile:'/home/dev/.local/share/mucodesandbox/desktop-clients/grok-bot',rendererProtected:!broken,issue:''},{id:'claude-desktop',installed:false,installedVersion:null,running:false,pid:0,profile:'/home/dev/.local/share/mucodesandbox/desktop-clients/claude-desktop',rendererProtected:null,issue:''}]});
   calls.push(options?.input??args.join(' '));return '';
  };
  await desktop.start(e,'grok-bot');assert.equal(calls.length,0,'An already-running client must not restart');

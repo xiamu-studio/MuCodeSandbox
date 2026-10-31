@@ -21,8 +21,8 @@ async function app(root:string,version=old){
  await writeFile(path.join(root,'resources/windows-runtime-manifest.json'),JSON.stringify({format:1,channel:'unsigned-windows-preview',release:{version,fileVersion}}));
  await writeFile(path.join(root,'resources/app/dist-server/windows-release.json'),JSON.stringify({format:1,version,fileVersion}));
 }
-async function fixture(installed=true){
- const directory=await mkdtemp(path.join(tmpdir(),'mu-installer-recovery-')),root=path.join(directory,'installed'),guid=randomUUID(),data=path.join(directory,'profile.bin');
+async function fixture(installed=true,rootName='installed'){
+ const directory=await mkdtemp(path.join(tmpdir(),'mu-installer-recovery-')),root=path.join(directory,rootName),guid=randomUUID(),data=path.join(directory,'profile.bin');
  await writeFile(data,'independent synthetic encrypted profile');if(installed)await app(root);
  const owner=spawn(process.execPath,['-e',"console.log('ready');setInterval(()=>{},1000)"],{windowsHide:true,stdio:['ignore','pipe','ignore']});await once(owner.stdout!,'data');
  const env={...process.env,MU_WINDOWS_TRANSACTION_SCRIPT:script,MU_WINDOWS_INSTALL_ROOT:root,MU_WINDOWS_APP_GUID:guid,MU_WINDOWS_INSTALL_PID:String(owner.pid),MU_WINDOWS_INSTALL_VERSION:updated};
@@ -47,6 +47,23 @@ test('Installer recovery restores removed application bytes and registration whi
   assert.equal(await readFile(f.data,'utf8'),'independent synthetic encrypted profile');await assert.rejects(access(f.journal));
  }finally{await f.cleanup();}
 });
+test('Installer backup and recovery preserve package files whose transaction paths exceed MAX_PATH',windows,async()=>{
+ const f=await fixture(true,"程序 O'Brien $ 测试");try{
+  const prefix='resources/app/',suffix='/retained.js',relative=prefix+'d'.repeat(245-f.root.length-1-prefix.length-suffix.length)+suffix;
+  const original=path.join(f.root,relative);assert.equal(original.length,245);await mkdir(path.dirname(original),{recursive:true});await writeFile(original,'original long-path package data');
+  await f.action('prepare');const record=JSON.parse(await readFile(f.journal,'utf8'));assert.equal(record.state,'prepared');const backup=f.root+'.mu-backup-'+record.nonce;assert.ok(path.join(backup,relative).length>260);assert.equal(await readFile(path.join(backup,relative),'utf8'),'original long-path package data');
+  await f.stop();await rename(f.root,path.join(f.directory,'removed-old'));await app(f.root,updated);await f.action('recover');assert.equal(await readFile(original,'utf8'),'original long-path package data');assert.equal(await readFile(f.data,'utf8'),'independent synthetic encrypted profile');await assert.rejects(access(f.journal));
+ }finally{await f.cleanup();}
+});
+
+test('Long transaction copies are removed after commit and unchanged-original recovery',windows,async()=>{
+ for(const action of ['commit','recover']){const f=await fixture(true,"程序 O'Brien $ 测试");try{
+  const relative='resources/app/'+'d'.repeat(245-f.root.length-1-'resources/app/'.length-'/retained.js'.length)+'/retained.js';const file=path.join(f.root,relative);await mkdir(path.dirname(file),{recursive:true});await writeFile(file,'long-path bytes retained');
+  await f.action('prepare');const record=JSON.parse(await readFile(f.journal,'utf8'));const backup=f.root+'.mu-backup-'+record.nonce;assert.ok(path.join(backup,relative).length>260);
+  if(action==='commit')await app(f.root,updated);else await f.stop();await f.action(action);await assert.rejects(access(backup));await assert.rejects(access(f.journal));assert.equal(await readFile(file,'utf8'),'long-path bytes retained');
+ }finally{await f.cleanup();}}
+});
+
 test('A live installer or live backup writer prevents another recovery attempt',windows,async()=>{
  const f=await fixture();try{await f.action('prepare');await assert.rejects(f.action('recover'),/Another installation is still active/);await f.stop();
   const original=await readFile(f.journal,'utf8');const record=JSON.parse(original);

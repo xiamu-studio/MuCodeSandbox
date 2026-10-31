@@ -17,6 +17,11 @@ import type { Environment } from '../shared/types.ts';
 function env():Environment {return {...environmentSchema.parse({name:'Observation test',kind:'vm',network:{mode:'http',host:'127.0.0.1',port:24897,strict:true,transparent:true}}),id:randomUUID(),instanceName:'mu-observation-test',state:'running',lastError:null,browserRunning:false,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};}
 function journal(message:string,cursor='s=abcd;i=1;b=abcd;m=1;t=1;x=abcd') {return JSON.stringify({__CURSOR:cursor,__REALTIME_TIMESTAMP:String(Date.now()*1000),MESSAGE:message});}
 
+test('Observation readiness exposes lifecycle state and retains dated IP history without claiming an unconfirmed stop',async()=>{
+ const root=await mkdtemp(path.join(tmpdir(),'mu-observation-state-')),store=new Store(root,Buffer.alloc(32,41)),e=env(),at='2026-10-24T02:03:04.000Z';store.save(e);let commands=0;const observer=new NetworkObserver(store,{management:async()=>{commands++;throw Error('No guest command during retained-state reads');}},async()=>{commands++;throw Error('No probe during retained-state reads');},()=>true,()=>1,false);
+ try{observer.record(e,'ipify',{ip:'203.0.113.10',country:'',city:'',latencyMs:12,source:'guest'},1,at);for(const state of ['running','not_created','creating','starting','stopping','stopped','error','deleting'] as const){const current={...e,state};store.save(current);const info=observer.info(current);assert.equal(info.environmentState,state);assert.equal(info.enabled,state==='running');assert.equal(info.summary.lastIp,'203.0.113.10');assert.equal(info.summary.lastCheckedAt,at);}assert.equal(commands,0);}finally{await observer.close();store.close();assert.equal(path.dirname(path.resolve(root)),path.resolve(tmpdir()));assert.match(path.basename(root),/^mu-observation-state-/);await rm(root,{recursive:true,force:true});}
+});
+
 test('Connection parser preserves observed destination and distinguishes attempts, rejects secrets and request URLs',()=>{
   assert.deepEqual(parseConnection('INFO [1212 3ms] outbound/http[upstream]: outbound connection to 203.0.113.2:443'),{target:'203.0.113.2',port:443,status:'attempt',protocol:'TCP',route:'proxy'});
   assert.equal(parseConnection('INFO outbound/socks[upstream]: outbound connection to example.org:443')?.target,'example.org');
@@ -104,6 +109,10 @@ test('Connection exit context never substitutes current, future, failed or expir
   assert.equal(connectionExit(at(8000),false,[],samples).exitSource,'observation');
   assert.deepEqual(connectionExit(at(90_001),false,[],samples),{});
   assert.deepEqual(connectionExit(at(8000),false,[],[...samples,{id:2,at:at(6000),provider:'ipify',status:'failed'}]),{});
+  assert.deepEqual(connectionExit(at(8000),true,[{id:2,at:at(6000),status:'unavailable'},...approvals],[]),{});
+  assert.deepEqual(connectionExit(at(8000),false,[],[{id:2,at:at(6000),provider:'ipify',status:'failed'},...samples]),{});
+  assert.deepEqual(connectionExit(at(8000),true,[{id:2,at:at(0),status:'unavailable'},...approvals],[]),{});
+  assert.deepEqual(connectionExit(at(8000),false,[],[{id:2,at:at(0),provider:'ipify',status:'failed'},...samples]),{});
 });
 
 test('Journal extraction validates cursors and signals bounded batches rather than claiming completeness',()=>{
@@ -126,12 +135,44 @@ test('Exit summary reports receipt disagreement, provider drift, failure and sta
   assert.equal(exitSummary([a,{...a,id:2,ip:'203.0.113.2'}],now).changes,1);
   assert.equal(exitSummary([a,{id:2,at,provider:'ipify',status:'failed'}],now).state,'failed');
   assert.equal(exitSummary([a],now+91_000).state,'stale');
+  const earlier={...a,id:3,at:new Date(now-5000).toISOString(),ip:'203.0.113.2'};
+  const laterFailure:ExitObservation={id:4,at:new Date(now-1000).toISOString(),provider:'ipify',status:'failed'};
+  const shuffled=exitSummary([laterFailure,earlier],now);assert.equal(shuffled.state,'failed');assert.equal(shuffled.lastCheckedAt,laterFailure.at);assert.equal(shuffled.firstCheckedAt,earlier.at);
+  assert.equal(exitSummary([{...laterFailure,at},a],now).state,'failed');
+  assert.equal(exitSummary([a,{...a,id:5,at:'invalid'}],now).state,'failed');
   assert.equal(logSummary('{"processes":[{"seccomp":2,"threads":[]}]}'),'浏览器隔离检查详情');
   assert.equal(logSummary('stored passwd in file: /run/browser/vnc'),'浏览器画面连接凭据已准备');
   assert.equal(logSummary('Linux browser ready: loopback VNC and CDP; no host website process.'),'沙箱浏览器已就绪，可以连接画面');
   assert.equal(logSummary('/usr/bin/Xvfb\n/usr/bin/x11vnc'),'浏览器图形显示组件已就绪');
 });
 
+test('Network retention counts actual records rather than IDs consumed by duplicate journal events',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'mu-network-retention-')),store=new Store(dir);
+ try{
+  store.addNetworkRecords('synthetic','connection','key',Array.from({length:10000},(_,i)=>({source:String(i),payload:{}})));
+  store.addNetworkRecords('synthetic','connection','key',Array.from({length:1000},()=>({source:'0',payload:{}})));
+  store.addNetworkRecord('synthetic','connection','key','latest',{});
+  assert.equal(Number((store.db.prepare('SELECT COUNT(*) AS n FROM network_records').get() as {n:number}).n),10000);
+  assert.equal(store.db.prepare("SELECT id FROM network_records WHERE source_key='0'").get(),undefined);
+  assert.ok(store.db.prepare("SELECT id FROM network_records WHERE source_key='1'").get());
+  assert.ok(store.db.prepare("SELECT id FROM network_records WHERE source_key='latest'").get());
+ }finally{store.close();await rm(dir,{recursive:true,force:true});}
+});
+test('Network batches deduplicate and roll back fully on failure without committing an outer transaction',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'mu-network-batch-')),store=new Store(dir);
+ try{
+  store.addNetworkRecords('synthetic','connection','key',[{source:'one',payload:{value:1}},{source:'one',payload:{value:2}},{source:'two',payload:{value:3}}]);
+  assert.equal(store.networkRecords('synthetic','connection','key').length,2);
+  store.db.exec("CREATE TEMP TRIGGER reject_batch BEFORE INSERT ON network_records WHEN NEW.source_key='bad' BEGIN SELECT RAISE(ABORT,'synthetic failure'); END");
+  assert.throws(()=>store.addNetworkRecords('synthetic','connection','key',[{source:'three',payload:{}},{source:'bad',payload:{}}]),/synthetic failure/);
+  assert.equal(store.networkRecords('synthetic','connection','key').length,2);
+  store.db.exec('BEGIN');store.addNetworkRecord('synthetic','connection','key','outer',{});store.db.exec('ROLLBACK');
+  assert.equal(store.networkRecords('synthetic','connection','key').length,2);
+  store.db.prepare('UPDATE network_records SET created_at=?').run('2000-01-01T00:00:00.000Z');
+  store.addNetworkRecords('synthetic','connection','key',[{source:'fresh',payload:{}}]);
+  assert.equal(store.networkRecords('synthetic','connection','key').length,1);
+ }finally{store.close();await rm(dir,{recursive:true,force:true});}
+});
 test('Store isolates environments and keys, deduplicates source events, prunes old records and deletes with environment',async()=>{
   const dir=await mkdtemp(path.join(tmpdir(),'mu-observations-'));const store=new Store(dir);
   try{
@@ -180,6 +221,34 @@ test('Collected connection receipts are persisted and isolated from later approv
   }finally{await observer.close();store.close();await rm(dir,{recursive:true,force:true});}
 });
 
+test('Receipt storage failures stay visible across healthy collection and recover independently',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'mu-observer-receipt-storage-')),store=new Store(dir),e=env();store.save(e);
+ let generation=0,cursor=0;const runtime={management:async(_e:Environment,args:string[])=>args.includes('show')?'mucodesandbox-network\n':journal('INFO outbound/socks[upstream]: outbound connection to fixture.example:443','s=receipt;i='+(++cursor))};
+ const observer=new NetworkObserver(store,runtime,async()=>({ip:'203.0.113.7',country:'',city:'',latencyMs:1,source:'guest'}),()=>true,()=>generation,false);
+ const original=store.addNetworkRecord,blocked=new Set<string>(['sample','approval']);
+ try{
+  store.addNetworkRecord=function(id,kind,...args){if(blocked.has(kind))throw Error('private storage failure');return original.call(this,id,kind,...args);};
+  observer.recordVerification(e,{status:'verified',actualIp:'203.0.113.7',checkedAt:new Date().toISOString()});
+  await observer.sample(e);await observer.tick();
+  let info=observer.info(e);assert.equal(info.capture,'ready');assert.ok(info.storageIssue);assert.equal(info.samples.length,0);assert.equal(JSON.stringify(info).includes('private storage failure'),false);
+  blocked.delete('approval');observer.recordVerification(e,{status:'verified',actualIp:'203.0.113.7',checkedAt:new Date().toISOString()});assert.ok(observer.info(e).storageIssue);
+  blocked.delete('sample');await observer.sample(e);info=observer.info(e);assert.equal(info.storageIssue,undefined);assert.equal(info.samples.length,2);assert.ok(info.samples.every(row=>row.status==='success'));
+  blocked.add('sample');await observer.sample(e);assert.ok(observer.info(e).storageIssue);generation++;assert.equal(observer.info(e).storageIssue,undefined);
+ }finally{store.addNetworkRecord=original;await observer.close();store.close();await rm(dir,{recursive:true,force:true});}
+});
+test('A journal storage failure remains explicit when persisting its gap also fails',async()=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'mu-observer-storage-error-')),store=new Store(dir),e=env();store.save(e);
+ let cursor=0;const runtime={management:async(_e:Environment,args:string[])=>args.includes('show')?'mucodesandbox-network\n':journal('INFO outbound/socks[upstream]: outbound connection to fixture.example:443','s=storage;i='+(++cursor))};
+ const observer=new NetworkObserver(store,runtime,async()=>({ip:'203.0.113.7',country:'',city:'',latencyMs:1,source:'guest'}),()=>true,()=>0,false);
+ const original=store.addNetworkRecords;
+ try{
+  await observer.tick();await observer.sample(e);assert.equal(observer.info(e).capture,'ready');
+  store.addNetworkRecords=()=>{throw Error('synthetic private storage detail');};
+  await observer.tick();store.addNetworkRecords=original;
+  const info=observer.info(e);assert.equal(info.capture,'error');assert.equal(info.connections.length,1);assert.equal(JSON.stringify(info).includes('synthetic private'),false);
+  await observer.tick();assert.equal(observer.info(e).capture,'ready');
+ }finally{store.addNetworkRecords=original;await observer.close();store.close();await rm(dir,{recursive:true,force:true});}
+});
 test('A slow ordinary observation probe does not block journal collection, and close still waits for probes',async()=>{
  const dir=await mkdtemp(path.join(tmpdir(),'mu-observer-queues-')),store=new Store(dir),e=env();store.save(e);const runtime=new LimaRuntime(dir);let cursor=0,probes=0,release!:()=>void;const gate=new Promise<void>(r=>release=r);
  runtime.management=async(_e,args)=>args.includes('show')?'mucodesandbox-network\n':journal('INFO outbound/socks[upstream]: outbound connection to queue.fixture.test:443','s=queue;i='+(++cursor));

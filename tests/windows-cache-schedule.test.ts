@@ -1,0 +1,31 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {DatabaseSync} from 'node:sqlite';
+import {WindowsCacheSchedule} from '../server/platform/windows/cache-schedule.ts';
+import {WindowsStorage} from '../server/platform/windows/storage.ts';
+import {AppError} from '../server/errors.ts';
+import type {WindowsStorageStatus} from '../shared/windows-storage.ts';
+const day=24*60*60*1000,hour=60*60*1000;
+const plan={plan:'a'.repeat(64),canPrune:true,reason:null} as WindowsStorageStatus;
+function fixture(){let now=1700000000000,idle=true;const db=new DatabaseSync(':memory:'),calls:string[]=[];let inspect=async()=>plan,prune=async(_plan:string)=>({deletedFiles:2,reclaimedBytes:1234});
+ const storage={inspect:async()=>{calls.push('inspect');return inspect();},prune:async(p:string)=>{calls.push('prune:'+p);return prune(p);}};
+ const schedule=new WindowsCacheSchedule({db},storage,()=>idle,()=>now);
+ return {db,calls,schedule,advance:(n:number)=>{now+=n;},idle:(v:boolean)=>{idle=v;},inspect:(fn:()=>Promise<WindowsStorageStatus>)=>{inspect=fn;},prune:(fn:(p:string)=>Promise<{deletedFiles:number;reclaimedBytes:number}>)=>{prune=fn;}};}
+test('Schedule defaults off, persists opt-in and only prunes a newly verified eligible plan after a day',async()=>{const f=fixture();try{await f.schedule.run();assert.deepEqual(f.calls,[]);assert.equal(f.schedule.status().enabled,false);const enabled=f.schedule.configure(true);assert.equal(enabled.enabled,true);await f.schedule.run();assert.deepEqual(f.calls,[]);f.advance(day);await f.schedule.run();assert.deepEqual(f.calls,['inspect','prune:'+plan.plan]);const state=f.schedule.status();assert.equal(state.result,'cleaned');assert.equal(state.bytes,1234);assert.equal(state.files,2);assert.equal(state.nextAt,state.lastAt!+day);const reopened=new WindowsCacheSchedule({db:f.db},{inspect:async()=>plan,prune:async()=>{throw Error('unexpected');}},()=>true);assert.equal(reopened.status().enabled,true);reopened.stop();}finally{f.schedule.stop();f.db.close();}});
+test('Schedule does not clean busy, unregistered, uncertain or empty storage; retries blocked checks',async()=>{for(const mode of ['busy','unregistered','uncertain','empty'] as const){const f=fixture();try{f.schedule.configure(true);f.advance(day);if(mode==='busy')f.idle(false);if(mode!=='busy')f.inspect(async()=>({...plan,canPrune:false,reason:mode==='empty'?null:mode==='unregistered'?'unregistered-storage':'dependencies-unavailable'}));await f.schedule.run();assert.equal(f.calls.some(x=>x.startsWith('prune:')),false);const state=f.schedule.status();assert.equal(state.result,mode==='empty'?'nothing':'blocked');assert.equal(state.nextAt,state.lastAt!+(mode==='empty'?day:hour));}finally{f.schedule.stop();f.db.close();}}});
+test('An in-flight inspection cannot begin cleanup after service stop',async()=>{const f=fixture();try{f.schedule.configure(true);f.advance(day);let resolve!:(s:WindowsStorageStatus)=>void;f.inspect(()=>new Promise(r=>{resolve=r;}));const run=f.schedule.run();assert.throws(()=>f.schedule.configure(false),{code:'CACHE_SCHEDULE_BUSY'});f.schedule.stop();resolve(plan);await run;assert.deepEqual(f.calls,['inspect']);}finally{f.db.close();}});
+test('Concurrent triggers share one run and failures do not claim success',async()=>{const f=fixture();try{f.schedule.configure(true);f.advance(day);let resolve!:(s:WindowsStorageStatus)=>void;f.inspect(()=>new Promise(r=>{resolve=r;}));const a=f.schedule.run(),b=f.schedule.run();assert.equal(a,b);f.prune(async()=>{throw Error('sensitive synthetic failure');});resolve(plan);await a;const s=f.schedule.status();assert.equal(s.result,'failed');assert.equal(s.bytes,0);assert.equal(s.nextAt,s.lastAt!+hour);assert.doesNotMatch(JSON.stringify(s),/sensitive/);}finally{f.schedule.stop();f.db.close();}});
+test('Malformed persisted schedule refuses operation instead of enabling cleanup',async()=>{const f=fixture();try{f.db.prepare('INSERT INTO windows_cache_schedule VALUES(1,2,0,NULL,NULL,0,0)').run();assert.throws(()=>f.schedule.status(),{code:'CACHE_SCHEDULE_INVALID'});assert.throws(()=>f.schedule.configure(true),{code:'CACHE_SCHEDULE_INVALID'});await assert.rejects(async()=>f.schedule.run(),{code:'CACHE_SCHEDULE_INVALID'});assert.deepEqual(f.calls,[]);}finally{f.schedule.stop();f.db.close();}});
+
+
+test('Schedule uses the real storage plan revalidation and preserves files when the native plan changes',async()=>{
+ const db=new DatabaseSync(':memory:');let now=1700000000000;const calls:string[]=[];
+ const status={...plan,imageBytes:100,imageAllocatedBytes:80,temporaryBytes:20,catalogueBytes:10,reclaimableBytes:30,retainedBytes:100,imageCount:2,reclaimableFiles:1,unrecognizedEntries:0,quotaBytes:1024,freeBytes:2048,allocatedDiskGiB:32,unregisteredStorage:0};
+ const broker={call:async(action:string)=>{calls.push(action);if(action==='cache-status')return status;throw new AppError('changed synthetic plan',409,'CACHE_PLAN_CHANGED');}};
+ const storage=new WindowsStorage(broker as never,()=>null,()=>true),schedule=new WindowsCacheSchedule({db},storage,()=>true,()=>now);
+ try{schedule.configure(true);now+=day;await schedule.run();assert.deepEqual(calls,['cache-status','cache-prune']);assert.equal(schedule.status().result,'failed');assert.equal(schedule.status().bytes,0);}finally{schedule.stop();db.close();}
+});
+
+
+test('Stopping during a cleanup permits service database closure before the late reply',async()=>{const f=fixture();f.schedule.configure(true);f.advance(day);let resolve!:(value:{deletedFiles:number;reclaimedBytes:number})=>void;f.prune(()=>new Promise(r=>{resolve=r;}));const run=f.schedule.run();await new Promise(r=>setImmediate(r));assert.equal(f.schedule.status().running,true);assert.equal(f.schedule.status().result,'pending');f.schedule.stop();f.db.close();resolve({deletedFiles:1,reclaimedBytes:5});await run;});
+
+
+test('Conflicting eligibility and protected reason never start cleanup',async()=>{const f=fixture();try{f.schedule.configure(true);f.advance(day);f.inspect(async()=>({...plan,canPrune:true,reason:'unregistered-storage'}));await f.schedule.run();assert.deepEqual(f.calls,['inspect']);assert.equal(f.schedule.status().result,'blocked');}finally{f.schedule.stop();f.db.close();}});

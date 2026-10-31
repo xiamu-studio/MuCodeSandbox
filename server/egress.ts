@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Environment, NetworkResult, EgressVerification,EgressCheck } from '../shared/types.ts';
 import type { LimaRuntime } from './runtime.ts';
 import type { RunOptions } from './process.ts';
-import { AppError, errorMessage } from './errors.ts';
+import { AppError, SshProcessError, errorMessage } from './errors.ts';
 
 export const EGRESS_URL = 'https://ipwho.is/';
 // This includes starting the bounded command through Lima / SSH. The HTTPS
@@ -29,7 +29,9 @@ export function parseEgressProbeOutput(output:string):{body:string;diagnostics?:
  const raw=output.slice(index+diagnosticMarker.length).split('\n')[0];
  if(raw.length>1024)throw new Error('Invalid probe diagnostics');
  const value=probeDiagnostic.parse(JSON.parse(raw));
- const ms=(seconds:number)=>Math.round(seconds*1000);
+ // Zero also means curl never reached this stage. Preserve any completed
+ // sub-millisecond stage so it cannot be mistaken for an unstarted handshake.
+ const ms=(seconds:number)=>Math.ceil(seconds*1000);
  return {body:output.slice(0,index),diagnostics:{curlExitCode:value.curlExitCode,httpStatus:value.httpStatus,
   tcpConnectMs:ms(value.tcp),tlsHandshakeMs:ms(value.tls),firstByteMs:ms(value.firstByte),totalMs:ms(value.total)}};
 }
@@ -51,6 +53,11 @@ export function checkFailure(error:unknown):EgressCheck['status']{
  const message=errorMessage(error);
  if(error instanceof AppError&&error.code==='CANCELLED')return 'cancelled';
  if(error instanceof AppError&&error.code==='TIMEOUT')return 'command-timeout';
+ if(error instanceof SshProcessError&&error.exitStatus===255)return 'connection-error';
+ // Windows OpenSSH can exit 255 without stderr. This is a failed management
+ // command, not evidence that a receiver returned an invalid IP response.
+ if(error instanceof AppError&&error.code==='PROCESS_FAILED'&&message==='SSH 任务失败（255）')return 'connection-error';
+ if(error instanceof SshProcessError&&error.exitStatus!==28&&/\bcurl:\s*\(28\)/.test(message))return error.exitStatus===255?'connection-error':'invalid-response';
  if(/curl:\s*\(28\)/.test(message))return 'timeout';
  if(/curl:\s*\((35|60)\)/.test(message))return 'tls-error';
  if(/407|(?:SOCKS|proxy).*auth|authentication/i.test(message))return 'auth-error';
@@ -82,13 +89,19 @@ export async function measureEgress(runtime: Pick<LimaRuntime, 'management' | 'e
   const tasks=EGRESS_RECEIVERS.map(async (target,index)=>{
     const probeStarted=performance.now();
     let diagnostics:EgressCheck['diagnostics'];
+    // Windows SSH keeps stdout out of a failed command's stderr summary.
+    // curl writes --write-out to stdout even when it exits nonzero. Retain a
+    // bounded stream tail locally; only validated numeric stages enter checks.
+    let probeOutput='';
     try {
       const output = await runtime.management(e, ['/usr/bin/sudo', '-H', '-u', 'mu-probe', '--', 'env', '-i', 'PATH=/usr/bin:/bin', '/usr/bin/curl', '-q',
     '--ipv4', '--fail', '--silent', '--show-error', '--proto', '=https', '--tlsv1.2',
     '--max-time', '12', '--connect-timeout', '8', '--max-filesize', '65536',
     '--proxy', proxy, '--noproxy', proxy ? '' : '*', '--cacert', '/etc/ssl/certs/ca-certificates.crt',
         ...resolution,'--write-out',diagnosticFormat,target.url],
-      { ...options, signal, timeoutMs: EGRESS_TIMEOUT_MS });
+      { ...options, signal, timeoutMs: EGRESS_TIMEOUT_MS,onOutput:text=>{
+        probeOutput=(probeOutput+text).slice(-8192);options.onOutput?.(text);
+      } });
       const parsed=parseEgressProbeOutput(output);diagnostics=parsed.diagnostics;
       const result=target.receiver==='icanhazip'?parseEgress(JSON.stringify({ip:parsed.body.trim()})):parseEgress(parsed.body);
       checks[index]={receiver:target.receiver,status:'success',ip:result.ip,latencyMs:Math.round(performance.now()-probeStarted),...(diagnostics?{diagnostics}:{})};
@@ -97,13 +110,20 @@ export async function measureEgress(runtime: Pick<LimaRuntime, 'management' | 'e
       observedIp??=result.ip;
       return {receiver:target.receiver,result,latencyMs:Math.round(performance.now()-probeStarted)};
     } catch(error) {
-      if(!diagnostics)try{diagnostics=parseEgressProbeOutput(errorMessage(error)).diagnostics;}catch{/* A failed diagnostic cannot replace the original failure. */}
-      if(!(error instanceof EgressMismatchError))checks[index]={receiver:target.receiver,status:checkFailure(error),latencyMs:Math.round(performance.now()-probeStarted),...(diagnostics?{diagnostics}:{})};
+      for(const output of [errorMessage(error),probeOutput]){
+        if(diagnostics)break;
+        try{diagnostics=parseEgressProbeOutput(output).diagnostics;}catch{/* A failed diagnostic cannot replace the original failure. */}
+      }
+      const sshExitStatus=error instanceof SshProcessError?error.exitStatus:null;
+      if(!(error instanceof EgressMismatchError))checks[index]={receiver:target.receiver,status:checkFailure(error),latencyMs:Math.round(performance.now()-probeStarted),...(sshExitStatus!==null&&Number.isInteger(sshExitStatus)&&sshExitStatus>=0&&sshExitStatus<=255?{sshExitStatus}:{}),...(diagnostics?{diagnostics}:{})};
       // Only a clearly bounded timeout may be covered by two other fresh receipts.
-      const timedOut=error instanceof AppError&&error.code==='TIMEOUT'||/\bcurl:\s*\(28\)/.test(errorMessage(error));
+      // Windows SSH preserves the actual remote exit status. Do not accept a
+      // timeout-looking message when that status says the command failed for
+      // some other reason; arbitrary error text is not a timeout receipt.
+      const timedOut=error instanceof AppError&&error.code==='TIMEOUT'||(error instanceof SshProcessError?error.exitStatus===28&&/\bcurl:\s*\(28\)/.test(errorMessage(error)):/\bcurl:\s*\(28\)/.test(errorMessage(error)));
       if(!timedOut)rejectCritical(error);
       throw error;
-    }
+    }finally{probeOutput='';}
   });
   try {
     const outcomes=await Promise.race([Promise.allSettled(tasks),critical]);

@@ -15,6 +15,11 @@ Image $a;Image $b;Image $c;Image $d;Catalogue $a;Catalogue $b;Catalogue $d
 $original=Join-Path $root 'original-vm-disk.vhdx';[IO.File]::WriteAllText($original,'original guest bytes')
 $none=[Threading.CancellationToken]::None
 switch($Case){
+ 'allocated' {
+  $sparse=Join-Path $images ($c+'.vhdx');& "$env:SystemRoot\System32\fsutil.exe" sparse setflag $sparse 1 | Out-Null;if($LASTEXITCODE -ne 0){throw 'Sparse fixture setup failed'}
+  $stream=[IO.File]::Open($sparse,[IO.FileMode]::Open,[IO.FileAccess]::Write,[IO.FileShare]::None);try{$stream.SetLength(16MB)}finally{$stream.Dispose()}
+  $plan=$cache.Inspect($refs,$a,$blocked);Check ($plan.imageBytes -ge 16MB) 'Sparse logical file size was not reported';Check ($plan.imageAllocatedBytes -gt 0 -and $plan.imageAllocatedBytes -lt $plan.imageBytes) 'Sparse allocation must be smaller than logical size'
+ }
  'pins' {
   $temp=Join-Path $images ($a+'.vhdx.'+[guid]::NewGuid().ToString('N')+'.next');[IO.File]::WriteAllText($temp,'interrupted import')
   $plan=$cache.Inspect($refs,$a,$blocked);Check ($plan.imageCount -eq 4 -and $plan.reclaimableFiles -eq 4) 'Unexpected cache candidates';$cache.Prune($refs,$a,$blocked,$plan.plan,$none) | Out-Null

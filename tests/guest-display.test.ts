@@ -29,7 +29,7 @@ test('VNC challenge has strict inputs, no padding and deterministic legacy authe
   assert.throws(()=>vncChallenge('too-long-value',Buffer.alloc(16)));assert.throws(()=>vncChallenge('abcdefgh',Buffer.alloc(8)));
 });
 test('Display client refuses a server that offers only unauthenticated VNC',async()=>{
-  const dir=await mkdtemp(path.join(tmpdir(),'mu-vnc-test-')),socket=path.join(dir,'vnc.sock');
+  const dir=await mkdtemp(path.join(tmpdir(),'mu-vnc-test-')),socket=process.platform==='win32'?'\\\\.\\pipe\\mu-vnc-'+randomUUID():path.join(dir,'vnc.sock');
   const server=createServer(peer=>{peer.write('RFB 003.008\n');peer.once('data',()=>peer.write(Buffer.from([1,1])));});
   await new Promise<void>(r=>server.listen(socket,r));
   try{await assert.rejects(resizeVncDisplay(socket,'abcdefgh',2940,1800),/authentication required/);}

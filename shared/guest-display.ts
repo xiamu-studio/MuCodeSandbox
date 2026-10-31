@@ -28,6 +28,8 @@ export interface GuestDisplay extends DisplayRequest {
   width: number;
   height: number;
   browserScaleFactor: number;
+  densitySource?: 'xsettings';
+  nativeScaleFactor?: number;
   matched: boolean;
   screenWidth?: number;
   screenHeight?: number;

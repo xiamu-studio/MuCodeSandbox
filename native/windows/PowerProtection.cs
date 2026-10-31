@@ -12,12 +12,12 @@ public static partial class MuHyperVBroker {
         return new {session=PowerSession,monitoring=PowerGuard!=null,fenced=PowerGuard==null||PowerGuard.Fenced,issue=PowerGuard==null?"monitor-unavailable":PowerGuard.Issue,cleanupRunning=PowerCleanupRunning,stopsConfirmed=PowerStopsConfirmed};
     }
     private static void PowerTrip(){
-        try{PowerCancellation.Cancel();}catch{}foreach(var record in RecordSnapshot())try{CloseChannel(Convert.ToString(record["id"]));}catch{}
+        try{PowerCancellation.Cancel();}catch{}RevokeCompactionChannels();foreach(var record in RecordSnapshot())try{CloseChannel(Convert.ToString(record["id"]));}catch{}
         try{File.WriteAllText(Path.Combine(UserRoot,"power-trip.json"),Json().Serialize(new {session=PowerSession,time=DateTime.UtcNow.ToString("o")}));}catch{}
         if(SetupOnly||RecoveryOnly)return;
         PowerCleanupRunning=true;var cleanup=new Thread(()=>{
             while(!Closing.IsCancellationRequested){
-                bool confirmed=true;foreach(var record in RecordSnapshot())try{string id=Convert.ToString(record["id"]);lock(VmGate(id))RecoverAllocation(Owned(id));}catch{confirmed=false;}
+                bool confirmed=false;try{confirmed=SweepEmergencyStops();}catch{/* Unknown ownership/provider state never confirms a stop. */}
                 if(confirmed){PowerStopsConfirmed=true;break;}if(Closing.Token.WaitHandle.WaitOne(1000))break;
             }PowerCleanupRunning=false;
         });cleanup.IsBackground=true;cleanup.Start();

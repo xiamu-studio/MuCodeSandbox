@@ -65,7 +65,7 @@ print('{"ok":true}')
 export function imageClipboardSetupScript(){return `set -eu
 systemctl is-active --quiet mucodesandbox-display.service
 sudo systemctl stop mucodesandbox-clipboard.service 'mucodesandbox-image-clipboard@*.service' mucodesandbox-image-clipboard.socket 2>/dev/null || true
-sudo python3 - <<'MU_IMAGE_DIRECTORY'
+sudo /usr/bin/python3 -I - <<'MU_IMAGE_DIRECTORY'
 import os,pathlib,pwd,stat
 p=pathlib.Path('/run/mucodesandbox-clipboard');uid=pwd.getpwnam('dev').pw_uid
 if p.is_symlink():raise ValueError('Invalid clipboard directory')

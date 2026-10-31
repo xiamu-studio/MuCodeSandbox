@@ -1,14 +1,31 @@
 import type {Environment} from '../../../shared/types.ts';
 import {shellQuote,linuxLocales} from '../../network-guard.ts';
 import {GUEST_AUDIO_LAUNCHER_START,GUEST_AUDIO_ENV} from '../../guest-audio.ts';
-import {WINDOWS_CHROME,WINDOWS_DISPLAY,WINDOWS_CHROME_ROOT,WINDOWS_CHROME_EXECUTABLE,WINDOWS_DISPLAY_ROOT,WINDOWS_DISPLAY_EXECUTABLE} from './browser-assets.ts';
+import {WINDOWS_CHROME,WINDOWS_DISPLAY,WINDOWS_DISPLAY_ROOT,WINDOWS_DISPLAY_EXECUTABLE} from './browser-assets.ts';
+import {windowsBrowserProfileAdmit,windowsBrowserProfileHelpers} from './browser-profile.ts';
+import {approvedWindowsBrowserRelease,windowsBrowserReleaseRoot} from './browser-releases.ts';
+import {WINDOWS_BROWSER_SELECTION_HELPERS} from './browser-selection.ts';
+import {WINDOWS_DESKTOP_SESSION_START} from './desktop-session.ts';
 
-export const VERIFY_WINDOWS_DESKTOP=`sudo python3 - <<'MU_COMPONENTS'
+export function verifyWindowsDesktop(version:string=WINDOWS_CHROME.version){
+ const release=approvedWindowsBrowserRelease(version);
+ return `sudo /usr/bin/python3 -I - <<'MU_COMPONENTS'
 import pathlib,json,os,stat,hashlib,subprocess
+${WINDOWS_BROWSER_SELECTION_HELPERS}
+mu_selected_version(${JSON.stringify(release.version)})
+${windowsDesktopComponentVerification(release.version)}
+mu_selected_version(${JSON.stringify(release.version)})
+print('Verified AMD64 browser and display components')
+MU_COMPONENTS
+`;
+}
+export function windowsDesktopComponentVerification(version:string){
+ const release=approvedWindowsBrowserRelease(version),browserRoot=windowsBrowserReleaseRoot(version);
+ return `import shutil
 assert subprocess.check_output(['dpkg','--print-architecture'],text=True).strip()=='amd64'
 for executable in ['xkbcomp','xauth','x11vnc','xsettingsd','openbox','wmctrl','pactl']:
- if subprocess.run(['which',executable],stdout=subprocess.DEVNULL).returncode!=0:raise RuntimeError('Missing display prerequisite: '+executable)
-for folder,expected,relative in ${JSON.stringify([[WINDOWS_CHROME_ROOT,WINDOWS_CHROME,'chrome'],[WINDOWS_DISPLAY_ROOT,WINDOWS_DISPLAY,'bin/Xvnc']])}:
+ if shutil.which(executable) is None:raise RuntimeError('Missing display prerequisite: '+executable)
+for folder,expected,relative in ${JSON.stringify([[browserRoot,release,'chrome'],[WINDOWS_DISPLAY_ROOT,WINDOWS_DISPLAY,'bin/Xvnc']])}:
  root=pathlib.Path(folder);current=pathlib.Path('/')
  for part in root.parts[1:]:
   current=current/part;info=current.lstat()
@@ -21,25 +38,27 @@ for folder,expected,relative in ${JSON.stringify([[WINDOWS_CHROME_ROOT,WINDOWS_C
  with main.open('rb') as source:
   if hashlib.file_digest(source,'sha256').hexdigest()!=value['binarySha256']:raise RuntimeError('Component executable changed')
  if relative=='bin/Xvnc' and value['binarySha256']!=expected['binarySha256']:raise RuntimeError('Unapproved display executable')
+ if 'binarySha256' in expected and value['binarySha256']!=expected['binarySha256']:raise RuntimeError('Unapproved component executable')
  if 'not found' in subprocess.check_output(['ldd',str(main)],text=True):raise RuntimeError('Missing component dependencies')
-helper=pathlib.Path('${WINDOWS_CHROME_ROOT}/chrome-sandbox');info=helper.lstat()
+helper=pathlib.Path('${browserRoot}/chrome-sandbox');info=helper.lstat()
 if not stat.S_ISREG(info.st_mode) or info.st_uid!=0 or stat.S_IMODE(info.st_mode)!=0o4755 or info.st_nlink!=1:raise RuntimeError('Unsafe browser sandbox helper')
-print('Verified AMD64 browser and display components')
-MU_COMPONENTS
-`;
+${'sandboxSha256' in release?`with helper.open('rb') as source:
+ if hashlib.file_digest(source,'sha256').hexdigest()!=${JSON.stringify(release.sandboxSha256)}:raise RuntimeError('Unapproved browser sandbox helper')`:''}
+`;}
+export const VERIFY_WINDOWS_DESKTOP=verifyWindowsDesktop();
 
-export function startWindowsDisplay(password:string,cpus:number){
+export function windowsDisplayLauncher(password:string,cpus:number,sharedSession=false){
  if(!/^[A-Za-z0-9_-]{8}$/.test(password))throw Error('Invalid VNC password');
  const threads=Math.min(4,Math.max(1,Math.floor(cpus)));
- const launcher=`#!/bin/bash
+ return `#!/bin/bash
 set -euo pipefail
 export HOME=/home/dev USER=dev LOGNAME=dev PATH=/usr/local/bin:/usr/bin:/bin DISPLAY=:99 XAUTHORITY=/run/mu-browser/Xauthority
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
 umask 077
 touch "$XAUTHORITY"; chmod 0600 "$XAUTHORITY"
 xauth -f "$XAUTHORITY" add :99 . "$(mcookie)"
-xvfb_pid= settings_pid= pulse_pid= wm_pid=
-cleanup(){ trap - EXIT TERM INT; for child in "$wm_pid" "$settings_pid" "$xvfb_pid" "$pulse_pid"; do if [ -n "$child" ]; then kill "$child" 2>/dev/null || true; fi; done; wait || true; }
+xvfb_pid= settings_pid= pulse_pid= wm_pid= bus_pid= portal_pid= portal_gtk_pid=
+cleanup(){ trap - EXIT TERM INT; for child in "$portal_pid" "$portal_gtk_pid" "$bus_pid" "$wm_pid" "$settings_pid" "$xvfb_pid" "$pulse_pid"; do if [ -n "$child" ]; then kill "$child" 2>/dev/null || true; fi; done; wait || true; }
 trap cleanup EXIT TERM INT
 printf '%s  %s\\n' '${WINDOWS_DISPLAY.binarySha256}' '${WINDOWS_DISPLAY_EXECUTABLE}' | sha256sum --check --status
 ${WINDOWS_DISPLAY_EXECUTABLE} :99 -geometry 3200x2000 -depth 24 -dpi 192 -nolisten tcp -auth "$XAUTHORITY" -noreset -interface 127.0.0.1 -rfbport 5900 -securitytypes vnc -rfbauth /run/mucodesandbox-browser-secret/vnc -alwaysshared -noclipboardrecv -noclipboardsend -noprimarysync -deferupdate 1 -nthreads ${threads} -dridir /usr/lib/x86_64-linux-gnu/dri &
@@ -53,8 +72,13 @@ openbox --sm-disable &
 wm_pid=$!
 for attempt in $(seq 1 100); do if wmctrl -m >/dev/null 2>&1; then break; fi; kill -0 "$wm_pid"; sleep .05; done
 wmctrl -m >/dev/null
-wait -n "$xvfb_pid" "$settings_pid" "$pulse_pid" "$wm_pid"
+${sharedSession?WINDOWS_DESKTOP_SESSION_START:''}
+wait -n "$xvfb_pid" "$settings_pid" "$pulse_pid" "$wm_pid"${sharedSession?' "$bus_pid" "$portal_gtk_pid" "$portal_pid"':''}
 `;
+}
+
+export function startWindowsDisplay(password:string,cpus:number,sharedSession=false){
+ const launcher=windowsDisplayLauncher(password,cpus,sharedSession);
  return `set -euo pipefail
 sudo systemctl stop mucodesandbox-browser.service mucodesandbox-display.service 2>/dev/null || true
 sudo install -d -m 0755 /usr/local/libexec
@@ -87,20 +111,29 @@ sudo -H -u dev -- env -i HOME=/home/dev PATH=/usr/bin:/bin DISPLAY=:99 XAUTHORIT
 `;
 }
 
-export function startWindowsChrome(e:Environment){
- const locale=linuxLocales[e.identity.locale];if(!locale)throw Error('Invalid browser locale');
- const command=[WINDOWS_CHROME_EXECUTABLE,'--user-data-dir=/home/dev/.local/share/mucodesandbox/browser','--no-first-run','--no-default-browser-check','--disable-dev-shm-usage','--disable-quic',
+export function windowsBrowserCommand(e:Environment,version:string){
+ const executable=windowsBrowserReleaseRoot(version)+'/chrome';
+ if(!linuxLocales[e.identity.locale])throw Error('Invalid browser locale');
+ // The application selects the startup page after protection checks. A prior
+ // protective power-off must not leave Chrome's restore prompt over that page.
+ return [executable,'--user-data-dir=/home/dev/.local/share/mucodesandbox/browser','--no-first-run','--no-default-browser-check','--hide-crash-restore-bubble','--disable-dev-shm-usage','--disable-quic',
  '--force-webrtc-ip-handling-policy=disable_non_proxied_udp','--use-gl=angle','--use-angle=gl','--ignore-gpu-blocklist','--disable-accelerated-2d-canvas','--disable-gpu-compositing',
  '--disable-background-networking','--disable-component-update','--disable-sync','--disable-default-apps','--metrics-recording-only','--disable-breakpad',
  '--disable-features=MediaRouter,OptimizationHints,Translate','--password-store=basic','--remote-debugging-address=127.0.0.1','--remote-debugging-port=9222','--window-position=0,0','--window-size=1600,1000','--start-maximized',`--lang=${e.identity.locale}`,'about:blank'];
+}
+export function startWindowsChrome(e:Environment,version:string=WINDOWS_CHROME.version){
+ const release=approvedWindowsBrowserRelease(version),browserRoot=windowsBrowserReleaseRoot(release.version),executable=browserRoot+'/chrome';
+ const locale=linuxLocales[e.identity.locale];if(!locale)throw Error('Invalid browser locale');
+ const command=windowsBrowserCommand(e,release.version);
  const launcher=`#!/bin/bash
 set -euo pipefail
 export HOME=/home/dev USER=dev LOGNAME=dev PATH=/usr/local/bin:/usr/bin:/bin DISPLAY=:99 XAUTHORITY=/run/mu-browser/Xauthority
 export TZ=${shellQuote(e.identity.timezone)} LANG=${shellQuote(locale)} LC_ALL=${shellQuote(locale)}
 export LP_NUM_THREADS=0 GALLIUM_DRIVER=llvmpipe LIBGL_ALWAYS_SOFTWARE=1 MESA_SHADER_CACHE_DISABLE=true
-export CHROME_DEVEL_SANDBOX=${shellQuote(WINDOWS_CHROME_ROOT+'/chrome-sandbox')}
+export CHROME_DEVEL_SANDBOX=${shellQuote(browserRoot+'/chrome-sandbox')}
 export PULSE_SERVER=${shellQuote(GUEST_AUDIO_ENV.PULSE_SERVER)} PULSE_COOKIE=${shellQuote(GUEST_AUDIO_ENV.PULSE_COOKIE)} PULSE_SINK=mu_browser
 unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+/usr/bin/python3 -I -c ${shellQuote(windowsBrowserProfileAdmit(release.version))}
 exec /usr/bin/dbus-run-session -- ${command.map(shellQuote).join(' ')}
 `;
  return `set -euo pipefail
@@ -109,23 +142,19 @@ sudo localedef -i ${shellQuote(locale.split('.')[0])} -f UTF-8 ${shellQuote(loca
 sudo tee /etc/apparmor.d/mucodesandbox-windows-chromium >/dev/null <<'MU_POLICY'
 abi <abi/4.0>,
 include <tunables/global>
-${WINDOWS_CHROME_EXECUTABLE} flags=(unconfined) {
+${executable} flags=(unconfined) {
  userns,
 }
 MU_POLICY
 sudo apparmor_parser -r /etc/apparmor.d/mucodesandbox-windows-chromium
 sudo -H -u dev -- python3 - <<'MU_PREFS'
 import os,pathlib,stat,json,re,uuid
+${windowsBrowserProfileHelpers(release.version)}
+mu_profile_admit()
 current=pathlib.Path('/home/dev')
 for name in ['.local','share','mucodesandbox','browser','Default']:
  current=current/name;current.mkdir(mode=0o700,exist_ok=True);info=current.lstat()
  if not stat.S_ISDIR(info.st_mode) or info.st_uid!=os.getuid():raise RuntimeError('Unsafe browser profile directory')
-record=current.parent/'Last Version'
-if record.exists() or record.is_symlink():
- info=record.lstat()
- if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_size>256 or info.st_uid!=os.getuid():raise RuntimeError('Unsafe profile version')
- version=record.read_text().strip()
- if not re.fullmatch(r'[0-9]+(?:\\.[0-9]+){3}',version) or tuple(map(int,version.split('.')))>tuple(map(int,'${WINDOWS_CHROME.version}'.split('.'))):raise RuntimeError('Newer profile requires a newer approved browser')
 file=current/'Preferences';data={}
 if file.exists() or file.is_symlink():
  info=file.lstat()
@@ -168,3 +197,16 @@ sudo systemctl start mucodesandbox-browser.service
 }
 
 export const STOP_WINDOWS_DISPLAY='sudo systemctl stop mucodesandbox-browser.service mucodesandbox-display.service';
+// Browser.close drops DevTools before Chrome necessarily finishes flushing its
+// profile. Give the managed service a short opportunity to exit on its own.
+export const STOP_WINDOWS_DISPLAY_AFTER_CLOSE=`for i in {1..20}; do
+ if ! systemctl is-active --quiet mucodesandbox-browser.service; then break; fi
+ sleep .2
+done
+${STOP_WINDOWS_DISPLAY}`;
+export const STOP_WINDOWS_CHROME=`set -euo pipefail
+sudo -n systemctl stop mucodesandbox-browser.service
+state=$(systemctl show mucodesandbox-browser.service --property=ActiveState --value)
+case "$state" in inactive|failed) ;; *) exit 1;; esac
+test "$(systemctl show mucodesandbox-browser.service --property=MainPID --value)" = 0
+`;

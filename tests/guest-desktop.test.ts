@@ -14,6 +14,7 @@ import type {Environment} from '../shared/types.ts';
 
 const browser={native:false,available:async()=>true,running:()=>false,open:async()=>{},close:async()=>{},clear:async()=>{},dispose:async()=>{}};
 function env():Environment{return {...environmentSchema.parse({name:'Desktop fixture',network:{mode:'socks5',host:'127.0.0.1',port:24898,strict:true,transparent:true},identity:{locale:'en-US',timezone:'America/Los_Angeles'}}),id:randomUUID(),instanceName:'mu-desktop-fixture',state:'running',browserRunning:false,lastError:null,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString()};}
+function desktopReceipt(running=false,protectedRenderer=false){return {supported:true,apps:(['grok-bot','claude-desktop'] as const).map(id=>({id,installed:running&&id==='grok-bot',installedVersion:running&&id==='grok-bot'?'0.68.1':null,running:running&&id==='grok-bot',pid:running&&id==='grok-bot'?42:0,profile:'/home/dev/.local/share/mucodesandbox/desktop-clients/'+id,rendererProtected:running&&id==='grok-bot'?protectedRenderer:null,issue:''})),displaySharedWithBrowser:true,accountTested:false};}
 async function wait(manager:Manager,id:string){const task=manager.tasks.get(id);if(task)await task.promise;return manager.store.jobs().find(j=>j.id===id)!;}
 
 test('Desktop launch is fixed to ordinary guest identity, real locale and private data, not arbitrary commands or URLs',()=>{
@@ -31,7 +32,7 @@ test('Actual Python process inspection handles both NUL argv and Electron rewrit
 
 test('Desktop installation uses pinned official metadata and verifies copied bytes before privileged metadata changes',async()=>{
   const runtime=new LimaRuntime('/tmp/mu-desktop-test-unused'),seen:string[]=[];
-  runtime.management=async(_e,args,options)=>{if(args[0]==='python3')return JSON.stringify({supported:true,apps:[],displaySharedWithBrowser:true,accountTested:false});seen.push(options?.input??args.join(' '));return '';};
+  runtime.management=async(_e,args,options)=>{if(args[0]==='python3')return JSON.stringify(desktopReceipt());seen.push(options?.input??args.join(' '));return '';};
   runtime.guest=async(_e,args,options)=>{seen.push(options?.input??args.join(' '));return '';};
   await new GuestDesktop(runtime).install(env(),'claude-desktop');
   const text=seen.join('\n');assert.match(text,/--proto '=https'/);assert.match(text,/--limit-rate 2M/);assert.match(text,/--no-install-recommends/);assert.match(text,/gnome-keyring gnupg/);assert.match(text,/31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE/);assert.ok(text.includes(DESKTOP_RECIPES['claude-desktop'].sha256));assert.ok(text.indexOf('p.is_symlink()')<text.indexOf('sudo chmod 0444'));assert.ok(!text.includes('sudo chown root:root "$stage/package.deb"'));assert.ok(text.includes('rm -f /home/dev/.cache/mucodesandbox-desktop/claude-desktop.deb'));
@@ -39,8 +40,8 @@ test('Desktop installation uses pinned official metadata and verifies copied byt
 
 test('Desktop renderer protection rejects an unsafe managed client and stops monitoring a normally closed client',async()=>{
   const runtime=new LimaRuntime('/tmp/mu-desktop-test-unused'),desktop=new GuestDesktop(runtime),e=env();desktop.tracked.add(e.id);
-  runtime.management=async()=>JSON.stringify({apps:[{id:'grok-bot',running:true,rendererProtected:false}]});await assert.rejects(desktop.assertProtected(e),/渲染保护未通过/);
-  runtime.management=async()=>JSON.stringify({apps:[{id:'grok-bot',running:false}]});await desktop.assertProtected(e);assert.ok(!desktop.tracked.has(e.id));
+  runtime.management=async()=>JSON.stringify(desktopReceipt(true,false));await assert.rejects(desktop.assertProtected(e),/渲染保护未通过/);
+  runtime.management=async()=>JSON.stringify(desktopReceipt());await desktop.assertProtected(e);assert.ok(!desktop.tracked.has(e.id));
 });
 
 test('Clean rebuild deletes the full VM and owned restore/snapshot copies, creates a new ID and never carries shares or client data',async()=>{

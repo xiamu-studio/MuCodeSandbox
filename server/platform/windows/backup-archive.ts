@@ -6,14 +6,23 @@ import {z} from 'zod';
 import {environmentSchema} from '../../validation.ts';
 import {AppError} from '../../errors.ts';
 
-const magic=Buffer.from('MUCWIN01'),headerBytes=32,tagBytes=16,chunkBytes=1024*1024,manifestBytes=64*1024;
+const magic=Buffer.from('MUCWIN01'),headerBytes=32,tagBytes=16,chunkBytes=1024*1024,manifestBytes=12*1024*1024;
 const passwordSchema=z.string().min(12).max(256);
-export const windowsBackupManifest=z.object({
+const commonManifest=z.object({
  version:z.literal(1),architecture:z.literal('x86_64'),platform:z.literal('hyperv'),
  config:environmentSchema.refine(value=>value.kind==='vm'&&value.cpus<=16&&value.memoryGiB>=2&&value.memoryGiB<=32&&value.diskGiB>=16&&value.diskGiB<=256&&value.mounts.length===0&&value.ports.length===0&&value.network.strict&&value.network.transparent&&!!value.network.egressLock&&['http','https','socks5'].includes(value.network.mode)&&!value.network.tls?.certificate,'Unsupported Windows backup configuration'),
  imageSha256:z.string().regex(/^[a-f0-9]{64}$/),
  disk:z.object({bytes:z.number().int().positive().max(260*2**30).safe(),sha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict(),
-}).strict().refine(value=>{const virtual=value.config.diskGiB*2**30;return value.disk.bytes<=virtual+Math.max(64*2**20,Math.floor(virtual/100));},'Disk file exceeds its declared virtual capacity and format allowance');
+}).strict();
+const canonicalId=z.uuid().refine(value=>value===value.toLowerCase()&&value!=='00000000-0000-0000-0000-000000000000');
+export const windowsBackupConfiguration=commonManifest.shape.config;
+export const windowsBackupIdentity=z.object({id:canonicalId,managementPrivate:z.string().min(1).max(32768),managementPublic:z.string().min(1).max(16384),hostPrivate:z.string().min(1).max(32768),hostPublic:z.string().min(1).max(16384),knownHosts:z.string().min(1).max(16384),seed:z.object({base64:z.string().min(1).max(Math.ceil(8*2**20/3)*4),sha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict()}).strict().refine(value=>{
+ const seed=Buffer.from(value.seed.base64,'base64');try{return seed.toString('base64')===value.seed.base64&&seed.length>=32774&&seed.length<=8*2**20&&seed.subarray(32769,32774).toString('ascii')==='CD001'&&createHash('sha256').update(seed).digest('hex')===value.seed.sha256;}finally{seed.fill(0);}
+},'Original seed is incomplete or its checksum changed');
+const restorableManifest=commonManifest.extend({version:z.literal(2),identity:windowsBackupIdentity});
+export const windowsBackupManifest=z.discriminatedUnion('version',[commonManifest,restorableManifest]).refine(value=>{const virtual=value.config.diskGiB*2**30;return value.disk.bytes<=virtual+Math.max(64*2**20,Math.floor(virtual/100));},'Disk file exceeds its declared virtual capacity and format allowance');
+export const restorableWindowsBackupManifest=restorableManifest.refine(value=>{const virtual=value.config.diskGiB*2**30;return value.disk.bytes<=virtual+Math.max(64*2**20,Math.floor(virtual/100));},'Disk file exceeds its declared virtual capacity and format allowance');
+export type RestorableWindowsBackupManifest=z.infer<typeof restorableManifest>;
 export type WindowsBackupManifest=z.infer<typeof windowsBackupManifest>;
 export interface BackupSink {write:(bytes:Uint8Array)=>Promise<void>}
 type Input=AsyncIterable<Uint8Array>;
@@ -77,8 +86,8 @@ export async function writeWindowsBackupArchive(output:BackupSink,source:Input,m
 
 // A successful return is the publication boundary. Until then, the caller must
 // retain only a disposable private staging file and must not register/start it.
-export async function readWindowsBackupArchive(input:Input,output:BackupSink,password:string,signal?:AbortSignal):Promise<WindowsBackupManifest>{
- passwordSchema.parse(password);const reader=new Reader(input,signal);let key:Buffer|undefined;
+export async function readWindowsBackupArchive(input:Input,output:BackupSink,password:string,signal?:AbortSignal,inspectManifest?:(value:WindowsBackupManifest)=>Promise<void>):Promise<WindowsBackupManifest>{
+ passwordSchema.parse(password);const reader=new Reader(input,signal);let key:Buffer|undefined,failed=false;
  try{
   const header=(await reader.read(headerBytes))!;if(!header.subarray(0,8).equals(magic))throw integrity();
   key=await derive(password,header.subarray(8,24));aborted(signal);
@@ -97,7 +106,7 @@ export async function readWindowsBackupArchive(input:Input,output:BackupSink,pas
    index++;
    try{
     aborted(signal);
-    if(type===1){try{manifest=windowsBackupManifest.parse(JSON.parse(plain.toString('utf8')));}catch{throw integrity();}}
+    if(type===1){try{manifest=windowsBackupManifest.parse(JSON.parse(plain.toString('utf8')));}catch{throw integrity();}if(inspectManifest)await inspectManifest(manifest);aborted(signal);}
     else if(type===2){total+=plain.length;hash.update(plain);await output.write(plain);aborted(signal);}
     else{
      const digest=hash.digest();
@@ -106,5 +115,5 @@ export async function readWindowsBackupArchive(input:Input,output:BackupSink,pas
     }
    }finally{plain.fill(0);}
   }
- }finally{key?.fill(0);await reader.close();}
+ }catch(error){failed=true;throw error;}finally{key?.fill(0);try{await reader.close();}catch(error){if(!failed)throw error;}}
 }

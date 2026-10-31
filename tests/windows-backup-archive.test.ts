@@ -95,3 +95,14 @@ test('Windows backup permits VHDX format overhead while bounding both virtual ca
  assert.throws(()=>windowsBackupManifest.parse({...f.manifest,disk:{...f.manifest.disk,bytes:40*2**30}}));
  assert.throws(()=>windowsBackupManifest.parse({...f.manifest,config:{...f.manifest.config,diskGiB:256},disk:{...f.manifest.disk,bytes:maximum+1}}));
 });
+
+
+test('Archive input close failures cannot hide the original restore failure or publish a successful read',async()=>{
+ const f=fixture(512),encrypted=await encode(f.disk,f.manifest),closeError=new Error('synthetic input close failed');
+ const source=()=>({[Symbol.asyncIterator](){let done=false;return {next:async()=>done?{done:true as const,value:undefined}:(done=true,{done:false as const,value:encrypted}),return:async()=>{throw closeError;}};}});
+ await assert.rejects(readWindowsBackupArchive(source(),sink(),'incorrect-synthetic-password'),{code:'WINDOWS_BACKUP_INTEGRITY'});
+ const diskError=new Error('synthetic restore disk full');
+ await assert.rejects(readWindowsBackupArchive(source(),{write:async()=>{throw diskError;}},password),error=>error===diskError);
+ const abort=new AbortController();abort.abort();await assert.rejects(readWindowsBackupArchive(source(),sink(),password,abort.signal),{name:'AbortError'});
+ await assert.rejects(readWindowsBackupArchive(source(),sink(),password),error=>error===closeError);
+});

@@ -5,16 +5,18 @@ public sealed class MuStorageException:IOException {
     public MuStorageException(string code,string message):base(message){Code=code;}
 }
 public sealed class MuCacheView {
-    public long imageBytes,temporaryBytes,catalogueBytes,reclaimableBytes,retainedBytes;
+    public long imageBytes,imageAllocatedBytes,temporaryBytes,catalogueBytes,reclaimableBytes,retainedBytes;
     public int imageCount,reclaimableFiles,unrecognizedEntries;
     public string plan;
 }
 public sealed class MuImageCache {
     private readonly string root,sid;
     private readonly Action<string> validate;
-    private sealed class Entry {public string Path,Name,Digest,Identity;public long Bytes;public int Kind;}
+    private sealed class Entry {public string Path,Name,Digest,Identity;public long Bytes,AllocatedBytes;public int Kind;}
     private sealed class Plan {public MuCacheView View;public List<Entry> Delete;}
     [DllImport("kernel32.dll",SetLastError=true)] private static extern bool GetFileInformationByHandle(IntPtr file,[Out]byte[] info);
+    [StructLayout(LayoutKind.Sequential)] private struct FileStandardInformation {public long AllocationSize,EndOfFile;public uint NumberOfLinks;[MarshalAs(UnmanagedType.U1)] public bool DeletePending;[MarshalAs(UnmanagedType.U1)] public bool Directory;}
+    [DllImport("kernel32.dll",SetLastError=true)] private static extern bool GetFileInformationByHandleEx(IntPtr file,int informationClass,out FileStandardInformation info,int size);
     public MuImageCache(string directory,string ownerSid,Action<string> validator){root=Path.GetFullPath(directory);sid=ownerSid;if(validator==null)throw new ArgumentNullException("validator");validate=validator;}
     private static bool Match(string value,string expression){return System.Text.RegularExpressions.Regex.IsMatch(value,expression);}
     private static bool Digest(string value){return value!=null&&Match(value,"^[a-f0-9]{64}$");}
@@ -23,8 +25,9 @@ public sealed class MuImageCache {
         using(var input=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read)){
             byte[] info=new byte[52];if(!GetFileInformationByHandle(input.SafeFileHandle.DangerousGetHandle(),info))throw new IOException("Cache identity unavailable");
             if(BitConverter.ToUInt32(info,40)!=1)throw new MuStorageException("CACHE_INTEGRITY","Cache hard links are not allowed");
+            FileStandardInformation allocation;if(!GetFileInformationByHandleEx(input.SafeFileHandle.DangerousGetHandle(),1,out allocation,Marshal.SizeOf(typeof(FileStandardInformation)))||allocation.AllocationSize<0||allocation.EndOfFile!=input.Length||allocation.NumberOfLinks!=1||allocation.DeletePending||allocation.Directory)throw new IOException("Cache allocation metric unavailable or file changed");
             string identity=BitConverter.ToUInt32(info,28)+":"+BitConverter.ToUInt32(info,44)+":"+BitConverter.ToUInt32(info,48)+":"+BitConverter.ToUInt64(info,20)+":"+input.Length;
-            return new Entry{Path=path,Name=Path.GetFileName(path),Digest=digest,Bytes=input.Length,Kind=kind,Identity=identity};
+            return new Entry{Path=path,Name=Path.GetFileName(path),Digest=digest,Bytes=input.Length,AllocatedBytes=allocation.AllocationSize,Kind=kind,Identity=identity};
         }
     }
     private void ValidateCatalogue(Entry entry){
@@ -43,7 +46,7 @@ public sealed class MuImageCache {
             foreach(string path in Directory.EnumerateFileSystemEntries(directory).OrderBy(value=>value,StringComparer.Ordinal)){
                 string name=Path.GetFileName(path);bool image=directory.EndsWith(Path.DirectorySeparatorChar+"images",StringComparison.OrdinalIgnoreCase);
                 Entry entry=null;
-                if(image&&Match(name,"^[a-f0-9]{64}\\.vhdx?$")){entry=ReadEntry(path,1,name.Substring(0,64));view.imageCount++;view.imageBytes=checked(view.imageBytes+entry.Bytes);}
+                if(image&&Match(name,"^[a-f0-9]{64}\\.vhdx?$")){entry=ReadEntry(path,1,name.Substring(0,64));view.imageCount++;view.imageBytes=checked(view.imageBytes+entry.Bytes);view.imageAllocatedBytes=checked(view.imageAllocatedBytes+entry.AllocatedBytes);}
                 else if(!image&&Match(name,"^[a-f0-9]{64}\\.json$")){entry=ReadEntry(path,0,name.Substring(0,64));ValidateCatalogue(entry);view.catalogueBytes=checked(view.catalogueBytes+entry.Bytes);if(currentBase==null)retained.Add(entry.Digest);}
                 else if(image&&Match(name,"^(?:[a-f0-9]{64}\\.vhdx?\\.[a-f0-9]{32}|base-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\\.[a-f0-9]{32})\\.next$")||!image&&Match(name,"^[a-f0-9]{64}\\.json\\.[a-f0-9]{32}\\.next$")){entry=ReadEntry(path,2,null);view.temporaryBytes=checked(view.temporaryBytes+entry.Bytes);}
                 else{view.unrecognizedEntries++;continue;}
@@ -97,7 +100,7 @@ public static partial class MuHyperVBroker {
                     if(reason!=null)throw new MuStorageException("CACHE_NOT_READY","Cache cleanup is disabled: "+reason);
                     return cache.Prune(references,currentBase,dependencies,expected,cancellation);
                 }
-                return new {imageBytes=view.imageBytes,temporaryBytes=view.temporaryBytes,catalogueBytes=view.catalogueBytes,reclaimableBytes=reason==null?view.reclaimableBytes:0,retainedBytes=reason==null?view.retainedBytes:view.imageBytes+view.temporaryBytes+view.catalogueBytes,imageCount=view.imageCount,reclaimableFiles=reason==null?view.reclaimableFiles:0,unrecognizedEntries=view.unrecognizedEntries,quotaBytes=64L*1024*1024*1024,freeBytes=MuResourceMetrics.Read(UserRoot).freeDisk,allocatedDiskGiB=allocatedGiB,unregisteredStorage=unregistered,plan=view.plan,canPrune=reason==null&&view.reclaimableFiles>0,reason=reason};
+                return new {imageBytes=view.imageBytes,imageAllocatedBytes=view.imageAllocatedBytes,temporaryBytes=view.temporaryBytes,catalogueBytes=view.catalogueBytes,reclaimableBytes=reason==null?view.reclaimableBytes:0,retainedBytes=reason==null?view.retainedBytes:view.imageBytes+view.temporaryBytes+view.catalogueBytes,imageCount=view.imageCount,reclaimableFiles=reason==null?view.reclaimableFiles:0,unrecognizedEntries=view.unrecognizedEntries,quotaBytes=64L*1024*1024*1024,freeBytes=MuResourceMetrics.Read(UserRoot).freeDisk,allocatedDiskGiB=allocatedGiB,unregisteredStorage=unregistered,plan=view.plan,canPrune=reason==null&&view.reclaimableFiles>0,reason=reason};
             }
         }finally{Monitor.Exit(ImportGate);}
     }

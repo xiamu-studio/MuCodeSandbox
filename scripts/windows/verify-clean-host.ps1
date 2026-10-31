@@ -1,6 +1,6 @@
 #Requires -RunAsAdministrator
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','upgrade-stage','upgrade-seed','upgrade-baseline','upgrade-current','upgrade-compare-current','upgrade-current-check','upgrade-baseline-next','upgrade-next','upgrade-compare-next','upgrade-next-check','upgrade-reject','upgrade-final','upgrade-inspect','upgrade-collect','power-inspect','power-discard-failed','power-clear-failed','power-prepare-reset','power-run','power-recover','power-progress','power-collect','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-backup','adoption-backup-collect','adoption-loss','adoption-review','adoption-approve','adoption-ui','adoption-ui-stage','adoption-ui-collect','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
+param([Parameter(Mandatory)][string]$Directory,[Parameter(Mandatory)][int]$OwnerPid,[Parameter(Mandatory)][ValidateSet('before-reboot','after-reboot','upgrade-stage','upgrade-seed','upgrade-baseline','upgrade-current','upgrade-compare-current','upgrade-current-check','upgrade-baseline-next','upgrade-next','upgrade-compare-next','upgrade-next-check','upgrade-reject','upgrade-final','upgrade-inspect','upgrade-collect','power-inspect','power-discard-failed','power-clear-failed','power-prepare-reset','power-run','power-recover','power-progress','power-collect','inspect','ssh-inspect','ssh-remove','ssh-source','ssh-install','ssh-ready','ssh-collect','network-inspect','network-prepare','network','network-collect','adoption-seed','adoption-backup','adoption-backup-restore','adoption-backup-cross','adoption-backup-cross-recover','adoption-backup-cross-finish','adoption-backup-cross-progress','adoption-backup-cross-collect','adoption-backup-gui','adoption-backup-gui-collect','adoption-backup-gui-progress','adoption-backup-gui-dialog-release','adoption-backup-restore-collect','adoption-backup-progress','adoption-backup-collect','adoption-loss','adoption-review','adoption-approve','adoption-ui','adoption-ui-stage','adoption-ui-collect','adoption-final','adoption-inspect','adoption-collect','resource-prepare','resource-inspect','resource-seed','resource-disk','resource-memory','resource-recover','resource-collect','cache','cache-reset','cache-inspect','cache-ui-stage','cache-ui','cache-collect','ledger-seed','ledger-logon','ledger-orphan-create','ledger-check','ledger-final','ledger-deny','ledger-primary-loss','ledger-primary-corrupt','ledger-both-loss','ledger-restore','ledger-collect','oobe','reset-hyperv','collect-stop')][string]$Phase)
 $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $directoryPath=[IO.Path]::GetFullPath($Directory)
 if([IO.Path]::GetFileName($directoryPath) -notmatch '^clean-host-[a-f0-9-]{36}$'){throw 'Dedicated clean-host fixture required'}
@@ -49,6 +49,71 @@ try{
   if(-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Synthetic guest administrator required'}
   if(-not (Test-Path -LiteralPath C:\MuLab\public\provisioned.json)){throw 'Guest bootstrap is incomplete'}
   [ordered]@{bootId=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o');hypervisor=[bool](Get-CimInstance Win32_ComputerSystem).HypervisorPresent;edition=(Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID}
+ }
+ if($Phase -eq 'adoption-backup-cross-collect'){
+  $value=Invoke-Command -Session $session -ScriptBlock {
+   $source=[IO.File]::ReadAllText('C:\MuLab\approved\adoption-backup-cross-result.json')|ConvertFrom-Json;$seed=[IO.File]::ReadAllText('C:\MuLab\approved\adoption-seed-result.json')|ConvertFrom-Json
+   if(-not $source.complete -or $source.nested.caseId -notmatch '^[a-f0-9]{32}$' -or -not $seed.complete -or $source.nested.id -ne $seed.nested.config.id){throw 'Completed source and seed results are required'}
+   $id=$source.nested.caseId;$cfg=[IO.File]::ReadAllText(('C:\MuLab\approved\backup-user-'+$id+'-config.json'))|ConvertFrom-Json;if($cfg.directory -cne ('C:\MuLab\backup-user-'+$id) -or $source.nonce.Substring(0,32) -cne $id){throw 'Cross-user collection identity changed'}
+   $conflict=[IO.File]::ReadAllText((Join-Path $cfg.directory conflict-result.json))|ConvertFrom-Json;$recovered=[IO.File]::ReadAllText((Join-Path $cfg.directory recover-result.json))|ConvertFrom-Json;$failed=[IO.File]::ReadAllText((Join-Path $cfg.directory restore-result.json))|ConvertFrom-Json;$preboot=[IO.File]::ReadAllText(('C:\MuLab\private\backup-user-'+$id+'-preboot-audit.json'))|ConvertFrom-Json
+   if(-not $conflict.complete -or -not $recovered.complete -or $failed.complete -ne $false -or $failed.checks.Count -ne 4 -or -not $recovered.bootRead -or $recovered.nested.platformId -ne $preboot.platformId -or -not $preboot.newOwnerConfirmed -or $cfg.userSid -eq $cfg.sourceSid -or (Get-LocalUser $cfg.userName).Enabled){throw 'Cross-user target results or disabled profile proof is incomplete'}
+   if(@(Get-VM).Count -or @(Get-CimInstance Win32_Process|Where-Object{$_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1\bin\hv-broker-*.exe' -or $_.ExecutablePath -eq 'C:\MuLab\product\resources\node\node.exe'}).Count){throw 'A cross-user VM or controller/broker is still live'}
+   foreach($sid in @($cfg.sourceSid,$cfg.userSid)){$root=Join-Path $env:ProgramData ('MuCodeSandbox-HyperVBroker-v1/users/'+$sid);$primary=[IO.File]::ReadAllText((Join-Path $root vms.json));if($primary -cne [IO.File]::ReadAllText((Join-Path $root vms.backup.json)) -or @((ConvertFrom-Json $primary).records.PSObject.Properties).Count -or (Test-Path -LiteralPath (Join-Path $root ('vms/'+$cfg.config.id)))){throw 'A user allocation or protected disk remains'}}
+   $permissions=[IO.File]::ReadAllText(('C:\MuLab\private\backup-user-'+$id+'-permissions.json'))|ConvertFrom-Json;foreach($item in $permissions){if((Get-Acl -LiteralPath $item.path).Sddl -cne $item.before){throw 'Shared fixture permissions were not restored'}}
+   $preserved=[IO.File]::ReadAllText('C:\MuLab\approved\adoption-preserve-restore-source.json')|ConvertFrom-Json;if($preserved.nonce -cne $source.nonce -or (Get-FileHash -LiteralPath (Join-Path C:\MuLab\private $preserved.archive)).Hash.ToLowerInvariant() -ne $cfg.diskSha256){throw 'Independent original disk copy changed'}
+   if(Test-Path -LiteralPath ('C:\MuLab\public\backup-cross-'+$source.nonce+'.mucwin')){throw 'Source encrypted fixture remains'}
+   if(@(Get-ChildItem -LiteralPath (Join-Path $cfg.directory runtime) -Directory -Filter 'backup-work-*').Count){throw 'Target plaintext staging remains'}
+   $archive=Join-Path $cfg.directory archive.mucwin;if(Test-Path -LiteralPath $archive){$entry=Get-Item -LiteralPath $archive;if($entry.Attributes -band [IO.FileAttributes]::ReparsePoint -or [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($archive)) -cne $cfg.directory){throw 'Encrypted target fixture identity changed'};[IO.File]::Delete($archive)}
+   $hashes=@{};foreach($file in @('C:\MuLab\client.mjs','C:\MuLab\adoption-client.mjs','C:\MuLab\backup-cross-source.mjs','C:\MuLab\backup-cross-target.mjs','C:\MuLab\BackupUserStation.cs')){$hashes[$file]=(Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant()}
+   foreach($name in @('manager','service','runtime','backup-bundle','backup-archive','backup-reader','credentials','broker','setup','config','guest','session','ssh-process')){$file='C:\MuLab\product\resources\app\dist-server\server\platform\windows\'+$name+'.js';$hashes[$file]=(Get-FileHash -LiteralPath $file).Hash.ToLowerInvariant()}
+   foreach($name in @('manager','service','runtime','backup-bundle','backup-archive','backup-reader','credentials','broker','setup','config','guest','session','ssh-process')){if(-not(Test-Path -LiteralPath ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\'+$name+'.js'))){throw 'A runtime input is missing'}}
+   $pointer=[IO.File]::ReadAllText((Join-Path $env:ProgramData 'MuCodeSandbox-HyperVBroker-v1/bin/current.json'))|ConvertFrom-Json;$winlogon='HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon';if((Get-ItemProperty $winlogon).DefaultUserName -ne 'MuLabUser'){throw 'Synthetic logon identity changed'};Remove-ItemProperty -LiteralPath $winlogon -Name DefaultPassword -ErrorAction SilentlyContinue;Set-ItemProperty -LiteralPath $winlogon -Name AutoAdminLogon -Value '0' -Type String;Set-ItemProperty -LiteralPath $winlogon -Name AutoLogonCount -Value 0 -Type DWord
+   @{complete=$true;source=$source;seed=$seed;conflict=$conflict;recovered=$recovered;failedObservation=$failed;prebootAudit=$preboot;sourceHashes=$hashes;protectedBrokerSourceDigest=$pointer.sourceDigest;sourceSid=$cfg.sourceSid;targetSid=$cfg.userSid;targetDisabled=$true;sharedFixturePermissionsRestored=$true;encryptedFixturesRemoved=$true;plaintextStagingRemoved=$true;originalCopyUnchanged=$true;syntheticAutologonDisabled=$true;nestedGuestsRemaining=0;aiWebsitesVisited=0}
+  }
+  Assert-LabVM|Out-Null;Save-Probe 'cross-user-evidence-collected' $value
+  try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{};Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
+  do{if((Assert-LabVM).State -eq 'Off'){Save-Probe 'cross-user-complete-and-evaluation-vm-off' $value;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown remains unconfirmed'};Start-Sleep -Seconds 2}while($true)
+ }
+ if($Phase -eq 'adoption-backup-cross-finish'){
+  $source=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-adoption-operator.ps1'));$cross=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-backup-cross-operator.ps1'))
+  $value=Invoke-Command -Session $session -ArgumentList $source,$cross -ScriptBlock {
+   param($source,$cross)
+   $owner=[IO.File]::ReadAllText('C:\MuLab\public\adoption-backup-cross-owner.json')|ConvertFrom-Json;if($owner.nonce -notmatch '^[a-f0-9]{64}$' -or -not(Get-Process -Id $owner.pid -ErrorAction SilentlyContinue)){throw 'The original source controller is not live'}
+   foreach($action in @('verify-preserved-source','cross-final')){
+    $file='C:\MuLab\public\adoption-'+$action+'-request.json';$until=[DateTime]::UtcNow.AddMinutes(3)
+    do{$request=$null;if(Test-Path -LiteralPath $file){$request=[IO.File]::ReadAllText($file)|ConvertFrom-Json};if($request -and $request.nonce -ceq $owner.nonce -and $request.action -eq $action){break};if([DateTime]::UtcNow -gt $until -or -not(Get-Process -Id $owner.pid -ErrorAction SilentlyContinue)){throw 'The original source follow-up request is not available'};Start-Sleep -Milliseconds 200}while($true)
+    if($action -eq 'cross-final'){& ([ScriptBlock]::Create($cross)) -Action $action -Nonce $owner.nonce|Out-Null}else{& ([ScriptBlock]::Create($source)) -Action $action -Nonce $owner.nonce|Out-Null}
+   }
+   $until=[DateTime]::UtcNow.AddMinutes(3);do{if(Test-Path -LiteralPath C:\MuLab\public\adoption-backup-cross-result.json){$result=[IO.File]::ReadAllText('C:\MuLab\public\adoption-backup-cross-result.json')|ConvertFrom-Json;if($result.nonce -ceq $owner.nonce){if(-not$result.complete){throw 'The original source controller did not finish successfully'};[IO.File]::WriteAllText('C:\MuLab\approved\adoption-backup-cross-result.json',($result|ConvertTo-Json -Depth 16 -Compress));return $result}};if([DateTime]::UtcNow -gt $until){throw 'The original source terminal result remains pending'};Start-Sleep -Milliseconds 200}while($true)
+  }
+  Save-Probe 'cross-user-source-finished' $value;exit 0
+ }
+ if($Phase -eq 'adoption-backup-cross-recover'){
+  $nonce=Invoke-Command -Session $session -ScriptBlock {
+   $owner=[IO.File]::ReadAllText('C:\MuLab\public\adoption-backup-cross-owner.json')|ConvertFrom-Json;if($owner.nonce -notmatch '^[a-f0-9]{64}$' -or -not(Get-Process -Id $owner.pid -ErrorAction SilentlyContinue)){throw 'Original cross-user source controller is no longer live'}
+   $id=$owner.nonce.Substring(0,32);$cfg=[IO.File]::ReadAllText(('C:\MuLab\approved\backup-user-'+$id+'-config.json'))|ConvertFrom-Json;$failed=[IO.File]::ReadAllText((Join-Path $cfg.directory restore-result.json))|ConvertFrom-Json
+   if($failed.complete -ne $false -or $failed.checks.Count -ne 4 -or $failed.error.code -ne 'PROCESS_FAILED' -or (Get-Process -Id $failed.pid -ErrorAction SilentlyContinue)){throw 'Only the exact terminal post-restore observation failure may continue'}
+   $owner.nonce
+  }
+  foreach($pair in @(@('clean-host-backup-cross-target.mjs','backup-cross-target.mjs'),@('BackupUserStation.cs','BackupUserStation.cs'))){Copy-Item -LiteralPath (Join-Path $PSScriptRoot $pair[0]) -Destination ('C:\MuLab\'+$pair[1]) -ToSession $session -Force}
+  $operator=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-backup-cross-operator.ps1'))
+  $value=Invoke-Command -Session $session -ArgumentList $nonce,$operator -ScriptBlock {
+   param($nonce,$operator)
+   $id=$nonce.Substring(0,32);$file='C:\MuLab\approved\backup-user-'+$id+'-config.json';$cfg=[IO.File]::ReadAllText($file)|ConvertFrom-Json;if($cfg.directory -cne ('C:\MuLab\backup-user-'+$id)){throw 'Cross-user recovery directory changed'};$old=[IO.File]::ReadAllText(('C:\MuLab\approved\backup-user-'+$id+'-audit.json'))|ConvertFrom-Json;$vm=Get-VM -Id ([guid]$old.platformId);$disk=Join-Path $env:ProgramData ('MuCodeSandbox-HyperVBroker-v1/users/'+$cfg.userSid+'/vms/'+$cfg.config.id+'/disk.vhdx');$drives=@(Get-VMHardDiskDrive -VM $vm)
+   if(-not $old.newOwnerConfirmed -or $old.userSid -ne $cfg.userSid -or $vm.State -ne 'Off' -or $drives.Count -ne 1 -or [IO.Path]::GetFullPath($drives[0].Path) -cne $disk){throw 'The existing stopped target allocation changed'}
+   $preserved='C:\MuLab\private\backup-user-'+$id+'-preboot-audit.json'
+   if(Test-Path -LiteralPath $preserved){
+    $failed=[IO.File]::ReadAllText((Join-Path $cfg.directory recover-result.json))|ConvertFrom-Json;if($failed.complete -ne $false -or $failed.bootRead -ne $false -or $failed.checks.Count -notin @(3,4) -or $failed.error.code -ne 'ERR_ASSERTION' -or (Get-Process -Id $failed.pid -ErrorAction SilentlyContinue)){throw 'The terminal recovery observation could not be verified'}
+    if($failed.checks.Count -eq 3 -and ((Get-FileHash -LiteralPath $disk).Hash.ToLowerInvariant() -ne $cfg.recoveryDiskSha256 -or (Get-Item -LiteralPath $disk).Length -ne $cfg.recoveryDiskBytes)){throw 'The pre-boot recovery disk changed'}
+    if($failed.checks.Count -eq 4 -and ([string]$vm.Id -ne $cfg.recoveryPlatformId -or -not $old.newOwnerConfirmed -or $old.userSid -ne $cfg.userSid)){throw 'The previously booted target VM identity changed'}
+    $history='C:\MuLab\private\backup-user-'+$id+'-recover-failed-'+[guid]::NewGuid().ToString('N');[IO.Directory]::CreateDirectory($history)|Out-Null
+    foreach($name in @('recover-owner.json','recover-result.json','recover-station-out.log','recover-station-error.log','recover-broker-out.log','recover-broker-error.log','recover-audit-request.json')){$from=[IO.Path]::GetFullPath((Join-Path $cfg.directory $name));$to=[IO.Path]::GetFullPath((Join-Path $history $name));if([IO.Path]::GetDirectoryName($from) -cne $cfg.directory -or [IO.Path]::GetDirectoryName($to) -cne $history){throw 'Recovery history retention path changed'};if(Test-Path -LiteralPath $from){[IO.File]::Move($from,$to)}}
+   }else{[IO.File]::WriteAllText($preserved,($old|ConvertTo-Json -Compress))}
+   $revision=(Get-FileHash C:\MuLab\backup-cross-target.mjs).Hash.ToLowerInvariant().Substring(0,16);$launcher='C:\MuLab\approved\backup-user-'+$id+'-station-recover-'+$revision+'.exe';Add-Type -TypeDefinition ([IO.File]::ReadAllText('C:\MuLab\BackupUserStation.cs').Replace('MuBackupUserStation',('MuBackupUserStationRecover'+$revision))) -ReferencedAssemblies @('System.dll','System.Core.dll','System.Web.Extensions.dll') -OutputAssembly $launcher -OutputType ConsoleApplication
+   foreach($pair in @(@('recoveryLauncher',$launcher),@('recoveryPlatformId',[string]$vm.Id),@('recoveryDiskSha256',(Get-FileHash -LiteralPath $disk).Hash.ToLowerInvariant()),@('recoveryDiskBytes',(Get-Item -LiteralPath $disk).Length))){$cfg|Add-Member -NotePropertyName $pair[0] -NotePropertyValue $pair[1] -Force};$cfg.clientSha256=(Get-FileHash C:\MuLab\backup-cross-target.mjs).Hash.ToLowerInvariant();[IO.File]::WriteAllText($file,($cfg|ConvertTo-Json -Depth 12 -Compress))
+   & ([ScriptBlock]::Create($operator)) -Action cross-restore -Nonce $nonce -Recovery
+  }
+  Save-Probe 'existing-cross-user-restore-recovered' $value;exit 0
  }
  if($Phase -eq 'resource-prepare'){
   $result=Invoke-Command -Session $session -ScriptBlock {
@@ -110,7 +175,84 @@ try{
    do{$vm=Assert-LabVM;if($vm.State -eq 'Off'){Save-Probe 'resources-complete-and-evaluation-vm-off' $evidence;exit 0};if($clock.ElapsedMilliseconds -gt 120000){throw 'Evaluation shutdown not confirmed'};Start-Sleep -Seconds 2}while($true)
   }
  }
+ if($Phase -eq 'adoption-backup-gui-dialog-release'){
+  $image=Get-ChildItem -LiteralPath $directoryPath -File -Filter 'console-*.png'|Sort-Object LastWriteTime -Descending|Select-Object -First 1
+  if(-not $image -or $image.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-5)){throw 'A fresh independently observed VM console image is required'}
+  $guard.PinInputFile($image.FullName);$hash=(Get-FileHash -LiteralPath $image.FullName).Hash.ToLowerInvariant()
+  $value=Invoke-Command -Session $session -ArgumentList $hash -ScriptBlock {param($hash)$owner=[IO.File]::ReadAllText('C:\MuLab\public\adoption-backup-gui-owner.json')|ConvertFrom-Json;$request=[IO.File]::ReadAllText('C:\MuLab\public\backup-gui-dialog-request.json')|ConvertFrom-Json;if($request.nonce -cne $owner.nonce -or $request.action -notin @('export','restore') -or -not(Get-Process -Id $owner.pid -ErrorAction SilentlyContinue)){throw 'Native dialog owner changed'};$value=@{nonce=$owner.nonce;action=$request.action;imageSha256=$hash};[IO.File]::WriteAllText('C:\MuLab\approved\backup-gui-dialog-observed.json',($value|ConvertTo-Json -Compress));$value}
+  $value.image=$image.FullName;Save-Probe 'native-backup-dialog-observation-recorded' $value;exit 0
+ }
+ if($Phase -in @('adoption-backup-progress','adoption-backup-gui-progress','adoption-backup-cross-progress')){
+  $name=if($Phase -eq 'adoption-backup-cross-progress'){'adoption-backup-cross'}elseif($Phase -eq 'adoption-backup-gui-progress'){'adoption-backup-gui'}else{'adoption-backup-restore'}
+  $value=Invoke-Command -Session $session -ArgumentList $name -ScriptBlock {
+   param($name)
+   $owner=[IO.File]::ReadAllText(('C:\MuLab\public\'+$name+'-owner.json'))|ConvertFrom-Json
+   $p=Get-Process -Id $owner.pid -ErrorAction SilentlyContinue
+   $result=$null;$file='C:\MuLab\public\'+$name+'-result.json'
+   if(Test-Path -LiteralPath $file){$r=Get-Content -LiteralPath $file -Raw|ConvertFrom-Json;if($r.nonce -eq $owner.nonce){$result=@{complete=$r.complete;checks=$r.checks;error=$r.error}}}
+   $outputs=@(Get-ChildItem -LiteralPath C:\MuLab\public -File|Where-Object{$_.Name -match ('^(backup-restore-'+$owner.nonce+'\.mucwin|\.mucwin-partial-[a-f0-9-]{36})$')}|ForEach-Object{
+    $length=$_.Length;try{$f=[IO.File]::Open($_.FullName,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete));try{$length=$f.Length}finally{$f.Dispose()}}catch{}
+    @{name=$_.Name;bytes=$length}
+   })
+   $staging=@();$root=Join-Path C:\MuLab\public ('restored-runtime-'+$owner.nonce)
+   if(Test-Path -LiteralPath $root){$staging=@(Get-ChildItem -LiteralPath $root -Directory -Filter 'backup-work-*'|ForEach-Object{$disk=Join-Path $_.FullName disk.vhdx;if(Test-Path -LiteralPath $disk){$length=(Get-Item -LiteralPath $disk).Length;try{$f=[IO.File]::Open($disk,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete));try{$length=$f.Length}finally{$f.Dispose()}}catch{};@{bytes=$length}}})}
+   $sid=(Get-LocalUser MuLabUser).SID.Value;$registration=Get-ItemProperty -LiteralPath ('Registry::HKEY_USERS\'+$sid+'\Software\Microsoft\Windows\CurrentVersion\Uninstall\e88eb670-5944-5236-81aa-7c1d3da3d6df') -ErrorAction SilentlyContinue
+   $dialog=$null;if(Test-Path -LiteralPath C:\MuLab\public\backup-gui-dialog-request.json){$r=[IO.File]::ReadAllText('C:\MuLab\public\backup-gui-dialog-request.json')|ConvertFrom-Json;if($r.nonce -ceq $owner.nonce){$dialog=$r}}
+   $cross=$null;if($name -eq 'adoption-backup-cross'){$id=$owner.nonce.Substring(0,32);$configFile='C:\MuLab\approved\backup-user-'+$id+'-config.json';if(Test-Path -LiteralPath $configFile){$config=[IO.File]::ReadAllText($configFile)|ConvertFrom-Json;$steps=@();foreach($step in @('conflict','restore','recover')){$actor=$null;$r=$null;$ownerFile=Join-Path $config.directory ($step+'-owner.json');$resultFile=Join-Path $config.directory ($step+'-result.json');if(Test-Path -LiteralPath $ownerFile){$o=[IO.File]::ReadAllText($ownerFile)|ConvertFrom-Json;$actor=Get-Process -Id $o.pid -ErrorAction SilentlyContinue};if(Test-Path -LiteralPath $resultFile){$r=[IO.File]::ReadAllText($resultFile)|ConvertFrom-Json};$steps+=@{phase=$step;ownerAlive=[bool]$actor;cpuSeconds=$(if($actor){$actor.CPU}else{0});complete=$r.complete;error=$r.error}};$jobs=@();try{$script='const {DatabaseSync}=require("node:sqlite");const db=new DatabaseSync(process.argv[2],{readOnly:true});console.log(Buffer.from(JSON.stringify(db.prepare("SELECT action,status,message FROM jobs ORDER BY created_at DESC LIMIT 3").all())).toString("base64"));db.close();';$encoded=$script|& C:\MuLab\product\resources\node\node.exe --no-warnings - (Join-Path $config.directory app/state.sqlite);$jobs=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))|ConvertFrom-Json}catch{};$cross=@{userName=$config.userName;userSid=$config.userSid;targetEnabled=(Get-LocalUser $config.userName).Enabled;steps=$steps;jobs=$jobs}}}
+   if($cross){$permissions=[IO.File]::ReadAllText(('C:\MuLab\private\backup-user-'+$id+'-permissions.json'))|ConvertFrom-Json;$cross.permissions=@(foreach($item in $permissions){$acl=Get-Acl -LiteralPath $item.path;@{path=$item.path;restored=($acl.Sddl -ceq $item.before);expectedTemporary=($acl.Sddl -ceq $item.after);current=$acl.Sddl;before=$item.before;after=$item.after}})}
+   @{crossUser=$cross;dialogObservationRequest=$dialog;installation=@{present=[bool]$registration;version=[string]$registration.DisplayVersion;location=[string](Get-ItemProperty -LiteralPath ('Registry::HKEY_USERS\'+$sid+'\Software\e88eb670-5944-5236-81aa-7c1d3da3d6df') -ErrorAction SilentlyContinue).InstallLocation};ownerAlive=[bool]$p;cpuSeconds=$(if($p){$p.CPU}else{0});nestedVMs=@(Get-VM|Select-Object Name,@{Name='state';Expression={[string]$_.State}});outputs=$outputs;staging=$staging;result=$result}
+  }
+  Save-Probe 'backup-product-progress-inspected' $value;exit 0
+ }
  if($Phase.StartsWith('adoption-')){
+  Invoke-Command -Session $session -ScriptBlock {
+   $clock=[Diagnostics.Stopwatch]::StartNew();do{$busy=@(Get-CimInstance Win32_Process|Where-Object{$_.ExecutablePath -like 'C:\MuLab\product\*' -or $_.ExecutablePath -like '*MuCodeSandbox-HyperVBroker-v1*'});if(-not $busy.Count){break};if($clock.ElapsedMilliseconds -gt 10000){throw 'A product process is still active; inspect its original owner instead of replacing the payload'};Start-Sleep -Milliseconds 250}while($true)
+  }
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server') -Destination C:\MuLab\product\resources\app -ToSession $session -Recurse -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-backup-restore-client.mjs') -Destination C:\MuLab\backup-restore-client.mjs -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-backup-product-client.mjs') -Destination C:\MuLab\backup-product-client.mjs -ToSession $session -Force
+  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-backup-installed-client.mjs') -Destination C:\MuLab\backup-installed-client.mjs -ToSession $session -Force
+  if($Phase -eq 'adoption-backup-cross'){
+   foreach($pair in @(@('clean-host-backup-cross-source.mjs','backup-cross-source.mjs'),@('clean-host-backup-cross-target.mjs','backup-cross-target.mjs'),@('BackupUserStation.cs','BackupUserStation.cs'))){Copy-Item -LiteralPath (Join-Path $PSScriptRoot $pair[0]) -Destination ('C:\MuLab\'+$pair[1]) -ToSession $session -Force}
+  }
+  if($Phase -eq 'adoption-backup-gui'){
+   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-backup-gui-client.mjs') -Destination C:\MuLab\backup-gui-client.mjs -ToSession $session -Force
+   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'clean-host-backup-gui.cjs') -Destination C:\MuLab\backup-gui.cjs -ToSession $session -Force
+   Invoke-Command -Session $session -ScriptBlock {
+    foreach($file in @('C:\MuLab\test-tools\playwright-core\index.mjs','C:\MuLab\test-tools\electron\electron.exe')){if(-not(Test-Path -LiteralPath $file -PathType Leaf)){throw 'The previously staged graphical test tools are required'}}
+    $previous=[IO.File]::ReadAllText('C:\MuLab\approved\adoption-backup-restore-result.json')|ConvertFrom-Json;$n=$previous.nested
+    if(-not $previous.complete -or -not $n.installedProductApiExercised -or $n.installedVersion -ne '0.4.66-preview.13' -or $n.installationNonce -notmatch '^[a-f0-9]{64}$'){throw 'A completed installed backup case is required'}
+    $suffix=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('56iL5bqPIE8nQnJpZW4gJCDmtYvor5VcTXVDb2RlU2FuZGJveCBXaW5kb3dzIFByZXZpZXc='));$expected='C:\MuLab\public\backup-installed-'+$n.installationNonce+'\'+$suffix
+    if([IO.Path]::GetFullPath($n.installedDirectory) -cne $expected -or [IO.Path]::GetFullPath($n.installedApp) -cne (Join-Path $expected resources/app)){throw 'Installed graphical payload identity changed'}
+    $sid=(Get-LocalUser MuLabUser).SID.Value;$r=Get-ItemProperty -LiteralPath ('Registry::HKEY_USERS\'+$sid+'\Software\e88eb670-5944-5236-81aa-7c1d3da3d6df');if([IO.Path]::GetFullPath($r.InstallLocation) -cne $expected){throw 'Installed graphical registration changed'}
+    [IO.File]::WriteAllText('C:\MuLab\approved\backup-gui-installation.json',($n|ConvertTo-Json -Depth 8 -Compress))
+   }
+  }
+  if($Phase -eq 'adoption-backup-restore'){
+   $package=Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../.mu-data/windows-run/desktop-package.json') -Raw|ConvertFrom-Json
+   if($package.stage.release.version -ne '0.4.66-preview.13'){throw 'The exact preview.13 installer is required'}
+   $installer=@($package.artifacts|Where-Object{$_ -like '*.exe'})[0];$hash=(Get-FileHash -LiteralPath $installer).Hash.ToLowerInvariant()
+   if($hash -ne 'f4a06ae77855a2ca25f67218551b67213e85982e4edde17171d70b95cd5e3baa'){throw 'Expected preview.13 artifact changed'}
+   Copy-Item -LiteralPath $installer -Destination C:\MuLab\backup-preview13.exe -ToSession $session -Force
+   Invoke-Command -Session $session -ArgumentList $hash -ScriptBlock {
+    param($hash)
+    if((Get-FileHash -LiteralPath C:\MuLab\backup-preview13.exe).Hash.ToLowerInvariant() -ne $hash){throw 'Transferred installer changed'}
+    $meta=@{version='0.4.66-preview.13';sha256=$hash};$sid=(Get-LocalUser MuLabUser).SID.Value
+    $registration=Get-ItemProperty -LiteralPath ('Registry::HKEY_USERS\'+$sid+'\Software\Microsoft\Windows\CurrentVersion\Uninstall\e88eb670-5944-5236-81aa-7c1d3da3d6df') -ErrorAction SilentlyContinue
+    if($registration){
+     $previous=Get-Content -LiteralPath C:\MuLab\approved\adoption-backup-restore-result.json -Raw|ConvertFrom-Json
+     if($previous.complete -ne $false -or $previous.checks.Count -ne 1 -or $previous.nested -or $previous.error.code -ne 'ERR_ASSERTION' -or $previous.nonce -notmatch '^[a-f0-9]{64}$' -or (Get-Process -Id $previous.pid -ErrorAction SilentlyContinue)){throw 'Existing installation cannot be resumed from this receipt'}
+     $suffix=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('56iL5bqPIE8nQnJpZW4gJCDmtYvor5VcTXVDb2RlU2FuZGJveCBXaW5kb3dzIFByZXZpZXc='))
+     $expected="C:\MuLab\public\backup-installed-"+$previous.nonce+'\'+$suffix
+     if($registration.DisplayVersion -ne $meta.version -or [IO.Path]::GetFullPath(([string](Get-ItemProperty -LiteralPath ('Registry::HKEY_USERS\'+$sid+'\Software\e88eb670-5944-5236-81aa-7c1d3da3d6df')).InstallLocation).Trim('"')).TrimEnd('\') -cne $expected){throw 'An unrelated existing installation was preserved'}
+     $retained='C:\MuLab\private\backup-installed-failed-'+$previous.nonce+'.json'
+     if(Test-Path -LiteralPath $retained){$saved=[IO.File]::ReadAllText($retained)|ConvertFrom-Json;if($saved.nonce -cne $previous.nonce -or $saved.pid -ne $previous.pid -or $saved.complete -ne $false -or $saved.checks.Count -ne 1 -or $saved.error.code -ne 'ERR_ASSERTION'){throw 'The retained failed receipt differs; inspect before retrying'}}else{[IO.File]::WriteAllText($retained,($previous|ConvertTo-Json -Depth 16 -Compress))}
+     $meta.resumeInstallationPath=$expected.Replace('\','/');$meta.resumeInstallationNonce=$previous.nonce
+    }
+    [IO.File]::WriteAllText('C:\MuLab\approved\backup-installer.json',($meta|ConvertTo-Json -Compress))
+   }
+  }
+  foreach($name in @('backup-bundle.js','runtime.js','recovery-candidates.js')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../dist-server/server/platform/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\server\platform\windows\'+$name) -ToSession $session -Force}
   $operatorSource=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-adoption-operator.ps1'))
   if($Phase -eq 'adoption-inspect'){
    $value=Invoke-Command -Session $session -ScriptBlock {@{vms=@(Get-VM|Select-Object Name,@{Name='state';Expression={[string]$_.State}});clients=@(Get-CimInstance Win32_Process -Filter "Name='node.exe'"|Where-Object{$_.CommandLine -like '*client.mjs*adoption-*'}|Select-Object ProcessId,CreationDate);results=@(Get-ChildItem -LiteralPath C:\MuLab\public -File -Filter 'adoption-*-result.json'|ForEach-Object{Get-Content -LiteralPath $_.FullName -Raw|ConvertFrom-Json});errors=@(Get-ChildItem -LiteralPath C:\MuLab\private -File -Filter 'adoption-*-broker-stderr.log'|ForEach-Object{@{name=$_.Name;bytes=$_.Length;text=$(if($_.Length){try{Get-Content -LiteralPath $_.FullName -Raw}catch{'log is still open by a running process'}}else{''})}})}}
@@ -120,10 +262,11 @@ try{
    Save-Probe 'adoption-progress-inspected' $value;exit 0
   }
   if($Phase -eq 'adoption-loss'){$value=Invoke-Command -Session $session -ArgumentList $operatorSource -ScriptBlock {param($source) & ([ScriptBlock]::Create($source)) -Action loss};Save-Probe 'synthetic-copies-removed-for-explicit-adoption' $value;exit 0}
-  if($Phase -in @('adoption-collect','adoption-ui-collect','adoption-backup-collect')){
-   $action=if($Phase -eq 'adoption-backup-collect'){'collect-backup'}elseif($Phase -eq 'adoption-ui-collect'){'collect-ui'}else{'collect'}
+  if($Phase -in @('adoption-collect','adoption-ui-collect','adoption-backup-collect','adoption-backup-restore-collect','adoption-backup-gui-collect')){
+   $action=if($Phase -eq 'adoption-backup-gui-collect'){'collect-backup-gui'}elseif($Phase -eq 'adoption-backup-restore-collect'){'collect-restore'}elseif($Phase -eq 'adoption-backup-collect'){'collect-backup'}elseif($Phase -eq 'adoption-ui-collect'){'collect-ui'}else{'collect'}
    $value=Invoke-Command -Session $session -ArgumentList $operatorSource,$action -ScriptBlock {param($source,$action) & ([ScriptBlock]::Create($source)) -Action $action}
    if($Phase -eq 'adoption-ui-collect'){$screenshot=$guard.Reserve(('recovery-ui-'+[guid]::NewGuid().ToString('N')+'.png'));Copy-Item -LiteralPath C:\MuLab\public\adoption-ui.png -Destination $screenshot -FromSession $session -Force;$value.screenshot=$screenshot}
+   if($Phase -eq 'adoption-backup-gui-collect'){$screenshot=$guard.Reserve(('backup-gui-review-'+[guid]::NewGuid().ToString('N')+'.png'));Copy-Item -LiteralPath C:\MuLab\public\backup-gui-review.png -Destination $screenshot -FromSession $session -Force;$value.screenshot=$screenshot}
    Assert-LabVM | Out-Null;Save-Probe 'adoption-evidence-collected' $value
    try{Invoke-Command -Session $session -ScriptBlock {Stop-Computer -Force}}catch [System.Management.Automation.Remoting.PSRemotingTransportException]{}
    Remove-PSSession $session -ErrorAction SilentlyContinue;$session=$null;$clock=[Diagnostics.Stopwatch]::StartNew()
@@ -431,7 +574,7 @@ try{
  if($Phase.StartsWith('ledger-') -or $Phase.StartsWith('resource-') -or $Phase.StartsWith('adoption-') -or $Phase.StartsWith('power-') -or $Phase -in @('cache','cache-ui')){
   # The broker digest covers its full compilation recipe, including helpers
   # unused by the current phase. Never retain older digest inputs by omission.
-  foreach($name in @('HyperVBroker.cs','SealedBases.cs','HostComponents.cs','ProtectedLedger.cs','ImageCache.cs','ResourceMetrics.cs','Resources.cs','DiskGrowth.cs','BackupRead.cs','BackupCursor.cs','Recovery.cs','RecoveryPermissions.cs','PowerWatch.cs','PowerProtection.cs','HyperVChannel.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
+  foreach($name in @('HyperVBroker.cs','SealedBases.cs','HostComponents.cs','ProtectedLedger.cs','ImageCache.cs','ResourceMetrics.cs','Resources.cs','DiskGrowth.cs','BackupRead.cs','BackupRestore.cs','BackupCursor.cs','Recovery.cs','RecoveryPermissions.cs','PowerWatch.cs','PowerProtection.cs','HyperVChannel.cs','RuntimeMetadataCleanup.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
   foreach($name in @('hyperv.ps1','host-components.ps1','build-channel.ps1','build-broker.ps1','install-broker.ps1')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination ('C:\MuLab\product\resources\app\dist-server\scripts\windows\'+$name) -ToSession $session -Force}
   $sourcePackage=Get-Content -LiteralPath (Join-Path $PSScriptRoot '../../.mu-data/windows-run/desktop-package.json') -Raw|ConvertFrom-Json
   if($sourcePackage.stage.release){
@@ -444,7 +587,7 @@ try{
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ProtectedLedger.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ProtectedLedger.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/HostComponents.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\HostComponents.cs -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../native/windows/ImageCache.cs') -Destination C:\MuLab\product\resources\app\dist-server\native\windows\ImageCache.cs -ToSession $session -Force
-  foreach($name in @('ResourceMetrics.cs','Resources.cs','DiskGrowth.cs','BackupRead.cs','BackupCursor.cs','Recovery.cs','RecoveryPermissions.cs','PowerWatch.cs','PowerProtection.cs','HyperVChannel.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
+  foreach($name in @('ResourceMetrics.cs','Resources.cs','DiskGrowth.cs','BackupRead.cs','BackupRestore.cs','BackupCursor.cs','Recovery.cs','RecoveryPermissions.cs','PowerWatch.cs','PowerProtection.cs','HyperVChannel.cs','RuntimeMetadataCleanup.cs')){Copy-Item -LiteralPath (Join-Path $PSScriptRoot ('../../native/windows/'+$name)) -Destination ('C:\MuLab\product\resources\app\dist-server\native\windows\'+$name) -ToSession $session -Force}
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-channel.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-channel.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'build-broker.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\build-broker.ps1 -ToSession $session -Force
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../../dist-server/server/platform/windows/broker.js') -Destination C:\MuLab\product\resources\app\dist-server\server\platform\windows\broker.js -ToSession $session -Force
@@ -464,8 +607,9 @@ try{
  Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'host-components.ps1') -Destination C:\MuLab\product\resources\app\dist-server\scripts\windows\host-components.ps1 -ToSession $session -Force
  $servicingHash=(Get-FileHash -LiteralPath (Join-Path $PSScriptRoot 'host-components.ps1') -Algorithm SHA256).Hash.ToLowerInvariant()
  Invoke-Command -Session $session -ArgumentList $servicingHash -ScriptBlock {param($hash) if(-not (Test-Path -LiteralPath C:\MuLab\private\package-original.json)){Copy-Item -LiteralPath C:\MuLab\private\package.json -Destination C:\MuLab\private\package-original.json};$m=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json;$m.hostScriptSha256=$hash;$m | ConvertTo-Json -Compress | Set-Content -LiteralPath C:\MuLab\private\package.json}
- $result=Invoke-Command -Session $session -ArgumentList $Phase,$operatorSource -ScriptBlock {
-  param($phase,$operatorSource)
+ $crossOperator=[IO.File]::ReadAllText((Join-Path $PSScriptRoot 'clean-host-backup-cross-operator.ps1'))
+ $result=Invoke-Command -Session $session -ArgumentList $Phase,$operatorSource,$crossOperator -ScriptBlock {
+  param($phase,$operatorSource,$crossOperator)
   $ErrorActionPreference='Stop';$node='C:\MuLab\product\resources\node\node.exe'
   $manifest=Get-Content -LiteralPath C:\MuLab\private\package.json -Raw | ConvertFrom-Json
   if((Get-FileHash -LiteralPath $node -Algorithm SHA256).Hash.ToLowerInvariant() -ne $manifest.nodeSha256){throw 'Packaged Node digest changed'}
@@ -564,10 +708,16 @@ await writeFile('C:/MuLab/private/artifact.json',JSON.stringify(await buildBroke
    if($phase -eq 'power-run' -and -not $handled.ContainsKey('native-pause') -and (Test-Path -LiteralPath C:\MuLab\public\power-pause-request.json)){
     $request=Get-Content -LiteralPath C:\MuLab\public\power-pause-request.json -Raw|ConvertFrom-Json;if($request.nonce -eq $nonce){& ([ScriptBlock]::Create($operatorSource)) -Action broker-pause -Nonce $nonce -OwnerPid $ownerPid|Out-Null;$handled['native-pause']=$true}
    }
-   if($phase -in @('adoption-review','adoption-approve','adoption-ui')){
-    foreach($action in @('inspect-plan','inspect-material-known-hosts','inspect-material-manifest','inspect-material-DPAPI','change-seed','restore-seed','break-acl','restore-acl','break-permissions','restore-permissions','add-dependency','remove-dependency','inspect-adopted')){
+   if($phase -in @('adoption-review','adoption-approve','adoption-ui','adoption-backup-restore','adoption-backup-gui')){
+    foreach($action in @('inspect-plan','inspect-material-known-hosts','inspect-material-manifest','inspect-material-DPAPI','change-seed','restore-seed','break-acl','restore-acl','break-permissions','restore-permissions','add-dependency','remove-dependency','inspect-adopted','preserve-restore-source','verify-preserved-source')){
      $name='adoption-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'
      if(-not $handled.ContainsKey($name) -and (Test-Path -LiteralPath $file)){$request=Get-Content -LiteralPath $file -Raw|ConvertFrom-Json;if($request.nonce -eq $nonce){if($request.action -ne $action){throw 'Unexpected adoption operator action'};& ([ScriptBlock]::Create($operatorSource)) -Action $action -Nonce $nonce|Out-Null;$handled[$name]=$true}}
+    }
+   }
+   if($phase -eq 'adoption-backup-cross'){
+    foreach($action in @('cross-prepare','cross-conflict','cross-restore','cross-final','preserve-restore-source','verify-preserved-source')){
+     $name='adoption-'+$action;$file='C:\MuLab\public\'+$name+'-request.json'
+     if(-not $handled.ContainsKey($name) -and (Test-Path -LiteralPath $file)){$request=[IO.File]::ReadAllText($file)|ConvertFrom-Json;if($request.nonce -ceq $nonce){if($request.action -ne $action){throw 'Unexpected cross-user action'};if($action.StartsWith('cross-')){& ([ScriptBlock]::Create($crossOperator)) -Action $action -Nonce $nonce|Out-Null}else{& ([ScriptBlock]::Create($operatorSource)) -Action $action -Nonce $nonce|Out-Null};$handled[$name]=$true}}
     }
    }
    if($phase -in @('cache','cache-ui')){

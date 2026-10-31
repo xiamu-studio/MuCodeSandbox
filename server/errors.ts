@@ -8,6 +8,12 @@ export class AppError extends Error {
   }
 }
 
+// Preserve the local SSH exit status without parsing arbitrary command output.
+export class SshProcessError extends AppError {
+  readonly exitStatus:number|null;
+  constructor(message:string,exitStatus:number|null) {super(message,500,'PROCESS_FAILED');this.exitStatus=exitStatus;}
+}
+
 export function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }

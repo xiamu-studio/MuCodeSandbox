@@ -1,0 +1,13 @@
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import path from 'node:path';
+import {powershellPath,powershellArgs} from '../server/platform/windows/runtime.ts';
+import {windowsRuntimeDirectory} from '../server/platform/windows/paths.ts';
+import {run} from '../server/process.ts';
+const action=process.argv[2]??'inspect';assert.ok(['run','inspect','prepare-desktop','park-desktop','start-pending-task','diagnose-export','resume-export','retry-resume','continue-restored','collect-restored'].includes(action));
+const caseId=process.argv[3];if(['diagnose-export','resume-export','retry-resume','continue-restored','collect-restored'].includes(action))assert.match(caseId??'',/^[a-f0-9]{32}$/);
+const lab=JSON.parse(await readFile('.mu-data/windows-run/clean-host-lab.json','utf8')),directory=path.resolve(lab.directory);assert.equal(path.dirname(directory),path.resolve(windowsRuntimeDirectory()));assert.match(path.basename(directory),/^clean-host-[a-f0-9-]{36}$/);
+const quote=(value:string)=>"'"+value.replaceAll("'","''")+"'",body=`& ${quote(path.resolve('scripts/windows/'+(['continue-restored','collect-restored'].includes(action)?'verify-backup-restored-continue.ps1':['resume-export','retry-resume'].includes(action)?'verify-backup-installed-resume.ps1':'verify-backup-preview14.ps1')))} -Directory ${quote(directory)} -OwnerPid ${process.pid} -Action '${action}'${['diagnose-export','resume-export','retry-resume','continue-restored','collect-restored'].includes(action)?` -CaseId '${caseId}'`:''}`,encoded=Buffer.from(body,'utf16le').toString('base64');
+console.log('preview.14 '+action+' only in the disconnected evaluation VM');
+await run(powershellPath(),powershellArgs(`$ErrorActionPreference='Stop';$p=Start-Process -FilePath ${quote(powershellPath())} -ArgumentList @('-NoProfile','-NonInteractive','-EncodedCommand','${encoded}') -WindowStyle Hidden -Verb RunAs -Wait -PassThru;if($p.ExitCode -ne 0){throw 'Inspect the preserved preview.14 probe receipt'}`),{timeoutMs:3000000,onOutput:value=>process.stdout.write(value)});
+console.log('preview.14 '+action+' completed');

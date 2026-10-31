@@ -245,38 +245,39 @@ with os.fdopen(fd,'wb') as f:
 export const inlineTranslationText=z.string().min(1).max(TRANSLATION_INPUT_LIMIT).refine(text=>text.length<=TRANSLATION_INPUT_LIMIT&&!!text.trim()&&!text.includes('\0'),`请输入最多 ${TRANSLATION_INPUT_LIMIT} 字的普通文本`);
 
 export class GuestExchange {
-  runtime:Pick<LimaRuntime,'guest'|'management'>;authorize:(id:string)=>Promise<Environment>;
+  runtime:Pick<LimaRuntime,'guest'|'management'>;authorize:(id:string,signal?:AbortSignal)=>Promise<Environment>;
   busy=new Set<string>();
   private translationSettings?:Pick<TranslationSettings,'credential'|'revision'>;
-  constructor(runtime:Pick<LimaRuntime,'guest'|'management'>,authorize:(id:string)=>Promise<Environment>,translationSettings?:Pick<TranslationSettings,'credential'|'revision'>){this.runtime=runtime;this.authorize=authorize;this.translationSettings=translationSettings;}
-  private async operation<T>(id:string,work:(e:Environment)=>Promise<T>){
+  constructor(runtime:Pick<LimaRuntime,'guest'|'management'>,authorize:(id:string,signal?:AbortSignal)=>Promise<Environment>,translationSettings?:Pick<TranslationSettings,'credential'|'revision'>){this.runtime=runtime;this.authorize=authorize;this.translationSettings=translationSettings;}
+  private async operation<T>(id:string,work:(e:Environment)=>Promise<T>,signal?:AbortSignal){
     if(this.busy.has(id))throw new AppError('当前环境正在传输，请稍后重试',409,'TRANSFER_BUSY');
+    signal?.throwIfAborted();
     this.busy.add(id);
-    try{const e=await this.authorize(id);if(e.kind!=='vm')throw new AppError('此功能只支持 Linux 环境',409);
-      const result=await work(e);const current=await this.authorize(id);if(current.updatedAt!==e.updatedAt)throw new AppError('环境已变化，传输结果不再交付',409);return result;
+    try{const e=await this.authorize(id,signal);signal?.throwIfAborted();if(e.kind!=='vm')throw new AppError('此功能只支持 Linux 环境',409);
+      const result=await work(e);signal?.throwIfAborted();const current=await this.authorize(id,signal);if(current.updatedAt!==e.updatedAt)throw new AppError('环境已变化，传输结果不再交付',409);signal?.throwIfAborted();return result;
     }finally{this.busy.delete(id);}
   }
-  private async files(e:Environment,input:object){
+  private async files(e:Environment,input:object,signal?:AbortSignal){
     // Keep the SSH command small: macOS mux fd passing can fail with EMSGSIZE
     // for a large command. The fixed program and its data both travel on stdin;
     // the guest task supervisor, user identity and network guard are unchanged.
     const bootstrap='import sys,json; exec(compile(json.loads(sys.stdin.buffer.readline()), "<mu-file-transfer>", "exec"))';
-    try{return JSON.parse(await this.runtime.guest(e,['python3','-c',bootstrap],{input:JSON.stringify(FILE_EXCHANGE_PYTHON)+'\n'+JSON.stringify(input),timeoutMs:120000,maxBytes:TRANSFER_MAX_BYTES*2,onOutput:undefined}));}
-    catch(error){if(String(error).includes('MU_TRANSFER_FILE_CHANGED'))throw new AppError('文件已更新，请刷新列表后重新下载。',409,'TRANSFER_FILE_CHANGED');throw new AppError('文件传输未完成：文件夹可能已移动，或文件大小/权限不符合要求，请刷新重试。',409,'FILE_TRANSFER_FAILED');}
+    try{return JSON.parse(await this.runtime.guest(e,['python3','-c',bootstrap],{input:JSON.stringify(FILE_EXCHANGE_PYTHON)+'\n'+JSON.stringify(input),signal,timeoutMs:120000,maxBytes:TRANSFER_MAX_BYTES*2,onOutput:undefined}));}
+    catch(error){signal?.throwIfAborted();if(String(error).includes('MU_TRANSFER_FILE_CHANGED'))throw new AppError('文件已更新，请刷新列表后重新下载。',409,'TRANSFER_FILE_CHANGED');throw new AppError('文件传输未完成：文件夹可能已移动，或文件大小/权限不符合要求，请刷新重试。',409,'FILE_TRANSFER_FAILED');}
   }
   list(id:string):Promise<TransferFile[]>{return this.operation(id,e=>this.files(e,{action:'list'}));}
-  listPage(id:string,cursor?:string):Promise<TransferFilePage>{
+  listPage(id:string,cursor?:string,signal?:AbortSignal):Promise<TransferFilePage>{
     let after:unknown=null;
     if(cursor!==undefined){
       try{after=z.tuple([z.string().regex(/^-?\d{1,25}$/),transferZone,transferName]).parse(JSON.parse(z.string().max(1024).parse(cursor)));}
       catch{throw new AppError('文件列表位置无效，请刷新文件后重试',400,'INVALID_TRANSFER_CURSOR');}
     }
-    return this.operation(id,e=>this.files(e,{action:'list',paged:true,cursor:after}));
+    return this.operation(id,e=>{signal?.throwIfAborted();return this.files(e,{action:'list',paged:true,cursor:after},signal);},signal);
   }
-  listDirectory(id:string,zone:string,relativePath='',cursor?:string):Promise<TransferFilePage>{
+  listDirectory(id:string,zone:string,relativePath='',cursor?:string,signal?:AbortSignal):Promise<TransferFilePage>{
     transferZone.parse(zone);transferPath.parse(relativePath);let after:unknown=null;
     if(cursor!==undefined){try{const value=z.tuple([transferZone,transferPath,z.union([z.literal(0),z.literal(1)]),z.string().regex(/^-?\d{1,25}$/),transferName]).parse(JSON.parse(z.string().max(4096).parse(cursor)));if(value[0]!==zone||value[1]!==relativePath)throw Error();after=value;}catch{throw new AppError('文件夹位置已变化，请刷新文件后重试',400,'INVALID_TRANSFER_CURSOR');}}
-    return this.operation(id,e=>this.files(e,{action:'browse',zone,path:relativePath,cursor:after}));
+    return this.operation(id,e=>{signal?.throwIfAborted();return this.files(e,{action:'browse',zone,path:relativePath,cursor:after},signal);},signal);
   }
   upload(id:string,name:string,data:Buffer,signal?:AbortSignal):Promise<SavedTransferFile>{
     transferName.parse(name);if(data.length>TRANSFER_MAX_BYTES)throw new AppError('单个文件最多150 MiB',413);
@@ -285,7 +286,7 @@ export class GuestExchange {
       const inputBytes=Buffer.concat([header,data]);
       try{return JSON.parse(await this.runtime.guest(e,['python3','-c','import sys,json; exec(compile(json.loads(sys.stdin.buffer.readline()), "<mu-file-transfer>", "exec"))'],{inputBytes,signal,timeoutMs:120000,maxBytes:10000,onOutput:undefined}));}
       catch{throw new AppError('文件尚未确认保存到沙箱，请检查连接后重试。',409,'FILE_TRANSFER_FAILED');}
-    });
+    },signal);
   }
   moveToDownloads(id:string,zone:string,name:string,relativePath='',revision?:string):Promise<SavedTransferFile>{
     transferZone.parse(zone);transferName.parse(name);transferPath.parse(relativePath);if(revision!==undefined)transferRevision.parse(revision);
@@ -293,11 +294,12 @@ export class GuestExchange {
     return this.operation(id,e=>this.files(e,{action:'move',zone,name,path:relativePath,revision}));
   }
   projects(id:string):Promise<SharedTransferDirectory[]>{return this.operation(id,async e=>e.mounts.map(m=>({id:m.id,guestPath:m.guestPath,writable:m.writable})));}
-  openFolder(id:string,input:{zone?:string;path?:string;projectId?:string}){return this.operation(id,async e=>{
+  openFolder(id:string,input:{zone?:string;path?:string;projectId?:string},ownership?:{unit:string}){return this.operation(id,async e=>{
+    const unit=ownership?.unit??'mucodesandbox-file-manager-'+randomUUID();
+    if(!/^mucodesandbox-file-manager-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(unit))throw new AppError('文件画面凭据无效',400,'FILE_DISPLAY_INVALID');
     let target:string;
     if(input.projectId){const project=e.mounts.find(m=>m.id===input.projectId);if(!project)throw new AppError('此项目目录尚未共享给当前沙箱',400,'TRANSFER_PROJECT_INVALID');const mounts=parseSharedMountInspection(await this.runtime.management(e,['bash','-s'],{input:inspectSharedMountsScript(e),timeoutMs:10000,onOutput:undefined}));if(mounts.issues.length)throw new AppError('项目目录挂载未通过检查，请保留配置并重新核验环境',409,'TRANSFER_PROJECT_UNAVAILABLE');target=project.guestPath;}
     else {const zone=transferZone.parse(input.zone),relative=transferPath.parse(input.path??'');target=(await this.files(e,{action:'folder',zone,path:relative})).path;}
-    const unit='mucodesandbox-file-manager-'+randomUUID();
     try {
     await this.runtime.management(e,['systemctl','is-active','--quiet','mucodesandbox-display.service'],{timeoutMs:4000,maxBytes:1000,onOutput:undefined});
     await this.runtime.management(e,['sudo','systemd-run','--quiet','--collect','--property=Type=exec','--unit='+unit,'--property=User=dev','--property=Group=dev','--property=BindsTo=mucodesandbox-display.service','--property=After=mucodesandbox-display.service','--property=KillMode=control-group','--property=UMask=0077','/usr/bin/env','-i','HOME=/home/dev','PATH=/usr/bin:/bin','DISPLAY=:99','XAUTHORITY=/run/mu-browser/Xauthority','/usr/local/bin/mu-proxy-run','/usr/bin/dbus-run-session','--','/usr/bin/thunar',target],{timeoutMs:10000,maxBytes:4000,onOutput:undefined});
@@ -306,23 +308,28 @@ export class GuestExchange {
     return {ok:true,path:target};
   });}
 
-  download(id:string,zone:string,name:string,relativePath='',revision?:string){transferZone.parse(zone);transferName.parse(name);transferPath.parse(relativePath);if(revision!==undefined)transferRevision.parse(revision);return this.operation(id,async e=>Buffer.from((await this.files(e,{action:'download',zone,name,path:relativePath,revision})).data,'base64'));}
-  translate(id:string,text:string,direction:TranslationDirection='auto'){inlineTranslationText.parse(text);return this.operation(id,async e=>{
+  download(id:string,zone:string,name:string,relativePath='',revision?:string,signal?:AbortSignal){
+    transferZone.parse(zone);transferName.parse(name);transferPath.parse(relativePath);if(revision!==undefined)transferRevision.parse(revision);
+    return this.operation(id,async e=>{signal?.throwIfAborted();const result=await this.files(e,{action:'download',zone,name,path:relativePath,revision},signal);signal?.throwIfAborted();return Buffer.from(result.data,'base64');},signal);
+  }
+  translate(id:string,text:string,direction:TranslationDirection='auto',signal?:AbortSignal){inlineTranslationText.parse(text);return this.operation(id,async e=>{
     if(!this.translationSettings)throw new AppError('请先在翻译设置中填写 DeepSeek API Key。',409,'TRANSLATION_KEY_REQUIRED');
     const credential=this.translationSettings.credential(),target=translationTarget(text,direction);
     let result:z.infer<typeof translationResult>;
     try{
       // Keep the SSH command short; program and private text both travel on stdin.
-      const raw=await this.runtime.guest(e,['python3','-c',TRANSLATE_BOOTSTRAP],{input:JSON.stringify(DEEPSEEK_TRANSLATE_PYTHON)+'\n'+JSON.stringify({text,apiKey:credential.apiKey,target,model:TRANSLATION_MODEL,prompt:TRANSLATION_PROMPT}),timeoutMs:(TRANSLATION_TIMEOUT_SECONDS+6)*1000,maxBytes:TRANSLATION_RESPONSE_BYTES,onOutput:undefined});
+      const raw=await this.runtime.guest(e,['python3','-c',TRANSLATE_BOOTSTRAP],{input:JSON.stringify(DEEPSEEK_TRANSLATE_PYTHON)+'\n'+JSON.stringify({text,apiKey:credential.apiKey,target,model:TRANSLATION_MODEL,prompt:TRANSLATION_PROMPT}),signal,timeoutMs:(TRANSLATION_TIMEOUT_SECONDS+6)*1000,maxBytes:TRANSLATION_RESPONSE_BYTES,onOutput:undefined});
       result=translationResult.parse(JSON.parse(raw));
     }catch(error){
+      if(signal?.aborted)throw new AppError('翻译已取消，原文已保留。',409,'CANCELLED');
+      if(error instanceof AppError&&error.code==='CANCELLED')throw error;
       if(error instanceof AppError&&error.code==='TIMEOUT')throw translationError('timeout');
       throw new AppError('沙箱翻译调用未完成，请重试。原文已保留。',502,'TRANSLATION_UNAVAILABLE');
     }
     if(credential.revision!==this.translationSettings.revision)throw new AppError('翻译密钥已更改，请重新翻译。原文已保留。',409,'TRANSLATION_SETTINGS_CHANGED');
     if('error' in result)throw translationError(result.error,result.httpStatus);
     return result;
-  });}
+  },signal);}
   writeClipboardImage(id:string,data:Buffer){const image=validateClipboardImage(data);return this.operation(id,async e=>{
     try{
       await this.runtime.management(e,['bash','-s'],{input:imageClipboardSetupScript(),timeoutMs:15000,onOutput:undefined});
@@ -338,7 +345,7 @@ export class GuestExchange {
     await this.runtime.management(e,['bash','-s'],{input:`set -eu
 systemctl is-active --quiet mucodesandbox-display.service
 sudo systemctl stop mucodesandbox-clipboard.service 'mucodesandbox-image-clipboard@*.service' mucodesandbox-image-clipboard.socket 2>/dev/null || true
-sudo python3 - <<'MU_CLIPBOARD_DIR'
+sudo /usr/bin/python3 -I - <<'MU_CLIPBOARD_DIR'
 import pathlib,os,pwd
 p=pathlib.Path('/run/mucodesandbox-clipboard');uid=pwd.getpwnam('dev').pw_uid
 if p.is_symlink():raise ValueError('Invalid clipboard directory')
@@ -348,9 +355,10 @@ else:
  p.mkdir(mode=0o700);os.chown(p,uid,pwd.getpwnam('dev').pw_gid)
 p.chmod(0o700)
 MU_CLIPBOARD_DIR
-`,timeoutMs:6000,onOutput:undefined});
-    await this.runtime.management(e,['sudo','-H','-u','dev','--','python3','-c',CLIPBOARD_WRITE_PYTHON],{input:JSON.stringify({text}),timeoutMs:6000,onOutput:undefined});
-    await this.runtime.management(e,['bash','-s'],{input:`set -eu
+sudo -H -u dev -- /usr/bin/python3 -I -c 'import sys,json; exec(compile(json.loads(sys.stdin.buffer.readline()), "<mu-clipboard>", "exec"))' <<'MU_CLIPBOARD_INPUT'
+${JSON.stringify(CLIPBOARD_WRITE_PYTHON)}
+${JSON.stringify({text})}
+MU_CLIPBOARD_INPUT
 sudo tee /etc/systemd/system/mucodesandbox-clipboard.service >/dev/null <<'MU_CLIPBOARD'
 [Unit]
 BindsTo=mucodesandbox-display.service
@@ -368,6 +376,6 @@ Restart=no
 MU_CLIPBOARD
 sudo systemctl daemon-reload
 sudo systemctl start mucodesandbox-clipboard.service
-`,timeoutMs:10000,onOutput:undefined});return {ok:true};
+`,timeoutMs:22000,onOutput:undefined});return {ok:true};
   });}
 }

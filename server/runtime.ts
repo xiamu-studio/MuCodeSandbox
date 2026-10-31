@@ -632,19 +632,21 @@ if sudo test -f /root/.ssh/authorized_keys; then sudo truncate -s 0 /root/.ssh/a
     const token=randomUUID(), timeoutMs=options.timeoutMs??30_000;
     if (!Number.isFinite(timeoutMs) || timeoutMs<=0 || timeoutMs>86_400_000) throw new AppError('开发任务超时时间无效',400);
     let cancellation: Promise<string>|undefined;
+    // Internal helpers must not import modules from the user's workdir. The
+    // supervised command keeps its original argv and Python import behavior.
     const cancel=()=>{
-      cancellation??=this.command(this.guestArgs(e,['python3','-c',GUEST_TASK_CANCEL,token]),{timeoutMs:8_000});
+      cancellation??=this.command(this.guestArgs(e,['/usr/bin/python3','-I','-c',GUEST_TASK_CANCEL,token]),{timeoutMs:8_000});
       // Await in finally; also handle rejection immediately while the main SSH exits.
       void cancellation.catch(()=>{});
     };
     options.signal?.addEventListener('abort',cancel,{once:true});
     try {
-      return await this.command(this.guestArgs(e,['python3','-c',GUEST_TASK_RUN,token,String(timeoutMs),...command]),options);
+      return await this.command(this.guestArgs(e,['/usr/bin/python3','-I','-c',GUEST_TASK_RUN,token,String(timeoutMs),...command]),options);
     } catch(error) {
       if(error instanceof AppError && error.code==='PROCESS_FAILED' && error.message.includes('MU_GUEST_TASK_TIMEOUT')) {
         throw new AppError('操作超时，虚拟机中的开发任务已终止',504,'TIMEOUT');
       }
-      if(error instanceof AppError && ['TIMEOUT','CANCELLED'].includes(error.code)) cancel();
+      if(error instanceof AppError && ['TIMEOUT','CANCELLED','PROCESS_OUTPUT_HANDLER_FAILED'].includes(error.code)) cancel();
       throw error;
     } finally {
       options.signal?.removeEventListener('abort',cancel);

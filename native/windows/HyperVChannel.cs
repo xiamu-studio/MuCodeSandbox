@@ -22,7 +22,23 @@ public sealed class MuHyperVEndpoint : EndPoint {
         return address;
     }
 }
+// Each fixed category retains a chance to report later failures even when
+// startup repeatedly times out. The broker independently caps persisted data.
+public sealed class MuChannelDiagnosticLimiter {
+    private readonly long[] next=new long[5];
+    public bool Allow(string code,long now) {
+        int i=code=="capacity"?0:code=="guest-connect-socket"?1:code=="guest-connect-timeout"?2:code=="guest-send-error"?3:code=="guest-recv-error"?4:-1;
+        if(i<0||now<0)return false;
+        lock(next){if(next[i]!=0&&now<next[i])return false;next[i]=now>long.MaxValue-60000?long.MaxValue:now+60000;return true;}
+    }
+}
 public static class MuHyperVChannel {
+    private static readonly MuChannelDiagnosticLimiter diagnostics=new MuChannelDiagnosticLimiter();
+    // Both pumps block for the lifetime of a connection. Pool starvation must
+    // not delay new SSH admissions; the listener's semaphore bounds threads.
+    private static void StartConnection(ThreadStart work){var worker=new Thread(work);worker.IsBackground=true;worker.Start();}
+    // Fixed event names only: never write connection contents, addresses or exception text.
+    private static void Diagnostic(string code){try{if(diagnostics.Allow(code,MuPowerWatch.Tick))Console.Error.WriteLine("MU_CHANNEL:"+code);}catch{/* Diagnostics never affect transport. */}}
     [DllImport("Ws2_32.dll")] private static extern int WSAStartup(ushort version, IntPtr data);
     [DllImport("Ws2_32.dll")] private static extern int WSACleanup();
     [DllImport("Ws2_32.dll")] private static extern IntPtr socket(int family, int type, int protocol);
@@ -32,17 +48,72 @@ public static class MuHyperVChannel {
     [DllImport("Ws2_32.dll")] private static extern int shutdown(IntPtr socket, int how);
     [DllImport("Ws2_32.dll")] private static extern int closesocket(IntPtr socket);
     [DllImport("Ws2_32.dll")] private static extern int WSAGetLastError();
+    [DllImport("Ws2_32.dll")] private static extern int ioctlsocket(IntPtr socket, int command, ref uint value);
+    [DllImport("Ws2_32.dll")] private static extern int select(int ignored, IntPtr read, IntPtr write, IntPtr error, ref TimeValue timeout);
+    [DllImport("Ws2_32.dll")] private static extern int getsockopt(IntPtr socket, int level, int option, out int value, ref int length);
+    [StructLayout(LayoutKind.Sequential)] private struct TimeValue { public int seconds; public int microseconds; }
+    private const int FIONBIO=unchecked((int)0x8004667e), WSAEWOULDBLOCK=10035, SOL_SOCKET=0xffff, SO_ERROR=0x1007;
+    private static IntPtr OneSocketSet(IntPtr value){
+        var memory=Marshal.AllocHGlobal(IntPtr.Size+IntPtr.Size);
+        try{Marshal.WriteInt32(memory,1);Marshal.WriteIntPtr(memory,IntPtr.Size,value);return memory;}
+        catch{Marshal.FreeHGlobal(memory);throw;}
+    }
+    // The calling thread owns every native operation and wait. No worker may
+    // still be in connect/recv when that owner closes or transfers its socket.
+    private static void WaitGuestSocket(IntPtr raw,bool reading,int timeoutMs){
+        if(timeoutMs<1||timeoutMs>5000)throw new ArgumentOutOfRangeException("timeoutMs");
+        IntPtr readySet=IntPtr.Zero,errorSet=IntPtr.Zero;
+        try{
+            readySet=OneSocketSet(raw);if(!reading)errorSet=OneSocketSet(raw);
+            var timeout=new TimeValue{seconds=timeoutMs/1000,microseconds=(timeoutMs%1000)*1000};
+            int ready=select(0,reading?readySet:IntPtr.Zero,reading?IntPtr.Zero:readySet,errorSet,ref timeout);
+            if(ready<0)throw new SocketException(WSAGetLastError());
+            if(ready==0)throw new IOException(reading?"Guest SSH banner was not received":"Guest channel is not ready");
+            if(!reading){
+                int socketError,length=4;
+                if(getsockopt(raw,SOL_SOCKET,SO_ERROR,out socketError,ref length)!=0)throw new SocketException(WSAGetLastError());
+                if(length!=4)throw new SocketException(10022);
+                if(socketError!=0)throw new SocketException(socketError);
+            }
+        }finally{if(readySet!=IntPtr.Zero)Marshal.FreeHGlobal(readySet);if(errorSet!=IntPtr.Zero)Marshal.FreeHGlobal(errorSet);}
+    }
+    private static IntPtr ConnectGuestSocket(IntPtr raw,byte[] address,int timeoutMs){
+        bool transferred=false;
+        try{
+            uint nonblocking=1;
+            if(ioctlsocket(raw,FIONBIO,ref nonblocking)!=0)throw new SocketException(WSAGetLastError());
+            if(connect(raw,address,address.Length)!=0){
+                int error=WSAGetLastError();if(error!=WSAEWOULDBLOCK)throw new SocketException(error);
+                WaitGuestSocket(raw,false,timeoutMs);
+            }
+            nonblocking=0;
+            if(ioctlsocket(raw,FIONBIO,ref nonblocking)!=0)throw new SocketException(WSAGetLastError());
+            transferred=true;return raw;
+        }finally{if(!transferred)closesocket(raw);}
+    }
+    private static int ReceiveGuestBanner(IntPtr raw,byte[] banner,int timeoutMs){
+        WaitGuestSocket(raw,true,timeoutMs);
+        int count=recv(raw,banner,banner.Length,0);
+        if(count<0)throw new SocketException(WSAGetLastError());
+        if(count==0)throw new IOException("Guest SSH banner was not received");
+        return count;
+    }
     private static IntPtr OpenGuest(Guid vm) {
-        var raw = socket(34, 1, 1); if (raw == new IntPtr(-1)) throw new SocketException(WSAGetLastError());
         var endpoint = new MuHyperVEndpoint(vm).Serialize(); var address = new byte[36]; for (int i=0;i<36;i++) address[i]=endpoint[i];
-        int result=-1, error=0; var done=new ManualResetEvent(false);
-        var opening=new Thread(()=>{result=connect(raw,address,address.Length);if(result!=0)error=WSAGetLastError();done.Set();}); opening.IsBackground=true;opening.Start();
-        if(!done.WaitOne(5000)){closesocket(raw);throw new IOException("Guest channel is not ready");}
-        if(result!=0){closesocket(raw);throw new SocketException(error);}return raw;
+        var raw=socket(34,1,1);if(raw==new IntPtr(-1))throw new SocketException(WSAGetLastError());
+        return ConnectGuestSocket(raw,address,5000);
     }
     private sealed class Link {
-        public TcpClient Client; public IntPtr Guest=new IntPtr(-1);
-        public void Close(){try{Client.Close();}catch{}var value=Interlocked.Exchange(ref Guest,new IntPtr(-1));if(value!=new IntPtr(-1)){shutdown(value,2);closesocket(value);}}
+        public TcpClient Client;
+        private readonly object gate=new object();private IntPtr guest=new IntPtr(-1);private int users,closing;
+        public bool Closing{get{return Interlocked.CompareExchange(ref closing,0,0)!=0;}}
+        // Hold the native socket until both pump threads have left their last
+        // send/recv call. Closing a socket while another thread still uses its
+        // numeric handle permits that handle to be reused for a different socket.
+        public bool Attach(IntPtr value){lock(gate){if(Closing)return false;guest=value;users=1;return true;}}
+        public bool Reserve(){lock(gate){if(Closing||guest==new IntPtr(-1))return false;users++;return true;}}
+        public void Release(){lock(gate){if(users<=0)throw new InvalidOperationException("Channel socket ownership is invalid");users--;if(Closing&&users==0&&guest!=new IntPtr(-1)){closesocket(guest);guest=new IntPtr(-1);}}}
+        public void Close(){lock(gate){if(Interlocked.Exchange(ref closing,1)==0){try{Client.Close();}catch{}if(guest!=new IntPtr(-1))shutdown(guest,2);}if(users==0&&guest!=new IntPtr(-1)){closesocket(guest);guest=new IntPtr(-1);}}}
     }
     // The data path does not depend on OpenSSH ProxyCommand handle inheritance.
     // Only the exact VM is reachable and no IP-network fallback is possible.
@@ -62,12 +133,15 @@ public static class MuHyperVChannel {
             check();listener.Start(32);
             Console.WriteLine("{\"port\":"+((IPEndPoint)listener.LocalEndpoint).Port+"}");Console.Out.Flush();
             while(!closed){TcpClient client;try{client=listener.AcceptTcpClient();}catch(SocketException){break;}
-                if(!capacity.WaitOne(0)){client.Close();continue;}var link=new Link{Client=client};lock(links){links.Add(link);}
-                ThreadPool.QueueUserWorkItem(_=>{try{
-                    check();var guest=OpenGuest(vm);lock(links){if(closed){shutdown(guest,2);closesocket(guest);throw new IOException("Transport closed");}link.Guest=guest;}check();var stream=client.GetStream();
-                    var up=new Thread(()=>{try{var b=new byte[65536];int n;while((n=stream.Read(b,0,b.Length))>0){int offset=0;var pin=GCHandle.Alloc(b,GCHandleType.Pinned);try{while(offset<n){check();int sent=send(link.Guest,IntPtr.Add(pin.AddrOfPinnedObject(),offset),n-offset,0);if(sent<=0)throw new IOException("Guest closed");offset+=sent;}}finally{pin.Free();}}}catch{}finally{link.Close();}});up.IsBackground=true;up.Start();
-                    var output=new byte[65536];int count;while((count=recv(link.Guest,output,output.Length,0))>0){check();stream.Write(output,0,count);stream.Flush();}
-                }catch{}finally{link.Close();lock(links){links.Remove(link);}capacity.Release();}});
+                if(!capacity.WaitOne(0)){Diagnostic("capacity");client.Close();continue;}var link=new Link{Client=client};lock(links){links.Add(link);}
+                try{StartConnection(()=>{bool attached=false;try{
+                    check();IntPtr guest;try{guest=OpenGuest(vm);}catch(SocketException){Diagnostic("guest-connect-socket");throw;}catch(IOException){Diagnostic("guest-connect-timeout");throw;}lock(links){if(closed||!link.Attach(guest)){shutdown(guest,2);closesocket(guest);throw new IOException("Transport closed");}attached=true;}check();var stream=client.GetStream();
+                    if(!link.Reserve())throw new IOException("Transport closed");
+                    try{var up=new Thread(()=>{try{var b=new byte[65536];int n;while((n=stream.Read(b,0,b.Length))>0){int offset=0;var pin=GCHandle.Alloc(b,GCHandleType.Pinned);try{while(offset<n){check();int sent=send(guest,IntPtr.Add(pin.AddrOfPinnedObject(),offset),n-offset,0);if(sent<=0){if(!link.Closing)Diagnostic("guest-send-error");throw new IOException("Guest closed");}offset+=sent;}}finally{pin.Free();}}}catch{}finally{link.Close();link.Release();}});up.IsBackground=true;up.Start();}catch{link.Release();throw;}
+                    var output=new byte[65536];int count;while((count=recv(guest,output,output.Length,0))>0){check();stream.Write(output,0,count);stream.Flush();}
+                    if(count<0&&!link.Closing)Diagnostic("guest-recv-error");
+                }catch{}finally{link.Close();if(attached)link.Release();lock(links){links.Remove(link);}capacity.Release();}});}
+                catch{link.Close();lock(links){links.Remove(link);}capacity.Release();throw;}
             }
             return 0;
         }catch(Exception error){Console.Error.WriteLine("Hyper-V loopback channel: "+error.Message);return 1;}
@@ -91,9 +165,7 @@ public static class MuHyperVChannel {
         try {
             if (WSAStartup(0x0202, startup) != 0) throw new IOException("WinSock initialization failed");
             raw = OpenGuest(vm);
-            Console.Error.WriteLine("Hyper-V connected"); var arrived = new ManualResetEvent(false); int count = 0; var banner = new byte[1024];
-            var receiver = new Thread(() => { count = recv(raw, banner, banner.Length, 0); arrived.Set(); }); receiver.IsBackground = true; receiver.Start();
-            if (!arrived.WaitOne(3000)) throw new IOException("Guest SSH banner was not received");
+            Console.Error.WriteLine("Hyper-V connected");var banner=new byte[1024];int count=ReceiveGuestBanner(raw,banner,3000);
             Console.Write(System.Text.Encoding.ASCII.GetString(banner, 0, Math.Max(0, count)));
             return 0;
         } catch (Exception failure) {

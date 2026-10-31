@@ -96,6 +96,9 @@ function Is-Alive($identity) {
 }
 function Tree([string]$root) {
     $null = Local-Root $root
+    # Keep validated logical paths in journals; use the Win32 extended form for
+    # tree I/O because the transaction suffix can push package files past 260.
+    $root = '\\?\' + $root
     if (-not [IO.Directory]::Exists($root)) { throw 'Application directory missing' }
     $pending = New-Object 'Collections.Generic.Stack[string]'
     $pending.Push($root)
@@ -130,6 +133,7 @@ function Tree([string]$root) {
 function Copy-Tree([string]$source, [string]$destination) {
     $null = Local-Root $source; $null = Local-Root $destination
     if (Test-Path -LiteralPath $destination) { throw 'Backup already exists; preserved' }
+    $source = '\\?\' + $source; $destination = '\\?\' + $destination
     $null = [IO.Directory]::CreateDirectory($destination)
     $pending = New-Object 'Collections.Generic.Stack[string]'
     $pending.Push($source)
@@ -138,7 +142,7 @@ function Copy-Tree([string]$source, [string]$destination) {
         foreach ($entry in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
             $attributes = [IO.File]::GetAttributes($entry)
             if ($attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Application link preserved' }
-            $target = Join-Path $destination $entry.Substring($source.Length + 1)
+            $target = $destination + '\' + $entry.Substring($source.Length + 1)
             if ($attributes -band [IO.FileAttributes]::Directory) { $null = [IO.Directory]::CreateDirectory($target); $pending.Push($entry) }
             else {
                 $input = [IO.File]::Open($entry, 'Open', 'Read', 'Read')
@@ -193,7 +197,7 @@ function Clean-Committed($record) {
         $backup = Local-Root ($entry.path + '.mu-backup-' + $record.nonce)
         if (-not (Test-Path -LiteralPath $backup)) { continue }
         # Interrupted cleanup or unexpected contents are retained, never guessed.
-        if ((Tree $backup) -eq $entry.digest) { [IO.Directory]::Delete($backup, $true) }
+        if ((Tree $backup) -eq $entry.digest) { [IO.Directory]::Delete(('\\?\' + $backup), $true) }
         else { Quarantine $backup $record.nonce }
     }
     Clear-Record
@@ -229,7 +233,7 @@ try {
             if ($entry.existed) {
                 if ([IO.Directory]::Exists($entry.path) -and (Tree $entry.path) -eq $entry.digest) {
                     if (Test-Path -LiteralPath $backup) {
-                        if ((Tree $backup) -eq $entry.digest) { [IO.Directory]::Delete($backup, $true) }
+                        if ((Tree $backup) -eq $entry.digest) { [IO.Directory]::Delete(('\\?\' + $backup), $true) }
                         else { Quarantine $backup $record.nonce }
                     }
                 } else {

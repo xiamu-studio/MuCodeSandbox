@@ -1,0 +1,33 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {mkdtemp,mkdir,writeFile,rm} from 'node:fs/promises';import path from 'node:path';import {tmpdir} from 'node:os';import {execFile,spawn} from 'node:child_process';import {promisify} from 'node:util';
+import {WINDOWS_BROWSER_SELECTION_INSPECT,parseWindowsBrowserSelection,assertWindowsBrowserProduct} from '../server/platform/windows/browser-selection.ts';
+import {WINDOWS_BROWSER_RELEASES,WINDOWS_BROWSER_CANDIDATE,windowsBrowserReleaseRoot} from '../server/platform/windows/browser-releases.ts';
+import {WINDOWS_CHROME} from '../server/platform/windows/browser-assets.ts';
+import {WINDOWS_BROWSER_PROFILE_INSPECT,windowsBrowserProfileHelpers,parseWindowsBrowserProfile} from '../server/platform/windows/browser-profile.ts';
+import {WINDOWS_BROWSER_VERSION_SCRIPT,parseWindowsBrowserVersion} from '../server/platform/windows/browser-installation.ts';
+import {startWindowsChrome,verifyWindowsDesktop} from '../server/platform/windows/browser-guest.ts';
+import type {Environment} from '../shared/types.ts';
+
+test('Selected-version readers preserve real host files, pin approved recipes and reject changed or unfinished choices',async t=>{
+ const root=await mkdtemp(path.join(tmpdir(),'mu-browser-selection-'));
+ try{
+  await mkdir(path.join(root,'cases'));await writeFile(path.join(root,'catalog.json'),JSON.stringify(WINDOWS_BROWSER_RELEASES));
+  const programs={selection:WINDOWS_BROWSER_SELECTION_INSPECT,profile:WINDOWS_BROWSER_PROFILE_INSPECT,installation:WINDOWS_BROWSER_VERSION_SCRIPT,'profile-base':windowsBrowserProfileHelpers(WINDOWS_CHROME.version)+'\nprint(json.dumps(mu_profile_inspect()))','profile-candidate':windowsBrowserProfileHelpers(WINDOWS_BROWSER_CANDIDATE.version)+'\nprint(json.dumps(mu_profile_inspect()))'};
+  await Promise.all(Object.entries(programs).map(([name,program])=>writeFile(path.join(root,name+'.py'),program)));
+  const result=JSON.parse((await promisify(execFile)(process.platform==='win32'?'python':'python3',['-I',path.resolve('tests/fixtures/windows-browser-selection.py'),root],{windowsHide:true,timeout:20000,maxBuffer:1048576})).stdout);
+  assert.equal(result.complete,true);assert.equal(result.checks.length,39);assert.equal(result.actualFilesAndIds,true);assert.equal(result.actualHardlinks,true);assert.equal(result.candidateDigestAdapter,true);assert.equal(result.realLinux,false);assert.equal(result.realVm,false);assert.equal(result.browserExecuted,false);
+  for(const check of result.checks)await t.test(check.case,()=>{assert.equal(check.passed,true);assert.equal(check.readonly,true);assert.equal(check.handlesClosed,true);});console.log(JSON.stringify({...result,diagnostic:'windows-browser-selection-readers'}));
+ }finally{assert.equal(path.dirname(root),path.resolve(tmpdir()));assert.match(path.basename(root),/^mu-browser-selection-/);await rm(root,{recursive:true,force:true});}
+});
+test('Selection receipts, CDP product and profile compatibility bind the same approved version',()=>{
+ for(const release of WINDOWS_BROWSER_RELEASES){assert.equal(parseWindowsBrowserSelection(JSON.stringify({version:1,selectedVersion:release.version})),release.version);assert.doesNotThrow(()=>assertWindowsBrowserProduct('Chrome/'+release.version,release.version));const status=parseWindowsBrowserVersion(JSON.stringify({version:1,state:'verified',issue:null,selectedVersion:release.version,recordedVersion:release.version}));assert.equal(status.installedVersion,release.version);assert.equal(status.availableVersion,release.version);assert.equal(status.updateAvailable,false);assert.equal(parseWindowsBrowserProfile(JSON.stringify({version:1,state:'compatible',issue:null,selectedVersion:release.version,recordedVersion:release.version})).state,'compatible');}
+ for(const value of [{version:1,selectedVersion:'1.2.3.4'},{version:1,selectedVersion:WINDOWS_CHROME.version,path:'/foreign'},{version:1},null])assert.throws(()=>parseWindowsBrowserSelection(JSON.stringify(value)),{code:'BROWSER_SELECTION_RECEIPT'});
+ for(const product of [undefined,null,'Chromium/'+WINDOWS_CHROME.version,'Chrome/'+WINDOWS_BROWSER_CANDIDATE.version])assert.throws(()=>assertWindowsBrowserProduct(product,WINDOWS_CHROME.version),{code:'BROWSER_VERSION_MISMATCH'});
+ assert.throws(()=>parseWindowsBrowserVersion(JSON.stringify({version:1,state:'verified',issue:null,selectedVersion:WINDOWS_BROWSER_CANDIDATE.version,recordedVersion:WINDOWS_CHROME.version})),{code:'BROWSER_VERSION_UNREADABLE'});
+ assert.throws(()=>parseWindowsBrowserProfile(JSON.stringify({version:1,state:'compatible',issue:null,selectedVersion:WINDOWS_CHROME.version,recordedVersion:WINDOWS_BROWSER_CANDIDATE.version})),{code:'BROWSER_PROFILE_RECEIPT'});
+});
+test('Each approved launch pins its executable, AppArmor path, sandbox helper and dev profile gates',async()=>{
+ const env={identity:{locale:'en-US',timezone:'UTC'},browserUrl:'https://not-opened.invalid/'} as Environment,pythonPrograms:string[]=[];
+ for(const release of WINDOWS_BROWSER_RELEASES){const root=windowsBrowserReleaseRoot(release.version),script=startWindowsChrome(env,release.version),verify=verifyWindowsDesktop(release.version);assert.ok(script.includes(root+'/chrome flags=(unconfined)'));assert.ok(script.includes(root+'/chrome-sandbox'));assert.ok(script.includes("MU_PROFILE_EXPECTED="+JSON.stringify(release.version)));assert.equal(script.includes(env.browserUrl),false);assert.ok(script.includes("'about:blank'"));assert.equal(script.includes('--no-sandbox'),false);assert.ok(verify.includes('mu_selected_version('+JSON.stringify(release.version)+')'));assert.ok(verify.includes(root));pythonPrograms.push(verify.split("<<'MU_COMPONENTS'\n")[1].split('\nMU_COMPONENTS')[0],script.split("<<'MU_PREFS'\n")[1].split('\nMU_PREFS')[0]);}
+ for(const value of ['156.0.8078.47/../../foreign','https://foreign.invalid','157.0.0.0']){assert.throws(()=>startWindowsChrome(env,value),{code:'BROWSER_VERSION_UNAPPROVED'});assert.throws(()=>verifyWindowsDesktop(value),{code:'BROWSER_VERSION_UNAPPROVED'});}
+ const result=await new Promise<{code:number|null;out:string;err:string}>((resolve,reject)=>{const child=spawn(process.platform==='win32'?'python':'python3',['-I','-c',"import sys,json; values=json.load(sys.stdin); [compile(p,'selected-launch','exec') for p in values]; print(len(values))"],{windowsHide:true});let out='',err='';child.stdout.on('data',v=>out+=v);child.stderr.on('data',v=>err+=v);child.on('error',reject);child.on('close',code=>resolve({code,out,err}));child.stdin.on('error',()=>{});child.stdin.end(JSON.stringify(pythonPrograms));});assert.equal(result.code,0,result.err);assert.equal(result.out.trim(),'4');
+});

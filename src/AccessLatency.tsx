@@ -40,13 +40,13 @@ export function LatencyBadge({environment}:{environment:Environment}){
   </button>;
 }
 
-export function AccessLatencyPanel({environment}:{environment:Environment}){
+export function AccessLatencyPanel({environment,hostLabel='Mac'}:{environment:Environment;hostLabel?:string}){
   const {report,error,readError,busy,running,measure}=useAccessLatency(environment),[target,setTarget]=useState<LatencyTarget>('google');
   const shown=report?.target===target&&!busy&&!error?report:null;
   return <section className="access-latency-panel">
     <SectionHeading title="线路延迟" subtitle="Clash 式统一延迟：先建立连接，再测复用连接的轻量请求往返。每次检测取三轮中位数。"/>
     <div className="latency-controls"><label>测试站点<select aria-label="延迟测试站点" value={target} disabled={busy} onChange={event=>setTarget(event.target.value as LatencyTarget)}>{LATENCY_TARGETS.map(t=><option value={t.id} key={t.id}>{t.name} · {t.host}</option>)}</select></label><Button className="primary" icon={<RefreshCw size={15}/>} loading={busy} disabled={!running} onClick={()=>void measure(target)}>测延迟</Button></div>
-    <div className="latency-reading"><strong>{!running?'先启动环境':busy?'检测中…':readError?'读取失败':error?'检测失败':shown?.medianMs===null?'检测失败':shown?<>{shown.medianMs}<span> ms</span></>:'尚未检测'}</strong><div>{shown?<><p>三次测量的中位数 · {shown.successfulSamples}/3 次成功{shown.minMs!==null&&` · 范围 ${shown.minMs}–${shown.maxMs} ms`}</p><small>检测时间：{dateLabel(shown.checkedAt)} · Linux 沙箱内</small></>:<p>{running?'连续测三次小请求，不下载大文件。':'启动后才能测当前线路；不会使用 Mac 本机直连代测。'}</p>}</div></div>
+    <div className="latency-reading"><strong>{!running?'先启动环境':busy?'检测中…':readError?'读取失败':error?'检测失败':shown?.medianMs===null?'检测失败':shown?<>{shown.medianMs}<span> ms</span></>:'尚未检测'}</strong><div>{shown?<><p>三次测量的中位数 · {shown.successfulSamples}/3 次成功{shown.minMs!==null&&` · 范围 ${shown.minMs}–${shown.maxMs} ms`}</p><small>检测时间：{dateLabel(shown.checkedAt)} · Linux 沙箱内</small></>:<p>{running?'连续测三次小请求，不下载大文件。':`启动后才能测当前线路；不会使用 ${hostLabel} 本机直连代测。`}</p>}</div></div>
     {shown&&<div className="latency-samples">{shown.samples.map((sample,index)=><div key={index} className={sample.ok?'':'failed'}><span>第 {index+1} 次</span><strong>{sample.ok?`${sample.lineDelayMs} ms`:'失败'}</strong><small>{sample.ok?`复用连接 · HTTP ${sample.httpStatus}`:sample.issue}</small></div>)}</div>}
     {shown?.firstResponseMedianMs!==null&&shown?.firstResponseMedianMs!==undefined&&<p className="latency-page-time">网页首次响应耗时：{shown.firstResponseMedianMs} ms（包含首次建连，仅作补充对比）。</p>}
     {error&&<Notice kind="error">{error}</Notice>}

@@ -61,3 +61,12 @@ for pid in sorted(pids):
  except (FileNotFoundError,ProcessLookupError):pass
 print(json.dumps(dict(unitActive=active,developmentUid=pwd.getpwnam('dev').pw_uid,processes=rows)))
 `;
+
+// Keep the ordinary Mac/Windows inspection byte-for-byte; candidates have a
+// separate, exact epoch service cgroup, never an arbitrary requested unit.
+export function inspectGuestBrowserSandboxUnit(unit:string){
+ if(unit==='mucodesandbox-browser.service')return INSPECT_GUEST_BROWSER_SANDBOX;
+ if(!/^mucodesandbox-browser-trial-[a-f0-9]{32}\.service$/.test(unit))throw new AppError('候选浏览器服务身份无效',400,'BROWSER_TRIAL_UNIT');
+ const marker="unit='mucodesandbox-browser.service'";if(INSPECT_GUEST_BROWSER_SANDBOX.split(marker).length!==2)throw Error('Sandbox unit template changed');
+ return INSPECT_GUEST_BROWSER_SANDBOX.replace(marker,'unit='+JSON.stringify(unit));
+}

@@ -5,10 +5,15 @@ import {AppError} from '../../errors.ts';
 import type {WindowsConfig} from './config.ts';
 import type {HyperVRuntime} from './runtime.ts';
 import type {WindowsManager} from './manager.ts';
+import type {WindowsDisplayLifecycle} from './display-lifecycle.ts';
 
 export interface WindowsAudioLaunch {file:string;args:string[];env:NodeJS.ProcessEnv;cwd:string}
 interface AudioSession extends GuestAudioSession {config:WindowsConfig;sessionId:string;closed?:boolean}
-interface AudioBrowser {entries:ReadonlyMap<string,AudioSession>;assertProtection(id:string):Promise<unknown>}
+export interface WindowsAudioSource {entries:Pick<ReadonlyMap<string,AudioSession>,'get'>;assertProtection(id:string):Promise<unknown>;subscribeRevoked?(listener:(id:string)=>void):()=>void}
+
+export function windowsDisplayAudioSource(display:WindowsDisplayLifecycle):WindowsAudioSource{
+ return {entries:{get:id=>display.readyEntry(id)},assertProtection:id=>display.assertProtection(id),subscribeRevoked:listener=>display.subscribeRevoked(listener)};
+}
 
 // The caller supplies audioLaunch's fixed dev/parec command. Closing stdin or
 // the authenticated Hyper-V channel also terminates the guest reader.
@@ -32,10 +37,12 @@ export function createWindowsAudioCapture(launch:WindowsAudioLaunch):GuestAudioC
 export class WindowsGuestAudio {
  readonly host:GuestAudioHost;
  private readonly prepared=new WeakMap<GuestAudioSession,WindowsAudioLaunch>();
- readonly manager:Pick<WindowsManager,'assertAccess'|'sessions'>;readonly browser:AudioBrowser;readonly runtime:Pick<HyperVRuntime,'audioLaunch'>;
- constructor(manager:Pick<WindowsManager,'assertAccess'|'sessions'>,browser:AudioBrowser,runtime:Pick<HyperVRuntime,'audioLaunch'>){
+ private readonly unsubscribeRevoked?:()=>void;
+ readonly manager:Pick<WindowsManager,'assertAccess'|'sessions'>;readonly browser:WindowsAudioSource;readonly runtime:Pick<HyperVRuntime,'audioLaunch'>;
+ constructor(manager:Pick<WindowsManager,'assertAccess'|'sessions'>,browser:WindowsAudioSource,runtime:Pick<HyperVRuntime,'audioLaunch'>){
   this.manager=manager;this.browser=browser;this.runtime=runtime;
   this.host=new GuestAudioHost({getSession:id=>this.current(id),authorize:async session=>{await manager.assertAccess(session.environment.id,true);await browser.assertProtection(session.environment.id);},capture:session=>{const launch=this.prepared.get(session);if(!launch)throw new AppError('音频会话已变化，请重新开启声音',409,'AUDIO_SESSION_CHANGED');return createWindowsAudioCapture(launch);}});
+  this.unsubscribeRevoked=browser.subscribeRevoked?.(id=>this.revoke(id));
  }
  private current(id:string){const entry=this.browser.entries.get(id),protection=this.manager.sessions.get(id);return entry?.ready&&!entry.closed&&protection?.id===entry.sessionId&&protection.state==='active'?entry:undefined;}
  async issue(id:string){
@@ -48,5 +55,5 @@ export class WindowsGuestAudio {
   this.prepared.set(session,launch);return this.host.issue(id);
  }
  revoke(id:string){this.host.revoke(id);}
- dispose(){return this.host.dispose();}
+ dispose(){this.unsubscribeRevoked?.();return this.host.dispose();}
 }

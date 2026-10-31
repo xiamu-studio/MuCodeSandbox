@@ -1,4 +1,5 @@
 import type {EgressCheck,EgressVerification} from './types.ts';
+import type {GuardDiagnostics} from './windows-guard-diagnostics.ts';
 export type ProtectionKind='exit-changed'|'exit-unavailable'|'connection'|'tls'|'proxy-auth'|'dns'|'lease'|'integrity'|'host'|'unknown';
 export interface ProtectionResolution {at:string;ip?:string;receipts:EgressVerification['receipts']}
 export interface ProtectionEvent {
@@ -7,6 +8,7 @@ export interface ProtectionEvent {
  stopResult:'requested'|'confirmed'|'failed'|'not-confirmed';stopIssue?:string;
  resolvedAt:string|null;resolution?:ProtectionResolution;
  persisted?:boolean;
+ guard?:GuardDiagnostics;
 }
 export const protectionLabels:Record<ProtectionKind,string>={'exit-changed':'检测到出口 IP 变化','exit-unavailable':'未取得足够出口回执',connection:'出口核验连接中断',tls:'HTTPS证书或安全连接失败','proxy-auth':'代理认证失败',dns:'域名解析失败',lease:'自动断网许可失效',integrity:'隔离或防火墙检查失败',host:'本机网络或电源状态变化',unknown:'防护检查失败'};
 export const checkLabels:Record<EgressCheck['status'],string>={pending:'未完成',success:'收到回执',timeout:'HTTPS请求超时','command-timeout':'管理命令超时','tls-error':'安全连接失败','auth-error':'代理认证失败','dns-error':'域名解析失败','connection-error':'连接失败','invalid-response':'回执格式无效',cancelled:'检查中断'};
@@ -25,19 +27,24 @@ export function protectionKind(issue:string,checks:EgressCheck[]=[]):ProtectionK
 export function protectionDisplayKind(event:ProtectionEvent):ProtectionKind{
  return event.kind==='exit-unavailable'&&protectionKind(event.issue,event.checks)==='connection'?'connection':event.kind;
 }
+function isTlsSystemError(event:ProtectionEvent|undefined):boolean{
+ return !!event&&protectionDisplayKind(event)==='tls'&&/curl:\s*\(35\)[\s\S]{0,1000}SSL_ERROR_SYSCALL/i.test(event.issue);
+}
+function isWindowsHostMonitorIssue(issue:string){return issue==='宿主网络发生变化、监测中断或电脑从休眠恢复'||issue.startsWith('宿主网络监测状态：');}
 // Describe only evidence that was actually recorded. A failed stop or absent
 // receiver result must not be turned into a claim of safety or an IP change.
 export function protectionExplanation(event:ProtectionEvent):{reason:string;next:string}{
  const kind=protectionDisplayKind(event);
  let reason: string,next: string;
- if(kind==='host'&&/休眠/.test(event.issue)){reason='电脑休眠，触发断网保护。'+(event.stopResult==='confirmed'?'服务已关闭。':'');next='唤醒后点击“启动环境”继续使用。';}
- else if(kind==='host'){reason='本机网络或电源状态发生变化，沙箱暂停联网。';next='确认本机网络恢复后，点“重新核验并启动”。';}
+ if(kind==='host'&&/^电脑休眠[，,：:；;\s]/.test(event.issue)){reason='电脑休眠，触发断网保护。'+(event.stopResult==='confirmed'?'服务已关闭。':'');next='唤醒后点击“启动环境”继续使用。';}
+ else if(kind==='host'){reason=event.issue.startsWith('宿主网络监测状态：')?event.issue+'，沙箱暂停联网。':'本机网络或电源状态发生变化，或监测中断，沙箱暂停联网。';next=isWindowsHostMonitorIssue(event.issue)?'确认本机网络恢复后，退出并重新打开应用，再重新核验并启动。':'确认本机网络恢复后，点“重新核验并启动”。';}
  else if(kind==='lease'){reason='应用与沙箱的联网保护连接已失效，无法继续确认联网安全。';next='保持应用开启、确认网络可用，再重新核验并启动。';}
  else if(kind==='exit-changed'){reason=`出口 IP 与批准值不同：${event.expectedIp??'未配置'} → ${event.observedIps.join('、')||'详见诊断'}。`;next='检查代理是否换了节点；恢复原线路后重新核验。';}
  else if(kind==='exit-unavailable'){reason='未能取得至少两处一致的出口检测结果，已触发保护。';next='确认 VPS 和本机代理在线，网络恢复后重新核验。';}
  else if(kind==='connection'){reason='出口检测连接中断，无法确认当前出口。';next='检查 VPS 和本机代理连接，恢复后重新核验。';}
  else if(kind==='proxy-auth'){reason='代理账号验证失败，当前线路无法使用。';next='到网络页检查代理用户名、密码或有效期。';}
  else if(kind==='dns'){reason='域名解析失败，出口检测无法完成。';next='到网络页检查 DNS 与代理线路，再重新核验。';}
+ else if(isTlsSystemError(event)){reason='建立安全连接时发生系统错误，原因尚未确定，出口核验未完成。';next='检查本机代理和上游线路，保留技术详情；确认线路恢复后再重新核验。';}
  else if(kind==='tls'){reason='安全连接检查失败，未通过证书或加密连接验证。';next='检查电脑时间、代理证书和线路配置，再重新核验。';}
  else if(kind==='integrity'){reason='沙箱隔离或网络防护配置未通过检查。';next='查看技术详情中的失败项，修复后重新核验。';}
  else{reason='防护检查未通过，当前原因需要进一步排查。';next='查看技术详情或下载诊断，检查网络与应用状态。';}
@@ -50,7 +57,9 @@ export function probeProgress(check:EgressCheck):string|null{
  if(d.tcpConnectMs>0)return 'TCP 已连接，远端 TLS 尚未确认';
  return 'TCP / TLS 尚未确认';
 }
-export function recoverySteps(kind:ProtectionKind):string[]{
+export function recoverySteps(kind:ProtectionKind,event?:ProtectionEvent):string[]{
+ if(kind==='host'&&event&&isWindowsHostMonitorIssue(event.issue))return ['确认电脑已唤醒、本机网络恢复且代理线路可用。','退出并重新打开应用，让宿主网络监测重新建立。','手动重新核验并启动；未通过检查时环境继续保持断网。'];
+ if(kind==='tls'&&isTlsSystemError(event))return ['查看检测端、错误码和连接阶段；安全连接尚未建立，不能据此断定是证书问题或出口 IP 已变化。','检查本机代理与上游线路；保留诊断记录，不要关闭 HTTPS 校验或出口锁定。','线路恢复后重新核验；仍失败时环境会继续保持断网。'];
  const steps:Record<ProtectionKind,string[]>={
   'exit-changed':['核对下方批准 IP 与实际回执；确认代理是否切换了节点、线路或出口。','先恢复原批准线路。确实要换线路时，到网络页核对新出口后由你修改批准值；系统不会自动接受新 IP。','点“重试核验并启动”。只在当前配置通过全部检查后恢复联网。'],
   'exit-unavailable':['查看哪些检测端超时或没有回执；这不等于已发现另一个 IP。','确认 VPS / 本机代理在线、端口正确；若只有检测站点暂时不可用，稍后重试，不要关闭出口锁定。','点“重试核验并启动”。仍失败会继续断网并留下新的记录。'],

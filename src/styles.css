@@ -274,6 +274,10 @@ input::placeholder, textarea::placeholder { color: #b0bab3; }.field input:disabl
 .guest-input-container {position:absolute;right:12px;top:64px;z-index:30;width:min(380px,calc(100% - 24px));max-height:calc(100% - 76px);overflow:auto;border:1px solid #bed4d1;border-radius:14px;box-shadow:0 10px 32px #173b4530;background:#f8fcfb;}
 .guest-input-container[hidden] {display:none;}
 .terminal-tool {position:relative;}
+.terminal-tool.terminal-fullscreen{position:fixed;inset:0;z-index:80;width:auto;height:100dvh;margin:0;border-radius:0;box-shadow:none}
+.terminal-fullscreen>.terminal-header{flex-shrink:0}
+.terminal-fullscreen>.terminal-container{min-height:0}
+.terminal-fullscreen-error{margin:0;padding:10px 14px;color:#ffe0d8;background:#522e2b;flex-shrink:0}
 .terminal-header {height:auto;min-height:44px;flex-wrap:wrap;gap:8px;padding:6px 12px;}
 .terminal-header>span:first-child {flex:1 1 180px;}
 .terminal-header .terminal-actions {flex-wrap:wrap;justify-content:flex-end;max-width:100%;}

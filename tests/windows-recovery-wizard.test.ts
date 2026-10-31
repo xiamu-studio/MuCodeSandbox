@@ -9,6 +9,7 @@ import {openWindowsStore,protectCurrentUser} from '../server/platform/windows/cr
 import {recoveryCandidates} from '../server/platform/windows/recovery-candidates.ts';
 import {WindowsRecoveryWizard} from '../server/platform/windows/recovery-wizard.ts';
 import {createWindowsRecoveryService} from '../server/platform/windows/recovery-service.ts';
+import {recoveryReviewSchema} from '../server/platform/windows/recovery.ts';
 import {windowsPaths} from '../server/platform/windows/config.ts';
 import type {HyperVBrokerClient} from '../server/platform/windows/broker.ts';
 import type {Environment} from '../shared/types.ts';
@@ -19,6 +20,12 @@ const reviewed={review:{version:1,id,name:'mu-win-'+id.replaceAll('-',''),platfo
 const approved={registered:true,id,platformId,state:'Off',diskPreserved:true,reopenRequired:true};
 function broker(call:(action:string,body:Record<string,unknown>,options?:{signal?:AbortSignal})=>Promise<unknown>){return {call} as HyperVBrokerClient;}
 const loaded=()=>Promise.resolve({candidates:[structuredClone(candidate)],issue:null,bindings:new Map([[id,'synthetic-private-binding']])});
+
+test('Recovery presents native source authority without accepting unknown or caller-supplied proof fields',async()=>{
+ for(const sourceAuthority of ['base-image','import-origin'] as const){const result={...reviewed,review:{...reviewed.review,sourceAuthority}};assert.equal(recoveryReviewSchema.parse(result).review.sourceAuthority,sourceAuthority);const wizard=new WindowsRecoveryWizard(broker(async action=>action==='recovery-review'?result:approved),loaded);await wizard.refresh();wizard.review(id);await wizard.wait();assert.equal(wizard.snapshot().review?.review.sourceAuthority,sourceAuthority);wizard.adopt(id,plan,candidate.name);await wizard.wait();assert.equal(wizard.snapshot().phase,'completed');await wizard.close();}
+ assert.equal(recoveryReviewSchema.parse(reviewed).review.sourceAuthority,undefined);
+ assert.throws(()=>recoveryReviewSchema.parse({...reviewed,review:{...reviewed.review,sourceAuthority:'scan-current-disk'}}));assert.throws(()=>recoveryReviewSchema.parse({...reviewed,review:{...reviewed.review,originProof:'untrusted'}}));
+});
 test('Recovery requires an unchanged original VM identity before presenting a confirmation',async()=>{
  const calls:string[]=[];const wizard=new WindowsRecoveryWizard(broker(async action=>{calls.push(action);return {...reviewed,review:{...reviewed.review,platformId:randomUUID()}};}),loaded);await wizard.refresh();wizard.review(id);await wizard.wait();assert.equal(wizard.snapshot().phase,'failed');assert.equal(wizard.snapshot().review,null);assert.deepEqual(calls,['recovery-review']);
 });

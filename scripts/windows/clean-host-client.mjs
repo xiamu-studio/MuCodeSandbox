@@ -9,7 +9,7 @@ import {HyperVBrokerClient,brokerSourceDigest} from 'file:///C:/MuLab/product/re
 import {HyperVRuntime} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/runtime.js';
 import {windowsConfigSchema} from 'file:///C:/MuLab/product/resources/app/dist-server/server/platform/windows/config.js';
 
-const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network','power-discard-failed','power-clear-failed','upgrade-seed','upgrade-current','upgrade-current-check','upgrade-next','upgrade-next-check','upgrade-reject','upgrade-final','power-run','power-recover','resource-seed','resource-disk','resource-memory','resource-recover','adoption-seed','adoption-backup','adoption-review','adoption-approve','adoption-ui','adoption-final','cache','cache-ui','ledger-seed','ledger-check','ledger-deny','ledger-final'].includes(phase));
+const phase=process.argv[2];assert.ok(['before-reboot','after-reboot','ssh-install','ssh-ready','network','power-discard-failed','power-clear-failed','upgrade-seed','upgrade-current','upgrade-current-check','upgrade-next','upgrade-next-check','upgrade-reject','upgrade-final','power-run','power-recover','resource-seed','resource-disk','resource-memory','resource-recover','adoption-seed','adoption-backup','adoption-backup-restore','adoption-backup-cross','adoption-backup-gui','adoption-review','adoption-approve','adoption-ui','adoption-final','cache','cache-ui','ledger-seed','ledger-check','ledger-deny','ledger-final'].includes(phase));
 const directory='C:/MuLab/public',nonce=randomBytes(32).toString('hex'),client=new HyperVBrokerClient(nonce);
 let complete=false;const checks=[];let before,after,error,nested;
 const pass=name=>checks.push({name,passed:true});
@@ -30,6 +30,10 @@ try{
   assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);const {upgradeAcceptance}=await import('file:///C:/MuLab/upgrade-client.mjs');nested=await upgradeAcceptance(phase,client,nonce,pass);
  }else if(phase.startsWith('power-')){
   assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);const {powerAcceptance}=await import('file:///C:/MuLab/power-client.mjs');nested=await powerAcceptance(phase,client,nonce,pass);
+ }else if(phase==='adoption-backup-cross'){
+  assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);const {backupCrossSourceAcceptance}=await import('file:///C:/MuLab/backup-cross-source.mjs');const seed=JSON.parse(await readFile('C:/MuLab/approved/adoption-seed-result.json','utf8')).nested;nested=await backupCrossSourceAcceptance(client,nonce,pass,new HyperVRuntime('C:/MuLab/public/adoption-runtime',undefined,client),windowsConfigSchema.parse(seed.config),seed);
+ }else if(phase==='adoption-backup-gui'){
+  assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);const {backupGuiAcceptance}=await import('file:///C:/MuLab/backup-gui-client.mjs');const seed=JSON.parse(await readFile('C:/MuLab/approved/adoption-seed-result.json','utf8')).nested;assert.ok(seed.stopped);nested=await backupGuiAcceptance(client,nonce,pass,new HyperVRuntime('C:/MuLab/public/adoption-runtime',undefined,client),windowsConfigSchema.parse(seed.config),seed);
  }else if(phase.startsWith('adoption-')){
   assert.equal(before.ready,true);assert.equal(before.runtimeActive,true);
   const {adoptionAcceptance}=await import('file:///C:/MuLab/adoption-client.mjs');nested=await adoptionAcceptance(phase,client,nonce,pass);

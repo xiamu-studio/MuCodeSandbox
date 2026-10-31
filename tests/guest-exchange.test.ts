@@ -5,20 +5,24 @@ import {mkdtemp,mkdir,readFile,writeFile,symlink,link,rm,realpath,readdir,utimes
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
-import {FILE_EXCHANGE_PYTHON,GuestExchange,transferName,clipboardText} from '../server/guest-exchange.ts';
+import {FILE_EXCHANGE_PYTHON,CLIPBOARD_WRITE_PYTHON,GuestExchange,transferName,clipboardText} from '../server/guest-exchange.ts';
 import {LimaRuntime} from '../server/runtime.ts';
 import {environmentSchema} from '../server/validation.ts';
 import {createService} from '../server/service.ts';
 import {AppError} from '../server/errors.ts';
 import type {Environment} from '../shared/types.ts';
 const browser={native:false,available:async()=>true,running:()=>false,open:async()=>{},close:async()=>{},clear:async()=>{},dispose:async()=>{}};
+// These execute the guest's POSIX filesystem program on the test host. Native
+// Windows Python cannot supply dir_fd, O_DIRECTORY, getuid or FIFO semantics.
+// Keep them mandatory on Mac/Linux; Windows has separate service/guest fixtures.
+const posixGuestFixture={skip:process.platform==='win32'?'Requires a POSIX host filesystem and Python 3; run on Mac/Linux':false};
 function env():Environment{return {...environmentSchema.parse({name:'Transfer fixture'}),id:randomUUID(),instanceName:'mu-exchange-test',state:'running',browserRunning:false,lastError:null,createdAt:'fixture',updatedAt:'fixture'};}
 
 test('Transfer rejects paths, control characters and oversized UTF8 text',()=>{
  for(const n of ['../token','/etc/passwd','a\\b','..','nul\0','line\n'])assert.throws(()=>transferName.parse(n));
  assert.equal(transferName.parse('测试资料.txt'),'测试资料.txt');assert.throws(()=>clipboardText.parse('🙂'.repeat(18000)));assert.throws(()=>clipboardText.parse('x\0y'));
 });
-test('Actual Python transfer roundtrip preserves bytes, avoids overwrite and excludes escaping or special files',async()=>{
+test('Actual Python transfer roundtrip preserves bytes, avoids overwrite and excludes escaping or special files',posixGuestFixture,async()=>{
  const root=await realpath(await mkdtemp(path.join(tmpdir(),'mu-exchange-')));const home=path.join(root,'guest');await mkdir(home);
  const code=FILE_EXCHANGE_PYTHON.replaceAll('/home/dev',home);
  const execute=(input:object)=>JSON.parse(execFileSync('python3',['-c',code],{input:JSON.stringify(input),stdio:['pipe','pipe','pipe']}).toString());
@@ -44,7 +48,7 @@ test('Actual Python transfer roundtrip preserves bytes, avoids overwrite and exc
   await rm(outgoing,{recursive:true});await symlink(root,outgoing);assert.throws(()=>execute({action:'download',zone:'outgoing',name:'outside'}));
  }finally{await rm(root,{recursive:true,force:true});}
 });
-test('Interrupted uploads never publish incomplete filenames or overwrite existing files',async()=>{
+test('Interrupted uploads never publish incomplete filenames or overwrite existing files',posixGuestFixture,async()=>{
  const root=await realpath(await mkdtemp(path.join(tmpdir(),'mu-exchange-interrupted-'))),home=path.join(root,'guest');await mkdir(home);
  const code=FILE_EXCHANGE_PYTHON.replaceAll('/home/dev',home),incoming=path.join(home,'Transfers/Incoming');
  const execute=(input:object,preamble='')=>JSON.parse(execFileSync('python3',['-c',preamble+code],{input:JSON.stringify(input),stdio:['pipe','pipe','pipe']}).toString());
@@ -76,7 +80,7 @@ test('Transfer never runs with revoked guard and rechecks access before deliveri
  await assert.rejects(exchange.list(e.id));assert.equal(calls,0);
  allowed=true;runtime.guest=async()=>{calls++;allowed=false;return '[]';};await assert.rejects(exchange.list(e.id),/revoked/);assert.equal(calls,1);
 });
-test('Paged file listing includes later names and all folders without dropping tied timestamps',async()=>{
+test('Paged file listing includes later names and all folders without dropping tied timestamps',posixGuestFixture,async()=>{
  const root=await realpath(await mkdtemp(path.join(tmpdir(),'mu-exchange-pages-'))),home=path.join(root,'guest');await mkdir(home);
  const code=FILE_EXCHANGE_PYTHON.replaceAll('/home/dev',home);
  const execute=(input:object)=>JSON.parse(execFileSync('python3',['-c',code],{input:JSON.stringify(input),stdio:['pipe','pipe','pipe']}).toString());
@@ -112,7 +116,7 @@ test('Malformed pagination positions are rejected before a guest operation',asyn
  }
  assert.equal(calls,0);
 });
-test('File exchange sends the program and payload through stdin with a short SSH command',async()=>{
+test('File exchange sends the program and payload through stdin with a short SSH command',posixGuestFixture,async()=>{
  const root=await realpath(await mkdtemp(path.join(tmpdir(),'mu-exchange-stdin-'))),home=path.join(root,'guest');await mkdir(home);
  const e=env(),runtime=new LimaRuntime('/tmp/mu-exchange-unused');
  runtime.guest=async(_e,args,options)=>{
@@ -134,8 +138,23 @@ test('Guest clipboard does not poll or read the host clipboard and uses the same
  runtime.management=async(_e,args,options)=>{calls.push({args,input:options?.input,onOutput:options?.onOutput});return JSON.stringify({text:'MU_FAKE_TEXT'});};
  const exchange=new GuestExchange(runtime,async()=>e);assert.equal(calls.length,0);
  await exchange.writeClipboard(e.id,'MU_FAKE_TEXT');const scripts=calls.map(c=>c.input??c.args.join(' ')).join('\n');
+ assert.ok(scripts.includes("sudo /usr/bin/python3 -I - <<'MU_CLIPBOARD_DIR'"));
  assert.ok(scripts.includes('BindsTo=mucodesandbox-display.service'));assert.ok(scripts.includes('User=dev'));assert.ok(scripts.includes('ExecStopPost=/usr/bin/rm'));assert.ok(calls.every(c=>c.onOutput===undefined));
  assert.equal((await exchange.readClipboard(e.id)).text,'MU_FAKE_TEXT');
+});
+test('Clipboard write keeps data on stdin and checks access before and after one guest call',async()=>{
+ const e=env(),runtime=new LimaRuntime('/tmp/mu-exchange-unused');let checks=0,calls=0;
+ const value="中文\nMU_CLIPBOARD_INPUT\n$(touch /tmp/no) ' \\\n";
+ runtime.management=async(_e,args,options)=>{
+  calls++;assert.deepEqual(args,['bash','-s']);assert.equal(options?.onOutput,undefined);
+  const script=options!.input!;const lines=script.split('\n');
+  const start=lines.indexOf("sudo -H -u dev -- /usr/bin/python3 -I -c 'import sys,json; exec(compile(json.loads(sys.stdin.buffer.readline()), \"<mu-clipboard>\", \"exec\"))' <<'MU_CLIPBOARD_INPUT'");
+  assert.ok(start>=0);assert.equal(JSON.parse(lines[start+1]),CLIPBOARD_WRITE_PYTHON);
+  assert.deepEqual(JSON.parse(lines[start+2]),{text:value});assert.equal(lines[start+3],'MU_CLIPBOARD_INPUT');
+  return '';
+ };
+ const exchange=new GuestExchange(runtime,async()=>{checks++;return e;});
+ assert.deepEqual(await exchange.writeClipboard(e.id,value),{ok:true});assert.equal(calls,1);assert.equal(checks,2);
 });
 test('Exchange API requires authentication and a running protected environment before reading or uploading',async()=>{
  const root=await mkdtemp(path.join(tmpdir(),'mu-exchange-api-'));

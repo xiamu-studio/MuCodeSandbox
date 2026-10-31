@@ -1,0 +1,41 @@
+import {test} from 'node:test';import assert from 'node:assert/strict';import {mkdtemp,rm} from 'node:fs/promises';import {tmpdir} from 'node:os';import path from 'node:path';import {randomUUID} from 'node:crypto';
+import {Store} from '../server/store.ts';import {environmentSchema} from '../server/validation.ts';import type {Environment} from '../shared/types.ts';import type {WindowsManager} from '../server/platform/windows/manager.ts';import type {WindowsLocalCheckBrowser} from '../server/platform/windows/local-checks.ts';import {WindowsLocalChecks} from '../server/platform/windows/local-checks.ts';import {WindowsNetworkSession} from '../server/platform/windows/session.ts';import {WindowsBrowserCheckFailure} from '../server/platform/windows/local-check-browser.ts';import {AppError} from '../server/errors.ts';import type {RunOptions} from '../server/process.ts';import {syntheticBrowserCheck} from './fixtures/windows-local-check-data.ts';
+async function fixture(enabled=true){
+ const root=await mkdtemp(path.join(tmpdir(),'mu-local-check-coordinator-')),store=new Store(root,Buffer.alloc(32,46)),now=new Date().toISOString();
+ const initial={...environmentSchema.parse({name:'合成检测任务',identity:{locale:'en-US',timezone:'UTC'},network:{mode:'http',host:'127.0.0.1',port:7897,strict:true,transparent:true,egressLock:{expectedIp:'203.0.113.10'}}}),id:randomUUID(),instanceName:'synthetic',state:'running',browserRunning:false,lastError:null,createdAt:now,updatedAt:now} as Environment;store.save(initial);const environment=store.get(initial.id);
+ let lease=false;const session=new WindowsNetworkSession({inspect:async()=>({digest:'a'.repeat(64),leaseActive:lease,remainingMs:lease?30000:0}),probe:async()=>[{receiver:'one',ip:'203.0.113.10'},{receiver:'two',ip:'203.0.113.10'}],activate:async()=>{lease=true;},renew:async()=>{},revoke:async()=>{},disconnect:async()=>{},stop:async()=>{}},'203.0.113.10');await session.open();
+ const sessions=new Map([[environment.id,session]]),active=new Set<string>(),tasks=new Map<string,Promise<void>>(),controls=new Map<string,AbortController>(),calls:string[]=[],hooks:{at?:(phase:string)=>Promise<void>;result?:ReturnType<typeof syntheticBrowserCheck>}={};
+ const at=async(phase:string)=>{calls.push(phase);await hooks.at?.(phase);};
+ const manager={store,sessions,assertAccess:async()=>{await at('guard');return store.get(environment.id);},submit:async(id:string,action:string,work:(options:RunOptions)=>Promise<unknown>)=>{if(active.has(id))throw new AppError('Synthetic operation active',409,'ENVIRONMENT_BUSY');const job=store.newJob(id,action),controller=new AbortController();active.add(id);controls.set(job.id,controller);const promise=Promise.resolve().then(()=>work({signal:controller.signal})).then(()=>{store.finishJob(job.id,'succeeded','Synthetic complete');},error=>{store.finishJob(job.id,controller.signal.aborted?'cancelled':'failed',(error as Error).message);}).finally(()=>active.delete(id));tasks.set(job.id,promise);return job;}} as unknown as WindowsManager;
+ const browser={running:()=>false,open:async()=>at('open'),localCheck:async()=>{await at('browser-check');return hooks.result??syntheticBrowserCheck();}} as unknown as WindowsLocalCheckBrowser;
+ const checks=new WindowsLocalChecks(manager,browser,enabled);
+ return {root,store,environment,session,sessions,controls,calls,hooks,checks,wait:async(id:string)=>tasks.get(id),close:async()=>{for(const control of controls.values())control.abort();await Promise.all([...tasks.values()]);store.close();assert.equal(path.dirname(path.resolve(root)),path.resolve(tmpdir()));assert.match(path.basename(root),/^mu-local-check-coordinator-/);await rm(root,{recursive:true,force:true});}};
+}
+test('Local checks persist real encrypted reports and confirm guard, browser, cleanup and the same session before success',async()=>{
+ const f=await fixture();try{const accepted=await f.checks.start(f.environment.id);await f.wait(accepted.job.id);const report=f.checks.status().reports[0];assert.equal(report.id,accepted.reportId);assert.equal(report.jobId,accepted.job.id);assert.equal(report.sessionId,f.session.id);assert.equal(report.state,'passed');assert.equal(report.checks.length,8);assert.ok(report.checks.every(value=>value.passed));assert.equal(f.store.jobs().find(job=>job.id===accepted.job.id)?.status,'succeeded');assert.deepEqual(f.calls,['guard','open','browser-check','guard']);assert.equal(f.store.get(f.environment.id).state,'running');assert.equal(new WindowsLocalChecks({store:f.store} as unknown as WindowsManager,{} as WindowsLocalCheckBrowser,false).status().reports[0].state,'passed');}finally{await f.close();}
+});
+test('Disabled, stopped and unprotected admission cannot create a job or open a browser',async()=>{
+ const f=await fixture(false);try{await assert.rejects(f.checks.start(f.environment.id),{code:'LOCAL_CHECK_UNAVAILABLE'});assert.equal(f.store.jobs().length,0);assert.deepEqual(f.calls,[]);}finally{await f.close();}
+ for(const state of ['stopped','unprotected']){const f=await fixture();try{const changed=f.store.get(f.environment.id);if(state==='stopped')changed.state='stopped';else changed.network.transparent=false;f.store.save(changed);await assert.rejects(f.checks.start(f.environment.id),{code:'LAB_PROTECTED_VM_REQUIRED'});assert.equal(f.store.jobs().length,0);assert.deepEqual(f.calls,[]);}finally{await f.close();}}
+});
+test('Retired sessions, changed configuration, cancellation and port failures never publish a passed report',async()=>{
+ let scenarios=0;
+ for(const phase of ['guard','open','browser-check'])for(const mode of ['retired','configuration','cancelled','failed']){
+  const f=await fixture();try{
+   f.hooks.at=async current=>{if(current!==phase)return;if(mode==='retired')f.sessions.set(f.environment.id,{id:randomUUID(),state:'active'} as WindowsNetworkSession);else if(mode==='configuration')f.store.save({...f.store.get(f.environment.id),description:'changed'});else if(mode==='cancelled')for(const controller of f.controls.values())controller.abort();else throw Error('Synthetic phase failure');};
+   const accepted=await f.checks.start(f.environment.id);await f.wait(accepted.job.id);const report=f.checks.status().reports[0];assert.equal(report.state,'failed');assert.ok(report.error);assert.notEqual(f.store.jobs().find(job=>job.id===accepted.job.id)?.status,'succeeded');if(phase!=='browser-check')assert.equal(f.calls.includes('browser-check'),false);scenarios++;
+  }finally{await f.close();}
+ }
+ console.log(JSON.stringify({diagnostic:'windows-local-check-coordinator',scenarios,actualRecords:true,actualSqlite:true,actualAesGcm:true,guardAndBrowserPortsAdapted:true,realVm:false}));
+});
+test('Partial browser failures and unconfirmed temporary cleanup remain failed, leaving the original environment intact',async()=>{
+ for(const kind of ['mismatch','cleanup','host-platform']){
+  const f=await fixture();try{
+   if(kind==='mismatch'){f.hooks.result=syntheticBrowserCheck();f.hooks.result.checks[0].passed=false;}else if(kind==='host-platform'){f.hooks.result=syntheticBrowserCheck();f.hooks.result.probe.page.platform='Win32';f.hooks.result.probe.page.userAgent='Synthetic Windows Chrome';}else f.hooks.at=async phase=>{if(phase==='browser-check')throw new WindowsBrowserCheckFailure('Synthetic cleanup unconfirmed','BROWSER_CHECK_CLEANUP_UNCONFIRMED',false);};
+   const accepted=await f.checks.start(f.environment.id);await f.wait(accepted.job.id);const report=f.checks.status().reports[0];assert.equal(report.state,'failed');assert.ok(report.checks.some(value=>!value.passed));assert.equal(f.store.get(f.environment.id).state,'running');assert.equal(f.store.jobs().find(job=>job.id===accepted.job.id)?.status,'failed');
+  }finally{await f.close();}
+ }
+});
+test('Failed initial record publication releases the admitted job without any browser work',async()=>{
+ const f=await fixture();try{f.checks.records.save=()=>{throw new AppError('Synthetic record failure',409,'LOCAL_CHECK_RECORD_SAVE_FAILED');};await assert.rejects(f.checks.start(f.environment.id),{code:'LOCAL_CHECK_RECORD_SAVE_FAILED'});const job=f.store.jobs()[0];await f.wait(job.id);assert.equal(f.store.jobs()[0].status,'failed');assert.deepEqual(f.calls,[]);assert.deepEqual(f.checks.status().reports,[]);}finally{await f.close();}
+});

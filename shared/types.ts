@@ -71,6 +71,7 @@ export interface SystemInfo {
   hostNetwork?: { state: 'starting' | 'ready' | 'failed'; issue: string | null };
   hostResourceIssue?: string | null;
   hostPowerIssue?: string | null;
+  hostSnapshotIssue?: string | null;
 }
 export interface Metrics {
   cpuPercent: number;
@@ -93,7 +94,7 @@ export interface EgressVerification {
 export interface EgressCheck {
   receiver:'ipwho'|'ipify'|'icanhazip';
   status:'pending'|'success'|'timeout'|'command-timeout'|'tls-error'|'auth-error'|'dns-error'|'connection-error'|'invalid-response'|'cancelled';
-  ip?:string;latencyMs?:number;
+  ip?:string;latencyMs?:number;sshExitStatus?:number|null;
   diagnostics?: {curlExitCode:number;httpStatus:number;tcpConnectMs:number;tlsHandshakeMs:number;firstByteMs:number;totalMs:number};
 }
 export interface NetworkResult { ip: string; country: string; city: string; latencyMs: number; source: 'guest' | 'host'; verification?: EgressVerification }
@@ -140,6 +141,8 @@ export interface BrowserInspection {
   webRtcPolicy: string; matchesConfiguration: boolean; checkedAt: string;
 }
 export interface BrowserVersionStatus {
+  selectedVersion?: string;
+  profileCompatibility?: import('./windows-browser-profile.ts').WindowsBrowserProfileStatus;
   installedVersion: string | null;
   availableVersion: string;
   updateAvailable: boolean;
@@ -147,6 +150,9 @@ export interface BrowserVersionStatus {
   installedChannel?: 'stable' | 'testing' | null;
   availableChannel?: 'stable' | 'testing';
   requiresFreshProfile?: boolean;
+  installationState?: 'verified' | 'missing' | 'untrusted';
+  installationIssue?: string;
+  recordedVersion?: string | null;
 }
 export interface LabInfo { running: boolean; url?: string; dnsPort?: number; stunPort?: number; receiptCount?: number; eventCount?: number; modelCalls?: number; scope?: string }
 export interface LocalCheckReport {

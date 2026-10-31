@@ -10,7 +10,7 @@ import {powershellPath,powershellArgs,powershellScript,fileHash} from './runtime
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../../scripts/windows');
 const reply=z.discriminatedUnion('ok',[z.object({ok:z.literal(true),result:z.unknown()}).strict(),z.object({ok:z.literal(false),code:z.string(),error:z.string()}).strict()]);
-export type BrokerAction='hello'|'doctor'|'fingerprint'|'disk'|'create'|'start'|'stop'|'status'|'inspect'|'channel'|'close-channel'|'shutdown'|'allocation'|'recover'|'prepare'|'delete'|'absence'|'begin-base'|'seal-base'|'base-status'|'discard-base-builder'|'host-status'|'prepare-host'|'cache-status'|'cache-prune'|'resource-status'|'power-status'|'recovery-info'|'recovery-review'|'recovery-adopt'|'disk-growth-status'|'grow-disk'|'start-disk-growth'|'start-disk-review'|'finish-disk-growth'|'backup-begin'|'backup-read'|'backup-stream'|'backup-close';
+export type BrokerAction='hello'|'doctor'|'fingerprint'|'disk'|'create'|'start'|'stop'|'status'|'inspect'|'channel'|'close-channel'|'shutdown'|'shutdown-status'|'allocation'|'recover'|'prepare'|'delete'|'absence'|'begin-base'|'seal-base'|'base-status'|'discard-base-builder'|'host-status'|'channel-diagnostics'|'prepare-host'|'cache-status'|'cache-prune'|'resource-status'|'power-status'|'recovery-info'|'recovery-review'|'recovery-adopt'|'disk-growth-status'|'grow-disk'|'start-disk-growth'|'start-disk-review'|'finish-disk-growth'|'disk-compact-begin'|'disk-compact-start'|'disk-compact-trimmed'|'disk-compact-run'|'disk-compact-reconcile'|'disk-compact-verify-start'|'disk-compact-review'|'disk-compact-finish'|'disk-compact-retry'|'disk-compact-cancel'|'disk-compact-status'|'backup-begin'|'backup-read'|'backup-seed'|'backup-stream'|'backup-close'|'backup-import'|'snapshot-delete'|'snapshot-deletions'|'snapshot-pending'|'snapshot-list'|'snapshot-staging'|'snapshot-staging-review'|'snapshot-staging-cleanup'|'snapshot-status'|'snapshot-outcome'|'snapshot-create'|'snapshot-prepare'|'snapshot-recover'|'snapshot-commit'|'snapshot-acknowledge'|'snapshot-seed'|'snapshot-export-begin'|'snapshot-export-read'|'snapshot-export-seed'|'snapshot-export-stream'|'snapshot-export-close';
 
 export class HyperVBrokerClient{
  readonly pipe:string;
@@ -18,21 +18,28 @@ export class HyperVBrokerClient{
  call(action:BrokerAction,parameters:Record<string,unknown>={},options:RunOptions={}):Promise<unknown>{
   return new Promise((resolve,reject)=>{
    if(options.signal?.aborted){reject(new AppError('操作已取消',409,'CANCELLED'));return;}
-   const payload=JSON.stringify({...parameters,action});if(Buffer.byteLength(payload)>65536){reject(new AppError('权限代理请求过大',400,'BROKER_REQUEST_TOO_LARGE'));return;}
-   const socket=connect(this.pipe);let bytes=Buffer.alloc(0),settled=false;
-   const finish=(error?:Error,value?:unknown)=>{if(settled)return;settled=true;clearTimeout(timer);options.signal?.removeEventListener('abort',abort);socket.destroy();if(error)reject(error);else resolve(value);};
+   const payload=JSON.stringify({...parameters,action}),largeOwnerRequest=action==='snapshot-create'||action==='snapshot-prepare';if(Buffer.byteLength(payload)>(largeOwnerRequest?1024*1024:65536)){reject(new AppError('权限代理请求过大',400,'BROKER_REQUEST_TOO_LARGE'));return;}
+   let socket:ReturnType<typeof connect>|undefined,bytes=Buffer.alloc(0),settled=false,retryTimer:ReturnType<typeof setTimeout>|undefined;
+   const retryUntil=performance.now()+1000;
+   const finish=(error?:Error,value?:unknown)=>{if(settled)return;settled=true;clearTimeout(timer);if(retryTimer)clearTimeout(retryTimer);options.signal?.removeEventListener('abort',abort);socket?.destroy();if(error)reject(error);else resolve(value);};
    const abort=()=>finish(new AppError('操作已取消',409,'CANCELLED'));
    const timer=setTimeout(()=>finish(new AppError('权限代理未及时完成操作',504,'BROKER_TIMEOUT')),options.timeoutMs??45000);timer.unref();
-   options.signal?.addEventListener('abort',abort,{once:true});socket.once('connect',()=>socket.write(payload+'\n'));
-   socket.on('data',chunk=>{bytes=Buffer.concat([bytes,chunk]);if(bytes.length>256*1024){finish(Error('Oversized broker reply'));return;}const end=bytes.indexOf(10);if(end<0)return;try{const value=reply.parse(JSON.parse(bytes.subarray(0,end).toString('utf8')));if(value.ok)finish(undefined,value.result);else finish(new AppError(value.error,value.code==='DENIED'?403:409,value.code));}catch(error){finish(error instanceof Error?error:Error('Invalid broker reply'));}});
-   socket.once('error',()=>finish(new AppError('Windows 权限代理连接已关闭',503,'BROKER_UNAVAILABLE')));socket.once('close',()=>{if(!settled)finish(new AppError('Windows 权限代理未返回结果',503,'BROKER_UNAVAILABLE'));});
+   options.signal?.addEventListener('abort',abort,{once:true});
+   const open=()=>{
+    if(settled)return;retryTimer=undefined;const attempt=connect(this.pipe);socket=attempt;let connected=false,retrying=false;
+    attempt.once('connect',()=>{if(settled){attempt.destroy();return;}connected=true;attempt.write(payload+'\n');});
+    attempt.on('data',chunk=>{bytes=Buffer.concat([bytes,chunk]);const limit=['snapshot-prepare','snapshot-status','snapshot-recover','snapshot-commit'].includes(action)?1024*1024:256*1024;if(bytes.length>limit){finish(Error('Oversized broker reply'));return;}const end=bytes.indexOf(10);if(end<0)return;try{const value=reply.parse(JSON.parse(bytes.subarray(0,end).toString('utf8')));if(value.ok)finish(undefined,value.result);else finish(new AppError(value.error,value.code==='DENIED'?403:409,value.code));}catch(error){finish(error instanceof Error?error:Error('Invalid broker reply'));}});
+    attempt.once('error',(error:NodeJS.ErrnoException)=>{if(!connected&&!settled&&['ENOENT','EBUSY','ECONNREFUSED'].includes(error.code??'')&&performance.now()<retryUntil){retrying=true;attempt.destroy();retryTimer=setTimeout(open,50);return;}finish(new AppError('Windows 权限代理连接已关闭',503,'BROKER_UNAVAILABLE'));});
+    attempt.once('close',()=>{if(!settled&&!retrying)finish(new AppError('Windows 权限代理未返回结果',503,'BROKER_UNAVAILABLE'));});
+   };
+   open();
   });
  }
  async hello(){return z.object({version:z.literal(1),ownerPid:z.literal(process.pid),ownerSid:z.string().regex(/^S-1-/),elevated:z.literal(true),protectedStorage:z.literal(true),sourceDigest:z.string().regex(/^[a-f0-9]{64}$/)}).strict().parse(await this.call('hello'));}
 }
 
 export async function brokerSourceDigest(){
- const files=['../../native/windows/HyperVBroker.cs','../../native/windows/SealedBases.cs','../../native/windows/HostComponents.cs','../../native/windows/ProtectedLedger.cs','../../native/windows/ImageCache.cs','../../native/windows/ResourceMetrics.cs','../../native/windows/Resources.cs','../../native/windows/DiskGrowth.cs','../../native/windows/BackupRead.cs','../../native/windows/BackupCursor.cs','../../native/windows/Recovery.cs','../../native/windows/RecoveryPermissions.cs','../../native/windows/PowerWatch.cs','../../native/windows/PowerProtection.cs','../../native/windows/HyperVChannel.cs','hyperv.ps1','host-components.ps1','build-channel.ps1','build-broker.ps1','install-broker.ps1'];const sha=createHash('sha256');for(const file of files){sha.update(file+'\0');sha.update(await readFile(path.resolve(scripts,file)));}return sha.digest('hex');
+ const files=['../../native/windows/HyperVBroker.cs','../../native/windows/SealedBases.cs','../../native/windows/HostComponents.cs','../../native/windows/ProtectedLedger.cs','../../native/windows/RestoreOriginProof.cs','../../native/windows/OriginPreparation.cs','../../native/windows/RestoreOriginStore.cs','../../native/windows/RestoreOriginFrames.cs','../../native/windows/ImageCache.cs','../../native/windows/ResourceMetrics.cs','../../native/windows/Resources.cs','../../native/windows/DiskGrowth.cs','../../native/windows/BackupRead.cs','../../native/windows/BackupRestore.cs','../../native/windows/RestoreOriginOperations.cs','../../native/windows/RestoreOriginInitialization.cs','../../native/windows/RestoreOriginSnapshots.cs','../../native/windows/OfflineSnapshots.cs','../../native/windows/SnapshotStaging.cs','../../native/windows/SnapshotOperations.cs','../../native/windows/BackupCursor.cs','../../native/windows/Recovery.cs','../../native/windows/RecoveryPermissions.cs','../../native/windows/PowerWatch.cs','../../native/windows/PowerProtection.cs','../../native/windows/HyperVChannel.cs','hyperv.ps1','host-components.ps1','build-channel.ps1','build-broker.ps1','install-broker.ps1'];const sha=createHash('sha256');for(const file of files){sha.update(file+'\0');sha.update(await readFile(path.resolve(scripts,file)));}return sha.digest('hex');
 }
 
 export function cleanWindowsEnvironment(){
@@ -52,7 +59,8 @@ export async function buildBroker(root:string,runner:Runner=run){
  }catch(error){const target=path.resolve(directory);if(path.dirname(target)!==path.resolve(root,'tools')||!/^broker-build-[a-f0-9-]{36}$/.test(path.basename(target)))throw Error('Broker staging boundary changed');await rm(target,{recursive:true,force:true});throw error;}
 }
 
-export async function installBroker(root:string,runner:Runner=run){
+export async function installBroker(root:string,runner:Runner=run,onPhase?:(phase:'building'|'installing')=>void){
+ onPhase?.('building');
  const artifact=await buildBroker(root,runner),source=await readFile(path.join(scripts,'install-broker.ps1'),'utf8');
  const values={Broker:artifact.broker,ExpectedBrokerHash:artifact.sha256,Channel:artifact.channel,ExpectedChannelHash:artifact.channelSha256,SourceDigest:artifact.sourceDigest};
  const invocation=Object.entries(values).map(([key,value])=>`-${key} '${value.replaceAll("'","''")}'`).join(' ');
@@ -61,17 +69,17 @@ export async function installBroker(root:string,runner:Runner=run){
  const launch=`$ErrorActionPreference='Stop'; $p=Start-Process -FilePath '${powershellPath().replaceAll("'","''")}' -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','${encoded}') -Verb RunAs -WindowStyle Hidden -Wait -PassThru; if($p.ExitCode -ne 0){throw 'Broker installation did not complete'}`;
  const launcher=path.join(artifact.directory,'install-launch.ps1');await writeFile(launcher,'\ufeff'+launch,{flag:'wx'});
  // Keep the outer command short: the nested elevated payload is already large.
- await runner(powershellPath(),powershellArgs(powershellScript(launcher)),{env:cleanWindowsEnvironment(),timeoutMs:120000});return artifact;
+ onPhase?.('installing');await runner(powershellPath(),powershellArgs(powershellScript(launcher)),{env:cleanWindowsEnvironment(),timeoutMs:120000});return artifact;
 }
 
 export async function hostRuntimeUsable(){
  const result=await run(powershellPath(),powershellArgs("$ErrorActionPreference='Stop';try{$ok=[bool](Get-Module -ListAvailable Hyper-V) -and (Get-Service vmms -ErrorAction Stop).Status -eq 'Running' -and [bool](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).HypervisorPresent;foreach($name in @('ssh.exe','ssh-keygen.exe')){$ok=$ok -and (Test-Path -LiteralPath (Join-Path $env:SystemRoot ('System32/OpenSSH/'+$name)) -PathType Leaf)};[Console]::Write([bool]$ok)}catch{[Console]::Write($false)}"),{env:cleanWindowsEnvironment(),timeoutMs:20000});return result.trim()==='True';
 }
-export async function startBroker(executable:string,options:{setupOnly?:boolean;detectHost?:boolean;recoveryOnly?:boolean}={}){
+export async function startBroker(executable:string,options:{setupOnly?:boolean;detectHost?:boolean;recoveryOnly?:boolean;onPhase?:(phase:'authorizing'|'connecting')=>void}={},runner:Runner=run){
  const nonce=randomBytes(32).toString('hex'),client=new HyperVBrokerClient(nonce);
  if([options.setupOnly,options.detectHost,options.recoveryOnly].filter(Boolean).length>1)throw Error('Select one broker startup mode');
  const launch=`$ErrorActionPreference='Stop'; Start-Process -FilePath '${executable.replaceAll("'","''")}' -WorkingDirectory '${path.dirname(executable).replaceAll("'","''")}' -ArgumentList @('--owner','${process.pid}','--pipe','${nonce}'${options.setupOnly?",'--setup-only'":options.detectHost?",'--detect-host'":options.recoveryOnly?",'--recover-storage'":''}) -Verb RunAs -WindowStyle Hidden`;
- await run(powershellPath(),powershellArgs(launch),{env:cleanWindowsEnvironment(),timeoutMs:30000});
+ options.onPhase?.('authorizing');await runner(powershellPath(),powershellArgs(launch),{env:cleanWindowsEnvironment(),timeoutMs:30000});options.onPhase?.('connecting');
  const expected=await brokerSourceDigest(),until=Date.now()+120000;for(;;){try{const hello=await client.hello();if(hello.sourceDigest!==expected)throw new AppError('权限代理版本与当前源码不一致，请重新安装',409,'BROKER_UPDATE_REQUIRED');return client;}catch(error){if(!(error instanceof AppError)||error.code!=='BROKER_UNAVAILABLE'||Date.now()>until)throw error;await new Promise(resolve=>setTimeout(resolve,200));}}
 }
 

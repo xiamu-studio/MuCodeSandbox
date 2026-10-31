@@ -11,10 +11,14 @@ switch($Case){
  'disk' {
   Check ([MuResourceMetrics]::DiskFootprint(32GB) -gt 32GB+64MB) 'Disk format overhead was not reserved'
   Check ([MuResourceMetrics]::DiskFootprint(1GB) -eq 1GB+64MB) 'Minimum disk metadata reserve is missing'
-  [MuResourcePolicy]::DiskRequest(44GB,10GB,32GB)
-  Reject {[MuResourcePolicy]::DiskRequest(44GB-1,10GB,32GB)} 'RESOURCE_DISK'
-  Reject {[MuResourcePolicy]::DiskRequest(2GB-1,0,0)} 'RESOURCE_DISK'
-  Reject {[MuResourcePolicy]::DiskRequest([long]::MaxValue,[long]::MaxValue,1)} 'RESOURCE_DISK'
+  Check ([MuResourcePolicy]::DiskFloor -eq 8GB -and [MuResourcePolicy]::GrowthReserveLimit -eq 16GB) 'Incorrect disk protection policy'
+  [MuResourcePolicy]::DiskRequest(50GB,10GB,32GB)
+  Reject {[MuResourcePolicy]::DiskRequest(50GB-1,10GB,32GB)} 'RESOURCE_DISK'
+  [MuResourcePolicy]::DiskRequest(24GB,221GB,0)
+  Reject {[MuResourcePolicy]::DiskRequest(24GB-1,221GB,0)} 'RESOURCE_DISK'
+  [MuResourcePolicy]::DiskRequest(223GB,221GB,0)
+  Reject {[MuResourcePolicy]::DiskRequest(8GB-1,0,0)} 'RESOURCE_DISK'
+  Reject {[MuResourcePolicy]::DiskRequest([long]::MaxValue,[long]::MaxValue,[long]::MaxValue)} 'RESOURCE_DISK'
   Reject {[MuResourcePolicy]::DiskRequest(1,0,-1)} 'ArgumentException'
  }
  'memory' {

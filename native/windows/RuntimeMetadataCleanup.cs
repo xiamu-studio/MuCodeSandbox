@@ -32,7 +32,7 @@ public static class MuRuntimeMetadataCleanup {
                 if((attributes&FileAttributes.ReparsePoint)!=0)throw new IOException("Metadata reparse entry rejected");
                 if((attributes&FileAttributes.Directory)!=0){if(seed||name!="seed")throw new IOException("Unexpected metadata directory; files retained");node.Children.Add(ReadTree(entry,reset,true));}
                 else{
-                    var allowed=seed?new[]{"meta-data","user-data","network-config"}:new[]{"management","management.pub","host-ed25519","host-ed25519.pub","known_hosts","seed.iso","allocation.json","manifest.json"};
+                    var allowed=seed?new[]{"meta-data","user-data","network-config"}:new[]{"management","management.pub","host-ed25519","host-ed25519.pub","known_hosts","seed.iso","allocation.json","manifest.json","backup-restore.json"};
                     if(!allowed.Contains(name)||reset&&name=="manifest.json")throw new IOException("Unexpected metadata file; files retained");node.Files.Add(entry);
                 }
             }

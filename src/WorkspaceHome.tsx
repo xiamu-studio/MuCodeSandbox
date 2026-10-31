@@ -1,0 +1,21 @@
+import type {ReactNode} from 'react';
+import {Box,ChevronRight,Circle,Cpu,MemoryStick,Plus,ShieldCheck,Upload,Globe} from 'lucide-react';
+import type {Snapshot} from '../shared/types.ts';
+import {Button,SectionHeading,Status,dateLabel} from './components.tsx';
+import {SetupChecklist} from './SetupChecklist.tsx';
+interface WorkspaceHomeProps {requireSandboxStart?:boolean;snapshot:Snapshot;onCreate:()=>void;onImport:()=>void;onSelect:(id:string)=>void;onSystem:()=>void;onNetwork:(id:string)=>void;onBrowser:(id:string)=>void;onHelp:()=>void;search:string;platformLabel?:string;createDisabled?:boolean;importDisabled?:boolean;hostAccess?:string;hostAccessDetail?:string;children?:ReactNode}
+export function WorkspaceHome({requireSandboxStart=false,snapshot,onCreate,onImport,onSelect,onSystem,onNetwork,onBrowser,onHelp,search,platformLabel='Apple Silicon',createDisabled=false,importDisabled=false,hostAccess='宿主权限按需授权',hostAccessDetail='目录与命令分别批准',children}:WorkspaceHomeProps){
+  const environments = snapshot.environments.filter(e => `${e.name} ${e.description}`.toLowerCase().includes(search.toLowerCase()));
+  const running = snapshot.environments.filter(e => e.state === 'running');
+  const allocated = running.filter(e => e.kind === 'vm').reduce((sum, e) => sum + e.memoryGiB, 0);
+  return <><header className="page-header workspace-header"><div><div className="eyebrow">本地工作区</div><h1>MuCodeSandbox</h1><p>{snapshot.system.hostname} <span>·</span> {platformLabel} <span>·</span> 本地运行</p></div><Button className="primary" icon={<Plus size={16} />} disabled={createDisabled} onClick={onCreate}>新建环境</Button></header>
+    <div className="workspace-stats"><div><span>全部环境</span><strong>{snapshot.environments.length}<small>个</small></strong></div><div><span><Circle size={7} fill="#3c8c70" />运行中</span><strong>{running.length}<small>个</small></strong></div><div><span>已分配内存</span><strong>{allocated}<small>/ {snapshot.system.memoryGiB} GB</small></strong></div><div><span>虚拟机运行组件</span><strong className="runtime-stat">{snapshot.system.runtime.available ? <><ShieldCheck size={17} />已就绪</> : <><Circle size={9} />未安装</>}</strong></div></div>
+    <SetupChecklist requireSandboxStart={requireSandboxStart} snapshot={snapshot} onCreate={onCreate} onSystem={onSystem} onNetwork={onNetwork} onBrowser={onBrowser} onHelp={onHelp}/>
+    {children}
+    <section className="environment-list"><SectionHeading title="我的环境" subtitle={`${environments.length} 个环境`} action={<Button icon={<Upload size={16} />} disabled={importDisabled || snapshot.jobs.some(job => job.environmentId === null && job.status === 'running')} onClick={onImport}>导入备份</Button>} />
+      {environments.length ? <div className="env-table"><div className="env-table-header"><span>环境</span><span>状态</span><span>资源</span><span>网络</span><span>最近更新</span><span /></div>{environments.map(e => <button className="env-table-row" key={e.id} onClick={() => onSelect(e.id)}><span className="env-table-name"><span className={`environment-symbol color-${e.color}`}>{e.kind === 'vm' ? <Box size={21} /> : <Globe size={21} />}</span><span><strong>{e.name}</strong><small>{e.description || (e.kind === 'vm' ? 'Ubuntu 24.04 LTS' : '独立浏览器会话')}</small></span></span><Status state={e.state} /><span className="env-table-resource">{e.kind === 'vm' ? `${e.cpus} CPU · ${e.memoryGiB} GB` : 'Chromium'}</span><span className="env-table-network">{e.network.mode === 'direct' ? '直连' : e.network.mode.toUpperCase()}</span><time>{dateLabel(e.updatedAt)}</time><ChevronRight size={17} /></button>)}</div> : <div className="workspace-empty"><div className="empty-icon"><Box size={36} strokeWidth={1.5} /></div><h2>{search ? '没有匹配的环境' : '还没有环境'}</h2>{!search && <Button icon={<Plus size={16} />} className="primary" disabled={createDisabled} onClick={onCreate}>新建环境</Button>}</div>}
+    </section>
+    <div className="host-band"><div><span className="host-symbol"><Cpu size={22} /></span><span><strong>{snapshot.system.cpus} 核心</strong><small>本机 CPU</small></span></div><div><span className="host-symbol"><MemoryStick size={22} /></span><span><strong>{snapshot.system.memoryGiB} GB</strong><small>本机内存</small></span></div><div><span className="host-symbol"><ShieldCheck size={22} /></span><span><strong>{hostAccess}</strong><small>{hostAccessDetail}</small></span></div></div>
+  </>;
+}
+

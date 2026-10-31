@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import { createSocket, type RemoteInfo } from 'node:dgram';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { once } from 'node:events';
 import express from 'express';
 import dns from 'dns2';
@@ -9,7 +9,12 @@ import { z } from 'zod';
 import { FEATURES_JS, PROBE_JS, PROBE_HTML } from './probe-assets.ts';
 import { createMockMessages } from './mock-messages.ts';
 
-export async function createAcceptanceLab() {
+export interface AcceptanceLabOptions {accessToken?:string;runId?:string}
+export async function createAcceptanceLab(options:AcceptanceLabOptions={}) {
+  if(options.accessToken!==undefined&&!/^[a-f0-9]{64}$/.test(options.accessToken))throw Error('Invalid private lab capability');
+  if(options.runId!==undefined&&(!options.accessToken||!z.uuid().safeParse(options.runId).success))throw Error('Invalid private lab identity');
+  const prefix=options.accessToken?'/control/'+options.accessToken:'';
+  const asset=(source:string)=>prefix?source.replaceAll("'/","'"+prefix+'/').replaceAll('"/','"'+prefix+'/'):source;
   const receipts: { id: string; result: unknown }[] = [];
   const events: { kind: string; address: string; name?: string; port?: number; at: string }[] = [];
   const sessions = new Map<string, string>();
@@ -43,23 +48,28 @@ export async function createAcceptanceLab() {
   app.use((req, res, next) => {
     const hosts = [`127.0.0.1:${port}`, `localhost:${port}`, ...extraOrigins];
     if (!hosts.includes(req.headers.host ?? '') || (req.headers.origin && !hosts.map(h => `http://${h}`).includes(req.headers.origin))) { res.status(403).json({ error: 'Lab origin rejected' }); return; }
+    if(options.accessToken){
+      const match=req.url.match(/^\/control\/([a-f0-9]{64})(\/[^#]*)$/);
+      if(!match||!timingSafeEqual(Buffer.from(match[1]),Buffer.from(options.accessToken))){res.status(404).type('text').send('Not found');return;}
+      req.url=match[2];
+    }
     res.setHeader('Cache-Control', 'no-store');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','no-referrer');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; worker-src 'self'; frame-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'");
     record({ kind: 'http', address: req.socket.remoteAddress ?? '' }); next();
   });
   app.use(express.json({ limit: '96kb' }));
-  app.get('/', (_req,res)=>res.type('html').send(PROBE_HTML));
+  app.get('/', (_req,res)=>res.type('html').send(asset(PROBE_HTML)));
   app.get('/features.js', (_req,res)=>res.type('js').send(FEATURES_JS));
-  app.get('/probe.js', (_req,res)=>res.type('js').send(PROBE_JS));
-  app.get('/worker.js', (_req,res)=>res.type('js').send("import {measure} from '/features.js';measure().then(result=>postMessage(result));"));
-  app.get('/frame', (_req,res)=>res.type('html').send('<!doctype html><script type="module" src="/frame.js"></script>'));
-  app.get('/frame.js', (_req,res)=>res.type('js').send("import {measure} from '/features.js';measure().then(result=>parent.postMessage(result,location.origin));"));
+  app.get('/probe.js', (_req,res)=>res.type('js').send(asset(PROBE_JS)));
+  app.get('/worker.js', (_req,res)=>res.type('js').send(asset("import {measure} from '/features.js';measure().then(result=>postMessage(result));")));
+  app.get('/frame', (_req,res)=>res.type('html').send(asset('<!doctype html><script type="module" src="/frame.js"></script>')));
+  app.get('/frame.js', (_req,res)=>res.type('js').send(asset("import {measure} from '/features.js';measure().then(result=>parent.postMessage(result,location.origin));")));
   app.get('/api/echo',(req,res)=>res.json({ address:req.socket.remoteAddress, userAgent:req.headers['user-agent']??'', acceptLanguage:req.headers['accept-language']??'', clientHints:{platform:req.headers['sec-ch-ua-platform']??'',brands:req.headers['sec-ch-ua']??''} }));
   const session = (cookie='') => cookie.split(';').map(v=>v.trim()).find(v=>v.startsWith('mu-lab='))?.slice(7)??'';
   app.post('/api/login',(req,res)=>{
     const {account}=z.object({account:z.enum(['synthetic-a','synthetic-b'])}).strict().parse(req.body);
     const id=randomUUID(); if(sessions.size>=1000)sessions.clear();sessions.set(id,account);
-    res.setHeader('Set-Cookie',`mu-lab=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);res.json({account});
+    res.setHeader('Set-Cookie',`mu-lab=${id}; HttpOnly; SameSite=Strict; Path=${prefix}/; Max-Age=3600`);res.json({account});
   });
   app.get('/api/session',(req,res)=>res.json({account:sessions.get(session(req.headers.cookie))??null}));
   app.post('/api/receipts',(req,res)=>{const result=z.record(z.string(),z.unknown()).parse(req.body);const item={id:randomUUID(),result};receipts.push(item);if(receipts.length>100)receipts.shift();res.status(201).json({id:item.id});});
@@ -78,7 +88,8 @@ export async function createAcceptanceLab() {
   app.post('/v1/messages/count_tokens', messages.countTokens);
   app.get('/api/status',(_req,res)=>res.json(info()));
   app.use((error:unknown,_req:express.Request,res:express.Response,_next:express.NextFunction)=>res.status(400).json({error:error instanceof z.ZodError?'Invalid synthetic input':'Invalid lab request'}));
-  const info = () => ({running:true,url:`http://127.0.0.1:${port}`,dnsPort:dnsServer.address().port,stunPort:socket.address().port,receiptCount:receipts.length,eventCount:events.length,modelCalls:modelCalls+messages.receipts.length,scope:'loopback-only'});
+  const info = () => ({running:true,url:`http://127.0.0.1:${port}${prefix}${prefix?'/':''}`,dnsPort:dnsServer.address().port,stunPort:socket.address().port,receiptCount:receipts.length,eventCount:events.length,modelCalls:modelCalls+messages.receipts.length,scope:prefix?'windows-host-control-loopback':'loopback-only',...(options.runId?{runId:options.runId}:{})});
+  if(prefix){server.requestTimeout=10000;server.headersTimeout=10000;server.keepAliveTimeout=1000;server.maxRequestsPerSocket=128;}
   try {
     dnsServer.listen(0,'127.0.0.1');await once(dnsServer,'listening');
     stunServer.listen(0,'127.0.0.1',()=>{});await once(stunServer,'listening');
@@ -87,6 +98,7 @@ export async function createAcceptanceLab() {
   let closing:Promise<void>|null=null;
   const close=()=>closing??=(async()=>{messages.close();server.closeAllConnections();await new Promise<void>(resolve=>server.close(()=>resolve()));await new Promise<void>(resolve=>dnsServer.close(()=>resolve()));stunServer.close();await new Promise<void>(resolve=>socket.close(()=>resolve()));sessions.clear();receipts.length=0;events.length=0;})();
   const allowLoopbackPort = (value:number) => {
+    if(prefix)throw Error('Private host control never accepts a guest forwarding origin');
     if(!Number.isInteger(value)||value<1||value>65535)throw new Error('Invalid guest loopback port');
     extraOrigins.add(`127.0.0.1:${value}`);
   };

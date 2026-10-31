@@ -1,0 +1,34 @@
+import assert from 'node:assert/strict';
+import {mkdtemp,rm} from 'node:fs/promises';
+import path from 'node:path';
+import {tmpdir} from 'node:os';
+import {createServer} from 'vite';
+import {chromium} from 'playwright-core';
+import {environmentSchema} from '../server/validation.ts';
+
+// Isolated UI acceptance: all API responses are synthetic and no VM is touched.
+const root=path.resolve(import.meta.dirname,'..'),cache=await mkdtemp(path.join(tmpdir(),'mu-compact-ui-'));
+const environment={...environmentSchema.parse({name:'磁盘回收测试',diskGiB:32}),id:'12345678-1234-4234-8234-123456789abc',state:'stopped',browserRunning:false,instanceName:'fixture',createdAt:'',updatedAt:'',lastError:null};
+const source=`import React from 'react';import{createRoot}from'react-dom/client';import Panel from '/src/windows/WindowsDiskCompactionPanel.tsx';import '/src/styles.css';window.__MU_CONFIG__={token:'fixture',version:'fixture',platform:'win32'};createRoot(document.getElementById('root')).render(<Panel environment={${JSON.stringify(environment)}} disabled={false} onChange={async()=>{}}/>);`;
+const server=await createServer({root,cacheDir:cache,logLevel:'error',server:{host:'127.0.0.1',port:0},plugins:[{name:'compaction-fixture',resolveId(id){if(id==='/compact-fixture.tsx')return id;},load(id){if(id==='/compact-fixture.tsx')return source;},configureServer(vite){vite.middlewares.use(async(req,res,next)=>{if(req.url!=='/compact-fixture.html')return next();res.setHeader('Content-Type','text/html');res.end(await vite.transformIndexHtml(req.url,'<!doctype html><meta charset="utf-8"><div id="root"></div><script type="module" src="/compact-fixture.tsx"></script>'));});}}]});
+await server.listen();const address=server.httpServer!.address();assert.ok(address&&typeof address!=='string');
+const browser=await chromium.launch({executablePath:process.env.MU_CHROME_EXE??'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true});
+const page=await browser.newPage(),posts:unknown[]=[],schedulePosts:unknown[]=[],errors:string[]=[];
+let status:Record<string,unknown>={pending:false},schedule:{enabled:boolean;nextAt:number|null;lastAt:number|null;result:'done'|'blocked'|'pending'|'failed'|null;running:boolean}={enabled:false,nextAt:null,lastAt:null,result:null,running:false},dropScheduleResponse=false;
+page.on('pageerror',error=>errors.push(error.message));
+await page.route('**/*',async route=>{const request=route.request(),url=new URL(request.url());if(url.hostname!=='127.0.0.1')throw Error('Unexpected external request');if(!url.pathname.startsWith('/api/'))return route.continue();const prefix=`/api/environments/${environment.id}/disk-compaction`;if(url.pathname===prefix+'/schedule'){if(request.method()==='POST'){schedulePosts.push(request.postDataJSON());schedule={...schedule,enabled:request.postDataJSON().enabled};if(dropScheduleResponse){dropScheduleResponse=false;return route.abort();}}return route.fulfill({json:schedule});}assert.equal(url.pathname,prefix);if(request.method()==='POST'){posts.push(request.postDataJSON());return route.fulfill({status:202,json:{id:'fixture'}});}return route.fulfill({json:status});});
+try{
+ await page.goto(`http://127.0.0.1:${address.port}/compact-fixture.html`);
+ const open=page.getByRole('button',{name:'回收磁盘空间'}),name=page.getByRole('textbox',{name:'输入完整环境名称以确认'});
+ await open.click();const start=page.getByRole('button',{name:'开始回收'});await start.waitFor();assert.equal(await start.isDisabled(),true);await page.getByRole('button',{name:'开启定期回收'}).evaluate(button=>{(button as HTMLButtonElement).click();(button as HTMLButtonElement).click();});await page.getByRole('button',{name:'关闭定期回收'}).waitFor();assert.equal(schedulePosts.length,1);await page.getByRole('button',{name:'关闭定期回收'}).click();await page.getByRole('button',{name:'开启定期回收'}).waitFor();await name.fill(environment.name);await start.evaluate(button=>{(button as HTMLButtonElement).click();(button as HTMLButtonElement).click();});await page.getByRole('dialog').waitFor({state:'hidden'});assert.equal(posts.length,1);assert.deepEqual(posts[0],{operation:'start',confirmation:environment.name});
+ status={pending:true,platformId:'87654321-4321-4321-8321-abcdefabcdef',diskIdentifier:'abcdefab-4321-4321-8321-123456789abc',diskGiB:32,phase:'compacting',beforeBytes:5*2**30};
+ await open.click();await page.getByText(/确认磁盘压缩结果/).waitFor();await page.getByText(/5\.00 GiB/).waitFor();assert.equal(await page.getByRole('button',{name:'取消未提交的维护'}).count(),0);assert.equal(await page.getByRole('button',{name:'开启定期回收'}).isDisabled(),true);await name.fill(environment.name);await page.getByRole('button',{name:'继续检查'}).click();assert.deepEqual(posts[1],{operation:'resume',confirmation:environment.name});
+ status={...status,jobTracked:false};await open.click();await page.getByText(/原压缩作业身份未记录/).waitFor();await name.fill(environment.name);assert.equal(await page.getByRole('button',{name:'继续检查'}).isDisabled(),true);await page.locator('footer').getByRole('button',{name:'关闭',exact:true}).click();
+ status={...status,phase:'trimming',jobTracked:null};await open.click();const cancel=page.getByRole('button',{name:'取消未提交的维护'});await cancel.waitFor();await name.fill(environment.name);await cancel.click();assert.deepEqual(posts[2],{operation:'cancel',confirmation:environment.name});assert.deepEqual(errors,[]);
+ status={pending:false};schedule={enabled:true,lastAt:Date.UTC(2026,9,29,1),nextAt:Date.UTC(2026,9,29,2),result:'blocked',running:false};await open.click();await page.getByText(/条件暂不满足，稍后重试/).waitFor();await page.getByText(/下次检查不早于/).waitFor();await page.locator('footer').getByRole('button',{name:'关闭',exact:true}).click();
+ schedule={...schedule,result:'pending'};await open.click();await page.getByText(/自动回收已暂停/).waitFor();assert.equal(await page.getByText(/下次检查不早于/).count(),0);await page.locator('footer').getByRole('button',{name:'关闭',exact:true}).click();
+ schedule={...schedule,result:'done'};await open.click();await page.getByText(/回收已完成/).waitFor();await page.getByText(/下次检查不早于/).waitFor();
+ dropScheduleResponse=true;await page.getByRole('button',{name:'关闭定期回收'}).click();await page.getByText(/定期回收状态未确认/).waitFor({timeout:2000});assert.equal(await page.getByRole('button',{name:'关闭定期回收'}).count(),0);assert.equal(await page.getByRole('button',{name:'开启定期回收'}).count(),0);
+ await page.getByRole('button',{name:'重新检查回收设置'}).click();await page.getByRole('button',{name:'开启定期回收'}).waitFor();assert.equal(schedule.enabled,false);assert.deepEqual(errors,[]);
+ console.log('Compaction UI main path: start, fenced resume, and pre-submission cancel passed with synthetic API');
+}finally{await browser.close();await server.close();assert.equal(path.dirname(cache),path.resolve(tmpdir()));assert.match(path.basename(cache),/^mu-compact-ui-/);await rm(cache,{recursive:true,force:true});}

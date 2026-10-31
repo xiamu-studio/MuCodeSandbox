@@ -39,3 +39,27 @@ Windows 自动测试 164 项通过，包含图片来源、手势、异步失效�
 本机忽略文件 .mu-data/windows-run/pro-image-complete.json、image-package-audit.json、image-tests.txt 和 image-shared-tests.txt 保存分项证据。账号、密钥、令牌、磁盘、截图、个人路径及运行回执不提交。
 
 独立收尾确认内层 VM、专属交换机、受保护登记及运行目录均为零，VMMS 已恢复就绪；合成自动登录关闭，外层 Pro 测试机 Off。物理宿主启动时间、Mac main 引用保持不变。实际切网和休眠、音频、真实输入法、翻译浮窗、安装版首次认证及发布回归仍按 [Windows 工作清单](windows-work-plan.md) 继续。
+
+## preview.27 Linux 图片取回实现
+
+Windows 新增“取回沙箱图片”，读取当前受保护 Linux 显示会话的 PNG 剪贴板并在页面预览；随后用户再次点击“复制图片到 Windows”才写入宿主剪贴板。取回不自动覆盖宿主内容，不轮询，不读取 PRIMARY、文件列表或外部网页。Windows 专用接口和模块不改变 Mac 图片流程。
+
+读取沿用当前环境传输互斥与原联网会话绑定；普通客体用户以固定命令只取 `image/png`，限制时长、字节、像素、编码与完整 PNG 内容。请求取消、防护撤销、会话切换或画面重连后，旧结果不能交付为可复制预览。没有图片或格式错误时保持宿主内容。宿主复制限定聚焦的正常工作区主框架、本机来源、导航代次和隔离世界用户激活；显式动作后用 Electron 44 的 `ClipboardItem` / `clipboard.write` 仅写 PNG，不放宽网页权限拒绝策略。
+
+8 项新增 Windows 边界测试包含完整 PNG 验证、错误与过大返回、互斥/撤销/取消、旧会话 HTTP 响应、原生焦点与真实激活边界、导航失效、异步输入快照及前端大小/尺寸检查。全套345项Windows测试、21项工作区检查、17项输入组件检查及完整构建通过；组件确认取回只预览、第二次点击才写入，重连丢弃旧结果及空图片保留宿主内容。上述为代码与夹具结果，真实已安装 Linux→Windows 手势及系统剪贴板像素比对另行记录。
+
+实际 preview.27 原目录升级返回0，原配置、两环境登记及升级前后两块Off原盘摘要保持，203个安装文件与包一致。仅启动原日常VM，沿用用户批准的Clash 127.0.0.1:7897；原本地页、脚本、canary、已接收PNG摘要与nonce核对后，在新回环本地页显示同一64×48四色图。实际Linux Chrome图片右键“Copy image”后，经产品“取回沙箱图片”显示预览，再点击“复制图片到Windows”，产品报告成功。独立只读取Windows PNG，Electron位图与独立Pillow RGBA均与原图一致；PNG从208字节重编码为277字节，字节摘要不同。Windows画图新空白文档Ctrl+V后出现同一四色图，选区64×48；未保存该临时画图文档，原合成源文件保持。
+
+图片系统剪贴板读回完成于2026-10-24 04:58:57。随后05:00:05后台核验出现 `curl: (56) Failure when receiving data from the peer`，产品自动关闭日常环境，数据库状态为error并确认停机；不是本轮手动正常停止。独立Hyper-V核对原备份VM和日常VM均Off。Clash本机监听仍存在，但这不能证明上游或接收端健康，当前证据也不能确定具体接收端。没有放宽TLS、回执、出口核验或故障断网策略。运行日志只有成功启动/浏览器信息，尚缺这次失败的结构化接收端诊断；此项加入稳定性待办，不能标记整轮稳定运行通过。
+
+私有证据：`local-preview27-images-complete.json`、`local-preview27-image-pixel-audit.json`、`local-preview27-egress-incident.json`、`local-preview27-native-stop.json`、`local-preview27-upgrade-two-vm-audit.json`，及`local-desktop-preview27-images`下的菜单/预览/复制/画图截图与原生系统剪贴板PNG。Mac实机、更多图片尺寸/透明度和来源组合仍待回归；真实空间不足、完整桌面恢复启动、听音、物理切网与休眠继续待验收。
+
+2026-10-27 preview.50 图片与真实拼音专项实机进展：实际安装b672aeea、真实Linux/X11/Chrome中右键复制本地合成64×32不透明RGB图；产品“取回沙箱图片”显示预览，独立点击“复制图片到Windows”，在新启动画图的空白64×32画布Ctrl+V后另存PNG。解码后2048像素RGB全一致，alpha全255，RGB SHA256 7de80639525fd153974e92ee9393eb1566c2dd1ee9e90785ae2e8c5c516237a7；未在画图打开原图，排除预加载原图假通过。专属画图已保存关闭。仅此次Linux→Windows单张小不透明图通过，Windows→Linux实际图片粘贴、透明/大图及更多来源仍待验收。
+
+本轮用实际n/i按键出现“你”候选，组合输入时产品粘贴按钮禁用，空格选你；h/a/o候选好、空格选好，实际草稿你好。产品粘贴到客体本地框后，客体按键独立加1，客体Ctrl+A/C再点取回客体文字，原生selected_text精确为你好1。没有用文字注入或直接设值代替中文选字；当前输入法基本候选与往返通过，不扩为全部输入法/候选翻页/组合中CtrlEnter或重连边界通过。
+
+正常关闭浏览器后再正常停止，4任务全成功，最终3环境stopped/0运行任务；当前Codex工作区 outputs/native50-image-roundtrip/acceptance.json、pixel-verification.json、ime-return-selection.json和原生文字树保留证据。另发现上一轮关闭任务成功后本轮Chrome仍显示Restore pages，未点恢复/遥测，干净退出根因继续定位，不按成功任务提前关闭此待办。没有代理/账号/环境/备份删除、没有新构建安装；实际仍50，文件状态提示源码待集中打包。原备份恢复开机与物理故障、跨夜、听音及发布门槛仍在。
+
+2026-10-27 preview.50 新完成 Windows→Linux 图片实机验收：独立48×24不透明RGBA合成PNG在本轮新画图窗口打开/全选/Ctrl+C，实际产品“图片粘贴→粘贴图片到沙箱”读取Windows系统剪贴板，客体本地接收框真实Ctrl+V收到image/png并逐像素计算SHA256。客体复制回执，经产品取回文字，原生selected_text与独立源摘要 d527e6cbd30f9933ee688189bf512becfaa411e899dccc1e0740dc40f92c138e 完全一致；接收HTML没有嵌入预期图或摘要，没有注入预期回执。专属画图正常退出，PNG原摘要未变。证据 outputs/native50-host-image/acceptance.json；862.794秒、122success/0fail、同一出口IP，仅本次小不透明图/按钮原生读取路径，不扩为全部尺寸/透明图/宿主面板Ctrl+V事件/联网根因已修复。验收清单最初将LF文本摘要误当实际CRLF文件摘要，已核对仅换行差异并修正清单，HTML/PNG未改动；修正记录保留。
+
+关闭流程有可重复触发路径：初次已有Restore pages，仅关闭该气泡（未恢复页面、未勾选遥测）；正常Close browser任务3d290ded后重新打开5df3cedd，实际画面没有恢复气泡。随后浏览器开着时直接Stop environment任务f1281c11，重启ffa7c915并打开8c507f02后气泡重新出现。故“旧气泡尚未确认”解释重复出现，但普通停止环境路径也会新触发；下一步需补正常停止时的浏览器退出收尾，不能改写退出标记或隐藏气泡，更不能延迟故障保护断网/独立强制停机。当前仅定位，尚未修复交付。最终关闭气泡、正常关闭浏览器15675e62，再停止环境成功，3环境全stopped/0活动任务；应用保持打开。证据 outputs/native50-close-acknowledgement.json。源码 src/panels.tsx 补close-browser中文标签，TypeScript检查0（会话70316终态），与已有上传确认提示修改同待集中构建，实际仍50；原完整恢复开机、物理切网/休眠/跨夜/听音与发布门槛仍未完成。

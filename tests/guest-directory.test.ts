@@ -35,3 +35,10 @@ test('Directory API validates path, cursor scope and revision before guest calls
  allowed=true;runtime.guest=async()=>{calls++;allowed=false;return '{"files":[],"total":0,"nextCursor":null}';};await assert.rejects(exchange.listDirectory(e.id,'downloads'),/revoked/);assert.equal(calls,1);
  allowed=true;runtime.guest=async()=>{throw Error('MU_TRANSFER_FILE_CHANGED');};await assert.rejects(exchange.download(e.id,'downloads','a','','a'.repeat(64)),{code:'TRANSFER_FILE_CHANGED'});
 });
+test('Cancelling a directory listing aborts its guest request and releases the exchange lock',async()=>{
+ const e={...environmentSchema.parse({name:'fixture'}),id:'fixture',instanceName:'fixture',state:'running',updatedAt:'initial'} as Environment;
+ const runtime=new LimaRuntime('/tmp/mu-dir-unused'),controller=new AbortController();let entered!:()=>void;const started=new Promise<void>(resolve=>entered=resolve);
+ runtime.guest=async(_e,_command,options)=>{assert.equal(options?.signal,controller.signal);entered();return await new Promise<string>((_resolve,reject)=>options!.signal!.addEventListener('abort',()=>reject(options!.signal!.reason),{once:true}));};
+ const exchange=new GuestExchange(runtime,async()=>e),pending=exchange.listDirectory(e.id,'downloads','',undefined,controller.signal);await started;assert.equal(exchange.busy.has(e.id),true);controller.abort();await assert.rejects(pending,{name:'AbortError'});assert.equal(exchange.busy.has(e.id),false);
+ runtime.guest=async()=>'{"files":[],"total":0,"nextCursor":null}';assert.deepEqual(await exchange.listDirectory(e.id,'downloads'),{files:[],total:0,nextCursor:null});
+});

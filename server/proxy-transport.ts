@@ -16,7 +16,7 @@ interface Transport extends ProxyTransportIdentity {
 
 // EOF from the owning host process closes the whole SSH session, including
 // forwarded channels. A pidfd prevents signalling a recycled guest PID.
-export const PROXY_SESSION = `import os,signal,sys
+export function proxySessionScript(observer?:{start:string;stop:string;ready?:string}){return `import os,signal,sys
 pid=os.getppid()
 for _ in range(32):
  if pid<=1: raise RuntimeError('SSH session ancestor not found')
@@ -25,14 +25,14 @@ for _ in range(32):
  with open('/proc/%d/status'%pid) as f:
   pid=int(next(line.split(':',1)[1] for line in f if line.startswith('PPid:')))
 else: raise RuntimeError('SSH session ancestor not found')
-print('MU_PROXY_SESSION_READY',flush=True)
-try:
+${observer?.start??''}${observer?.ready??"print('MU_PROXY_SESSION_READY',flush=True)\n"}try:
  while sys.stdin.buffer.read(4096): pass
 finally:
- try: signal.pidfd_send_signal(session,signal.SIGTERM)
+${observer?.stop??''} try: signal.pidfd_send_signal(session,signal.SIGTERM)
  except ProcessLookupError: pass
  os.close(session)
-`;
+`;}
+export const PROXY_SESSION=proxySessionScript();
 
 export class ProxyTransports {
   entries = new Map<string, Transport>();

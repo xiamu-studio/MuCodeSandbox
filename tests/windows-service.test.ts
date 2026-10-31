@@ -1,6 +1,6 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp,mkdir,writeFile,readFile,rm} from 'node:fs/promises';
+import {mkdtemp,mkdir,writeFile,readFile,rm,link,unlink} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import path from 'node:path';
 import {request as httpRequest} from 'node:http';
@@ -13,6 +13,42 @@ import type {WindowsBackend} from '../server/platform/windows/manager.ts';
 import type {HyperVRuntime} from '../server/platform/windows/runtime.ts';
 import {WindowsNetworkSession} from '../server/platform/windows/session.ts';
 import {windowsPaths} from '../server/platform/windows/config.ts';
+import {VERSION} from '../server/platform/windows/release.ts';
+import {windowsApplication} from '../server/platform/windows/application.ts';
+
+test('Windows build metadata validates complete bounded receipts and never reads the runtime directory',async()=>{
+ const root=await mkdtemp(path.join(tmpdir(),'mu-build-receipt-')),file=path.join(root,'build-info.json'),value={buildId:'1111222233334444',builtAt:'2026-10-24T07:22:27.618Z',channel:'local-test'};
+ try{
+  assert.deepEqual(await windowsApplication(root,VERSION),{channel:'source-preview',buildId:'working-tree',builtAt:null});
+  await writeFile(file,JSON.stringify(value));assert.deepEqual(await windowsApplication(root,VERSION),{channel:'source-preview',buildId:value.buildId,builtAt:value.builtAt});
+  for(const changed of [{...value,buildId:'private-path'}, {...value,builtAt:'bad-date'}, {...value,channel:'signed-release'}, {...value,extra:'MUST_NOT_LEAK'}, {buildId:value.buildId}, 'x'.repeat(4097)]){
+   await writeFile(file,typeof changed==='string'?changed:JSON.stringify(changed));assert.deepEqual(await windowsApplication(root,VERSION),{channel:'source-preview',buildId:'unknown',builtAt:null});
+  }
+  await writeFile(file,JSON.stringify(value));await link(file,path.join(root,'hardlink'));assert.equal((await windowsApplication(root,VERSION)).buildId,'unknown');await unlink(path.join(root,'hardlink'));
+  await writeFile(path.join(root,'package.json'),JSON.stringify({name:'mucodesandbox-windows-preview',version:'0.0.0-preview.1'}));assert.deepEqual(await windowsApplication(root,VERSION),{channel:'desktop-test',buildId:'unknown',builtAt:null});
+  await writeFile(path.join(root,'package.json'),JSON.stringify({name:'mucodesandbox-windows-preview',version:VERSION}));assert.deepEqual(await windowsApplication(root,VERSION),{channel:'desktop-test',buildId:value.buildId,builtAt:value.builtAt});
+  await unlink(file);await mkdir(path.join(root,'runtime'));await writeFile(path.join(root,'runtime/build-info.json'),JSON.stringify(value));assert.deepEqual(await windowsApplication(root,VERSION),{channel:'desktop-test',buildId:'unknown',builtAt:null});
+ }finally{assert.equal(path.dirname(path.resolve(root)),path.resolve(tmpdir()));assert.match(path.basename(root),/^mu-build-receipt-/);await rm(root,{recursive:true,force:true});}
+});
+
+for(const receipt of ['valid','missing','corrupt'] as const)test('Windows snapshot reports the actual packaged build or an honest unknown: '+receipt,{skip:process.platform!=='win32'},async()=>{
+ const root=await mkdtemp(path.join(tmpdir(),'mu-windows-application-'));
+ await mkdir(path.join(root,'dist'));await writeFile(path.join(root,'dist/index.html'),'<!-- MU_BOOTSTRAP -->');
+ await writeFile(path.join(root,'package.json'),JSON.stringify({name:'mucodesandbox-windows-preview',version:VERSION}));
+ const expected={buildId:'0123456789abcdef',builtAt:'2026-10-24T07:22:27.618Z',channel:'local-test'};
+ if(receipt!=='missing')await writeFile(path.join(root,'build-info.json'),receipt==='valid'?JSON.stringify(expected):JSON.stringify({...expected,builtAt:'not-a-date',privateFixture:'MUST_NOT_LEAK'}));
+ const unexpected=async()=>{throw Error('Unexpected VM operation during build metadata read');};
+ const runtime:WindowsBackend&Pick<HyperVRuntime,'fingerprint'>={info:async()=>({available:true,issues:[]}),fingerprint:async()=>'fixture',state:async()=>({state:'Off'}),stop:async()=>{},create:unexpected,start:unexpected,session:unexpected,connect:unexpected,inspectGuard:unexpected};
+ const service=await createWindowsService({rootDir:root,dataDir:path.join(root,'app'),runtimeRoot:path.join(root,'runtime'),runtime});
+ try{
+  const launch=await fetch(service.launchUrl(),{redirect:'manual'}),cookie=launch.headers.get('set-cookie')!.split(';')[0];
+  const html=await(await fetch(service.url,{headers:{Cookie:cookie}})).text(),config=JSON.parse(html.match(/window\.__MU_CONFIG__=(\{.*?\});/)![1]);
+  const headers={Cookie:cookie,Authorization:'Bearer '+config.token};assert.equal((await fetch(service.url+'/api/snapshot')).status,401);
+  const snapshot=await(await fetch(service.url+'/api/snapshot',{headers})).json();
+  assert.equal(snapshot.system.version,VERSION);assert.deepEqual(snapshot.system.application,{channel:'desktop-test',buildId:receipt==='valid'?expected.buildId:'unknown',builtAt:receipt==='valid'?expected.builtAt:null});
+  assert.ok(!JSON.stringify(snapshot).includes('MUST_NOT_LEAK'));
+ }finally{await service.close();assert.equal(path.dirname(path.resolve(root)),path.resolve(tmpdir()));assert.match(path.basename(root),/^mu-windows-application-/);await rm(root,{recursive:true,force:true});}
+});
 
 for(const phase of ['clipboard-completion','clipboard-authorization','download-completion','download-authorization'] as const)test(`Old Windows exchange work cannot cross a restart at ${phase}`,{skip:process.platform!=='win32',timeout:30000},async()=>{
  const root=await mkdtemp(path.join(tmpdir(),'mu-windows-exchange-session-')),runtimeRoot=path.join(root,'runtime');
@@ -44,7 +80,7 @@ for(const phase of ['clipboard-completion','clipboard-authorization','download-c
   assert.equal(calls,oldCalls,'Old private work must never execute in the new guest session');
   assert.equal(service.manager.sessions.get(e.id)?.state,'active');
   assert.equal(service.exchange!.busy.has(e.id),false);
-  await operate();assert.equal(calls,oldCalls+(phase.startsWith('clipboard')?3:1));
+  await operate();assert.equal(calls,oldCalls+1);
  }finally{release();await service.close();assert.equal(path.dirname(path.resolve(root)),path.resolve(tmpdir()));await rm(root,{recursive:true,force:true});}
 });
 
@@ -67,6 +103,9 @@ test('Windows API requires its launch cookie, bearer token, valid Host and same 
   assert.match(page.headers.get('content-security-policy')!,/frame-ancestors 'none'/);
   const bootstrap=JSON.parse((await page.text()).match(/window\.__MU_CONFIG__=(\{.*?\});/)![1]);
   assert.equal(bootstrap.platform,'win32');
+  assert.equal(bootstrap.capabilities.browserDetails,false);
+  assert.equal(bootstrap.capabilities.browserStartup,false);
+  assert.equal(bootstrap.capabilities.browserReset,false);
   const headers={Cookie:sessionCookie,Authorization:'Bearer '+bootstrap.token,'Content-Type':'application/json'};
   assert.equal((await fetch(service.url+'/api/windows/host',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).status,401);
   assert.equal((await fetch(service.url+'/api/windows/host',{method:'POST',headers,body:JSON.stringify({features:['anything']})})).status,400);
@@ -94,10 +133,32 @@ test('Windows API requires its launch cookie, bearer token, valid Host and same 
   assert.ok(!(await readFile(path.join(root,'app','state.sqlite-wal'))).includes(Buffer.from(input.network.password)));
   assert.equal((await fetch(service.url+'/api/environments/'+e.id+'/actions/delete',{method:'POST',headers})).status,400);
   assert.equal((await fetch(service.url+'/api/environments/'+e.id+'/browser/open',{method:'POST',headers})).status,409);
+  for(const body of [{startup:'native'},{startup:'configured',url:'file:///etc/passwd'}])assert.equal((await fetch(service.url+'/api/environments/'+e.id+'/browser/open',{method:'POST',headers,body:JSON.stringify(body)})).status,400);
+  assert.equal((await fetch(service.url+'/api/environments/'+e.id+'/browser/open',{method:'POST',headers,body:JSON.stringify({startup:'configured'})})).status,409);
   await assert.rejects(createWindowsService(options),{code:'ALREADY_RUNNING'});
   await service.close();service=undefined;
   service=await createWindowsService(options);assert.equal(service.manager.store.list().length,1);
  }finally{await service?.close();await rm(root,{recursive:true,force:true});}
+});
+
+test('Browser details capability requires both guest browser and guest-reading backends',{skip:process.platform!=='win32'},async()=>{
+ for(const enabled of [false,true]){
+  const root=await mkdtemp(path.join(tmpdir(),'mu-windows-browser-caps-'));let service:Awaited<ReturnType<typeof createWindowsService>>|undefined;
+  try{await mkdir(path.join(root,'dist'));await writeFile(path.join(root,'dist/index.html'),'<!-- MU_BOOTSTRAP -->');
+   const runtime:WindowsBackend&Pick<HyperVRuntime,'fingerprint'|'guest'>&Partial<Pick<HyperVRuntime,'management'|'serviceStreamFactory'>>={info:async()=>({available:true,issues:[]}),fingerprint:async()=>'fixture',state:async()=>({state:'Off'}),stop:async()=>{},create:async()=>{},start:async()=>{},session:async()=>{throw Error('Not used');},connect:async()=>{},inspectGuard:async()=>{throw Error('Not used');},guest:async()=>{throw Error('Capability rendering must not run a guest command');}};
+   if(enabled){runtime.management=async()=>{throw Error('Not used');};runtime.serviceStreamFactory=async()=>{throw Error('Not used');};}
+   service=await createWindowsService({rootDir:root,dataDir:path.join(root,'app'),runtimeRoot:path.join(root,'vms'),runtime,base:{image:path.join(root,'base.vhdx'),imageSha256:'a'.repeat(64)}});
+   const launch=await fetch(service.launchUrl(),{redirect:'manual'}),cookie=launch.headers.get('set-cookie')!.split(';')[0],html=await(await fetch(service.url,{headers:{Cookie:cookie}})).text(),bootstrap=JSON.parse(html.match(/window\.__MU_CONFIG__=(\{.*?\});/)![1]);assert.equal(bootstrap.capabilities.browser,enabled);assert.equal(bootstrap.capabilities.browserDetails,enabled);assert.equal(bootstrap.capabilities.browserStartup,enabled);assert.equal(bootstrap.capabilities.browserReset,false);
+   if(enabled){
+    const environment=await service.manager.create({name:'Configured start fixture',cpus:1,memoryGiB:2,diskGiB:16,network:{mode:'http',host:'127.0.0.1',port:12345,strict:true,transparent:true,egressLock:{expectedIp:'203.0.113.10'}}});
+    const launches:unknown[][]=[];service.browser!.open=async(...args)=>{launches.push([args[0],args[2]]);};
+    service.manager.submit=async(id,action,work)=>{await work({});return {id:'fixture-job',environmentId:id,action,status:'succeeded',createdAt:new Date().toISOString(),finishedAt:new Date().toISOString(),message:'Fixture'};};
+    const headers={Cookie:cookie,Authorization:'Bearer '+bootstrap.token,'Content-Type':'application/json'};
+    for(const body of [{},{startup:'configured'}]){const response:Response=await fetch(service.url+'/api/environments/'+environment.id+'/browser/open',{method:'POST',headers,body:JSON.stringify(body)});assert.equal(response.status,202);}
+    assert.deepEqual(launches,[[environment.id,'blank'],[environment.id,'configured']]);
+   }
+  }finally{await service?.close();assert.equal(path.dirname(path.resolve(root)),path.resolve(tmpdir()));await rm(root,{recursive:true,force:true});}
+ }
 });
 
 test('Windows workspace lock releases cleanly and uses canonical directory identity',{skip:process.platform!=='win32'},async()=>{

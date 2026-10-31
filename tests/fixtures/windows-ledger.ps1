@@ -1,9 +1,10 @@
 [CmdletBinding()]
-param([string]$Directory,[string]$Source,[ValidateSet('fresh','legacy','orphans','loss','corruption','interrupted','conflict','missing','schema','links','permissions','limit','recovery-missing','recovery-corrupt','recovery-stale','recovery-trust','disk-growth','disk-growth-schema')][string]$Case)
+param([string]$Directory,[string]$Source,[ValidateSet('fresh','legacy','orphans','loss','corruption','interrupted','conflict','missing','schema','links','permissions','limit','recovery-missing','recovery-corrupt','recovery-stale','recovery-trust','disk-growth','disk-growth-schema','disk-compaction','restore-journal','restore-origin','origin-initialization')][string]$Case)
 $ErrorActionPreference='Stop'
 Add-Type -AssemblyName System.Web.Extensions
 $header='using System;using System.IO;using System.Linq;using System.Text;using System.Collections.Generic;using System.Runtime.InteropServices;using System.Web.Script.Serialization;'
-Add-Type -TypeDefinition ($header+[Environment]::NewLine+[IO.File]::ReadAllText($Source)) -ReferencedAssemblies @('System.dll','System.Core.dll','System.Web.Extensions.dll')
+$core=Join-Path $Directory 'ledger-core.cs';[IO.File]::WriteAllText($core,$header+[Environment]::NewLine+[IO.File]::ReadAllText($Source),[Text.UTF8Encoding]::new($false))
+Add-Type -Path @($core,(Join-Path (Split-Path $Source) 'OriginPreparation.cs')) -ReferencedAssemblies @('System.dll','System.Core.dll','System.Web.Extensions.dll')
 $root=[IO.Path]::GetFullPath($Directory);$sid='S-1-5-21-1-2-3-1001';$id='12345678-1234-4234-8234-123456789012';$vmId='87654321-4321-4321-8321-210987654321'
 $primary=Join-Path $root 'vms.json';$backup=Join-Path $root 'vms.backup.json';$canary=Join-Path $root ('vms/'+$id+'/canary.txt')
 [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($canary)) | Out-Null;[IO.File]::WriteAllText($canary,'original guest bytes')
@@ -19,6 +20,49 @@ function Check-Copies {
  $a=[IO.File]::ReadAllText($primary);$b=[IO.File]::ReadAllText($backup);Check ($a -ceq $b) 'Replicated copies differ';$saved=$json.DeserializeObject($a);Check ($saved.version -eq 2 -and $saved.ownerSid -eq $sid -and $saved.records.Count -eq 1 -and $saved.records[$id].platformId -eq $vmId) 'Allocation identity changed';Check ([IO.File]::ReadAllText($canary) -ceq 'original guest bytes') 'Guest bytes changed'
 }
 switch($Case){
+ 'disk-compaction' {
+  $s=Seed;$script:denyPrimary=$false
+  $validator=[Action[string]]{param($file) if($script:denyPrimary -and $file -eq $primary){throw [IO.IOException]::new('Synthetic compaction publication interruption')}}
+  $s=[MuProtectedLedger]::new($root,$sid,$validator);$loaded=$s.Load()
+  $journal=$json.DeserializeObject('{"diskIdentifier":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","fileIdentity":"'+('a'*24)+'","diskGiB":32,"beforeBytes":5368709120,"phase":"preparing"}')
+  $loaded[$id]['diskCompaction']=$journal;$script:denyPrimary=$true;Reject {$s.Save($loaded)} 'IOException';$script:denyPrimary=$false
+  $loaded=(Store).Load();Check ($loaded[$id].diskCompaction.phase -ceq 'preparing') 'Interrupted maintenance intent was lost';Check-Copies
+  foreach($phase in @('trimming','armed','compacting','verifying')){$loaded[$id].diskCompaction.phase=$phase;(Store).Save($loaded);Check ((Store).Load()[$id].diskCompaction.phase -ceq $phase) 'Maintenance phase did not persist';Check-Copies}
+  $loaded[$id].diskCompaction.phase='compacting';$loaded[$id].diskCompaction['jobId']='cccccccc-cccc-4ccc-8ccc-cccccccccccc';$loaded[$id].diskCompaction['operationId']='dddddddd-dddd-4ddd-8ddd-dddddddddddd';(Store).Save($loaded);$loaded=(Store).Load();Check ($loaded[$id].diskCompaction.jobId -ceq 'cccccccc-cccc-4ccc-8ccc-cccccccccccc' -and $loaded[$id].diskCompaction.operationId -ceq 'dddddddd-dddd-4ddd-8ddd-dddddddddddd') 'Compaction identities were not durable';Check-Copies
+  $loaded[$id].diskCompaction.operationId='invalid';Reject {(Store).Save($loaded)} 'UnauthorizedAccessException';$loaded=(Store).Load();$loaded[$id].diskCompaction.jobId='invalid';Reject {(Store).Save($loaded)} 'UnauthorizedAccessException';$loaded=(Store).Load();$loaded[$id].diskCompaction.phase='verifying';Reject {(Store).Save($loaded)} 'UnauthorizedAccessException';$loaded=(Store).Load();$loaded[$id].diskCompaction.Remove('jobId')|Out-Null;$loaded[$id].diskCompaction.Remove('operationId')|Out-Null;$loaded[$id].diskCompaction.phase='verifying';(Store).Save($loaded);$loaded=(Store).Load();Check-Copies
+  $valid=[IO.File]::ReadAllText($primary)
+  foreach($kind in @('phase','guid','file','capacity','before','unknown','missing','not-ready','not-ever-ready','builder','growth','restore')){
+   $x=$json.DeserializeObject($valid);$r=$x.records[$id];switch($kind){'phase'{$r.diskCompaction.phase='completed'};'guid'{$r.diskCompaction.diskIdentifier='invalid'};'file'{$r.diskCompaction.fileIdentity='bad'};'capacity'{$r.diskCompaction.diskGiB=31};'before'{$r.diskCompaction.beforeBytes=-1};'unknown'{$r.diskCompaction['path']='C:\foreign.vhdx'};'missing'{$r.diskCompaction.Remove('phase')|Out-Null};'not-ready'{$r.stage='allocated'};'not-ever-ready'{$r.everReady=$false};'builder'{$r['baseBuilder']=$false};'growth'{$r['diskGrowth']=$null};'restore'{$r['backupRestore']=$null}}
+   $text=$json.Serialize($x);[IO.File]::WriteAllText($primary,$text);[IO.File]::WriteAllText($backup,$text);Reject {(Store).Load()|Out-Null} 'UnauthorizedAccessException';Check ([IO.File]::ReadAllText($primary) -ceq $text -and [IO.File]::ReadAllText($backup) -ceq $text) 'Invalid maintenance record was overwritten'
+  }
+ }
+ 'origin-initialization' {
+  $plan=$json.DeserializeObject('{"version":1,"epoch":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","rootFile":{"fileId":"aaaaaaaaaaaaaaaaaaaaaaaa","birthFileTime":"100"},"directoryFile":null,"storeFile":null}')
+  $journal=$json.DeserializeObject('{"diskSha256":"'+('b'*64)+'","diskBytes":1048576,"seedSha256":"'+('c'*64)+'","seedBytes":49152}')
+  $journal['originInitialization']=$plan;$record['backupRestore']=$journal;$record['restoreOrigin']=$true;Seed|Out-Null
+  Check ((Store).Load()[$id].backupRestore.originInitialization.storeFile -eq $null) 'Unbound preparation lost';Check-Copies
+  $plan.directoryFile=$json.DeserializeObject('{"fileId":"bbbbbbbbbbbbbbbbbbbbbbbb","birthFileTime":"200"}');$plan.storeFile=$json.DeserializeObject('{"fileId":"cccccccccccccccccccccccc","birthFileTime":"300"}');(Store).Save($records)
+  Check ((Store).Load()[$id].backupRestore.originInitialization.storeFile.fileId -ceq ('c'*24)) 'Bound preparation lost';Check-Copies;$valid=[IO.File]::ReadAllText($primary)
+  foreach($kind in @('version','epoch','unknown','root','half-bound','overlap','birth','untracked')){
+   $x=$json.DeserializeObject($valid);$r=$x.records[$id];$p=$r.backupRestore.originInitialization
+   switch($kind){'version'{$p.version='1'};'epoch'{$p.epoch='bad'};'unknown'{$p['path']='F:\foreign'};'root'{$p.rootFile.fileId='0'*24};'half-bound'{$p.storeFile=$null};'overlap'{$p.storeFile=$p.rootFile};'birth'{$p.storeFile.birthFileTime='0300'};'untracked'{$r.Remove('restoreOrigin')|Out-Null}}
+   $text=$json.Serialize($x);[IO.File]::WriteAllText($primary,$text);[IO.File]::WriteAllText($backup,$text);Reject {(Store).Load()|Out-Null} 'UnauthorizedAccessException';Check ([IO.File]::ReadAllText($primary) -ceq $text -and [IO.File]::ReadAllText($backup) -ceq $text) 'Invalid initialization witness was overwritten'
+  }
+ }
+ 'restore-origin' {
+  $record['restoreOrigin']=$true;$record['everReady']=$true;Seed|Out-Null;Check ((Store).Load()[$id].restoreOrigin -eq $true) 'Origin marker was lost';$valid=[IO.File]::ReadAllText($primary)
+  foreach($kind in @('string','no-ready','builder','sealed')){
+   $x=$json.DeserializeObject($valid);$r=$x.records[$id];switch($kind){'string'{$r.restoreOrigin='true'};'no-ready'{$r.everReady=$false};'builder'{$r['baseBuilder']=$false};'sealed'{$r['sealedSource']='mu-base:'+('a'*64)}}
+   $text=$json.Serialize($x);[IO.File]::WriteAllText($primary,$text);[IO.File]::WriteAllText($backup,$text);Reject {(Store).Load()|Out-Null} 'UnauthorizedAccessException';Check ([IO.File]::ReadAllText($primary) -ceq $text -and [IO.File]::ReadAllText($backup) -ceq $text) 'Invalid origin authority was overwritten'
+  }
+ }
+ 'restore-journal' {
+  $journal=[Collections.Generic.Dictionary[string,object]]::new();$journal.Add('diskSha256',('b'*64));$journal.Add('diskBytes',1048576);$journal.Add('seedSha256',('c'*64));$journal.Add('seedBytes',49152);$record['backupRestore']=$journal
+  $s=Seed;$loaded=(Store).Load();Check ($loaded[$id].ContainsKey('backupRestore')) 'Restore journal was lost';Check-Copies;$original=[IO.File]::ReadAllText($primary)
+  foreach($key in @('diskSha256','diskBytes','seedBytes')){$old=$journal[$key];$journal[$key]=if($key -eq 'diskSha256'){'bad'}elseif($key -eq 'diskBytes'){40L*1024*1024*1024}else{1};Reject {$s.Save($records)} 'UnauthorizedAccessException';$journal[$key]=$old;Check ([IO.File]::ReadAllText($primary) -ceq $original) 'Invalid restore journal overwrote a valid copy'}
+  $record['baseBuilder']=$false;Reject {$s.Save($records)} 'UnauthorizedAccessException';$record.Remove('baseBuilder')|Out-Null;$record['everReady']=$false;Reject {$s.Save($records)} 'UnauthorizedAccessException';$record['everReady']=$true
+  Check-Copies
+ }
  'disk-growth' {
   $s=Seed;$script:denyPrimary=$false
   $validator=[Action[string]]{param($file) if($script:denyPrimary -and $file -eq $primary){throw [IO.IOException]::new('Synthetic growth publication interruption')}}

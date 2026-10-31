@@ -35,7 +35,7 @@ finally:os.close(lock)
 print(json.dumps({'closed':True,'volatileState':True}))
 `;
 }
-async function armMaintenance(runtime:MaintenanceRuntime,config:WindowsConfig,options:RunOptions){const proof=z.object({closed:z.literal(true),volatileState:z.literal(true)}).strict().parse(JSON.parse(await runtime.management(config,['sudo','-n','python3','-'],{...options,input:armWindowsDiskMaintenanceScript(config),timeoutMs:15000,maxBytes:4096,onOutput:undefined})));return proof;}
+export async function armWindowsDiskMaintenance(runtime:Pick<MaintenanceRuntime,'management'>,config:WindowsConfig,options:RunOptions){const proof=z.object({closed:z.literal(true),volatileState:z.literal(true)}).strict().parse(JSON.parse(await runtime.management(config,['sudo','-n','python3','-'],{...options,input:armWindowsDiskMaintenanceScript(config),timeoutMs:15000,maxBytes:4096,onOutput:undefined})));return proof;}
 export function windowsRootGrowthScript(targetGiB:number,review=false){windowsDiskSize.parse(targetGiB);return `import json,os,stat,subprocess,tempfile,shutil
 assert os.geteuid()==0
 environment=dict(os.environ,LC_ALL='C',LANG='C',PATH='/usr/sbin:/usr/bin:/sbin:/bin')
@@ -89,7 +89,7 @@ export async function growWindowsDisk(runtime:MaintenanceRuntime,config:WindowsC
  await runtime.disconnect(config.id);
  if(!status.pending){
   const current={...config,diskGiB:status.actualGiB};
-  try{await runtime.startDiskReview(current,options);await armMaintenance(runtime,current,options);const guard=await runtime.inspectGuard(current);if(guard.leaseActive||guard.remainingMs!==0)throw Error('Disk review requires a verified closed business network');const reviewed=windowsFilesystemGrowth.parse(JSON.parse(await runtime.management(current,['sudo','-n','python3','-'],{...options,input:windowsRootGrowthScript(status.actualGiB,true),timeoutMs:30000,maxBytes:16384,onOutput:undefined})));if(reviewed.diskBytes!==status.actualGiB*GiB||reviewed.filesystemBytes>reviewed.partitionBytes||reviewed.partitionStartBytes+reviewed.partitionBytes>reviewed.diskBytes)throw Error('Unsupported root geometry');options.signal?.throwIfAborted();}
+  try{await runtime.startDiskReview(current,options);await armWindowsDiskMaintenance(runtime,current,options);const guard=await runtime.inspectGuard(current);if(guard.leaseActive||guard.remainingMs!==0)throw Error('Disk review requires a verified closed business network');const reviewed=windowsFilesystemGrowth.parse(JSON.parse(await runtime.management(current,['sudo','-n','python3','-'],{...options,input:windowsRootGrowthScript(status.actualGiB,true),timeoutMs:30000,maxBytes:16384,onOutput:undefined})));if(reviewed.diskBytes!==status.actualGiB*GiB||reviewed.filesystemBytes>reviewed.partitionBytes||reviewed.partitionStartBytes+reviewed.partitionBytes>reviewed.diskBytes)throw Error('Unsupported root geometry');options.signal?.throwIfAborted();}
   finally{await runtime.stop(current);}
  }
  const expanded={...config,diskGiB:targetGiB};let filesystem:z.infer<typeof windowsFilesystemGrowth>|undefined;
@@ -97,7 +97,7 @@ export async function growWindowsDisk(runtime:MaintenanceRuntime,config:WindowsC
   options.signal?.throwIfAborted();
   const result=z.object({grown:z.literal(true),diskGiB:windowsDiskSize,pending:z.boolean()}).strict().parse(await runtime.broker.call('grow-disk',{id:config.id,targetGiB},{signal:options.signal,timeoutMs:180000}));
   if(result.diskGiB!==targetGiB||!result.pending)throw Error('Unexpected growth journal receipt');
-  await runtime.startDiskMaintenance(expanded,options);options.signal?.throwIfAborted();await armMaintenance(runtime,expanded,options);
+  await runtime.startDiskMaintenance(expanded,options);options.signal?.throwIfAborted();await armWindowsDiskMaintenance(runtime,expanded,options);
   const guard=await runtime.inspectGuard(expanded);if(guard.leaseActive||guard.remainingMs!==0)throw Error('Maintenance requires a verified closed business network');
   filesystem=windowsFilesystemGrowth.parse(JSON.parse(await runtime.management(expanded,['sudo','-n','python3','-'],{...options,input:windowsRootGrowthScript(targetGiB),timeoutMs:120000,maxBytes:16384,onOutput:undefined})));
   if(filesystem.diskBytes!==targetGiB*GiB||filesystem.filesystemBytes<filesystem.beforeFilesystemBytes||filesystem.filesystemBytes>filesystem.partitionBytes||filesystem.partitionBytes-filesystem.filesystemBytes>32*2**20||filesystem.partitionStartBytes+filesystem.partitionBytes>filesystem.diskBytes||filesystem.diskBytes-filesystem.partitionStartBytes-filesystem.partitionBytes>32*2**20)throw Error('Filesystem growth capacity did not match the requested disk');

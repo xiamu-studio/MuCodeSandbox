@@ -20,6 +20,8 @@ async function fixture() {
   runtime.renewLease = async (_e, activate = false) => { events.push(activate ? 'activate' : 'renew'); };
   runtime.revokeLease = async () => {};
   const manager = new Manager(root, undefined, runtime);
+  // Power tests use a synthetic runtime, not native Mac snapshot durability.
+  manager.snapshots.recover = async () => {};
   clearInterval(manager.protectionTimer);
   manager.onQuarantine = () => { events.push('revoke-access'); };
   const e = await manager.create({ name: 'Power test', cpus: 1, memoryGiB: 1, network: { mode: 'http', host: 'proxy.test', strict: true, transparent: true } });
@@ -92,6 +94,99 @@ test('Shutdown failure remains visible and never automatically activates or rest
     assert.ok(!f.events.includes('activate') && !f.events.includes('start'));
     await assert.rejects(f.manager.assertAccess(f.e.id));
   } finally { await f.cleanup(); }
+});
+
+for (const trigger of ['suspend', 'changed', 'failed'] as const) {
+  for (const stopFails of [false, true]) {
+    test(`${trigger}: incident and logs do not claim shutdown before its ${stopFails ? 'failure' : 'confirmation'}`, async () => {
+      const f = await fixture(), stopped = deferred();
+      f.runtime.stop = async () => { await stopped.promise; if (stopFails) throw new Error('Synthetic unconfirmed stop'); };
+      try {
+        f.manager.enableHostNetworkMonitor();
+        await f.manager.handleHostNetworkEvent('ready');
+        const pending = trigger === 'suspend' ? f.manager.handleHostPowerEvent(trigger) : f.manager.handleHostNetworkEvent(trigger);
+        const before = f.manager.protectionEvents(f.e.id)[0];
+        assert.equal(before.kind, 'host');
+        assert.equal(before.stopResult, 'requested');
+        assert.doesNotMatch(before.issue, /已关闭|已停止/);
+        const logs = f.manager.store.logs(f.e.id);
+        assert.ok(logs.some(log => log.message.includes(before.issue)));
+        assert.ok(logs.every(log => !/已关闭|已停止/.test(log.message)));
+        assert.equal(f.manager.store.get(f.e.id).state, 'stopping');
+        await assert.rejects(f.manager.assertAccess(f.e.id));
+        stopped.resolve(); await pending;
+        const after = f.manager.protectionEvents(f.e.id)[0];
+        assert.equal(after.id, before.id);
+        assert.equal(after.stopResult, stopFails ? 'failed' : 'confirmed');
+        assert.doesNotMatch(after.issue, /已关闭|已停止/);
+        if (stopFails) assert.match(after.stopIssue ?? '', /Synthetic unconfirmed stop/);
+        assert.ok(!f.events.includes('start') && !f.events.includes('activate'));
+      } finally { stopped.resolve(); await f.cleanup(); }
+    });
+  }
+}
+
+for (const write of ['state', 'log', 'newJob', 'finishJob'] as const) {
+  test(`Protection still revokes and stops when ${write} storage fails`, async t => {
+    const f = await fixture();
+    try {
+      f.manager.enableHostNetworkMonitor(); await f.manager.handleHostNetworkEvent('ready');
+      t.mock.method(f.manager.store, write, () => { throw new Error('Synthetic disk write failure'); });
+      await f.manager.handleHostNetworkEvent('changed');
+      assert.ok(f.events.includes('revoke-access'));
+      assert.equal(f.events.filter(value => value === 'stop').length, 1);
+      assert.equal(f.manager.protectionEvents(f.e.id)[0].stopResult, 'confirmed');
+      assert.equal(f.manager.quarantines.size, 0);
+      t.mock.restoreAll();
+      await assert.rejects(f.manager.assertAccess(f.e.id), {code: 'QUARANTINED'});
+      assert.ok(!f.events.includes('renew') && !f.events.includes('activate'));
+    } finally { t.mock.restoreAll(); await f.cleanup(); }
+  });
+}
+
+test('A failed stop and failed state writes remain denied until an explicit verified restart', async t => {
+  const f = await fixture();
+  try {
+    t.mock.method(f.manager.store, 'state', () => { throw new Error('Synthetic disk full'); });
+    t.mock.method(f.runtime, 'stop', async () => { f.events.push('stop-failed'); throw new Error('Synthetic stop failure'); });
+    await f.manager.handleHostPowerEvent('resume');
+    assert.equal(f.manager.protectionEvents(f.e.id)[0].stopResult, 'failed');
+    assert.equal(f.manager.store.get(f.e.id).state, 'running');
+    t.mock.restoreAll();
+    await assert.rejects(f.manager.assertAccess(f.e.id), {code: 'QUARANTINED'});
+    assert.ok(!f.events.includes('renew'));
+    // No native Mac snapshot operations are exercised by this host lifecycle test.
+    t.mock.method(f.manager.snapshots, 'recover', async () => {});
+    const protection = t.mock.method(f.runtime, 'networkProtection', async () => ({active: false, integrity: 'failed', issues: ['Synthetic bad protection']} as unknown as NetworkProtection));
+    const rejected = await f.manager.lifecycle(f.e.id, 'restart');
+    await f.manager.tasks.get(rejected.id)?.promise;
+    assert.equal(f.manager.store.jobs().find(row => row.id === rejected.id)?.status, 'failed');
+    await assert.rejects(f.manager.assertAccess(f.e.id), {code: 'QUARANTINED'});
+    assert.ok(!f.events.includes('activate'));
+    protection.mock.restore();
+    const job = await f.manager.lifecycle(f.e.id, 'restart');
+    await f.manager.tasks.get(job.id)?.promise;
+    assert.equal(f.manager.store.jobs().find(row => row.id === job.id)?.status, 'succeeded');
+    await f.manager.assertAccess(f.e.id);
+    assert.ok(f.events.includes('activate') && f.events.includes('renew'));
+  } finally { t.mock.restoreAll(); await f.cleanup(); }
+});
+
+test('Combined failed writes and connection revocation cannot suppress the runtime stop', async t => {
+  const f = await fixture();
+  try {
+    for (const write of ['state', 'log', 'newJob', 'addProtectionEvent'] as const)
+      t.mock.method(f.manager.store, write, () => { throw new Error('Synthetic full disk'); });
+    f.manager.onQuarantine = () => { f.events.push('revoke-failed'); throw new Error('Synthetic viewer revoke failure'); };
+    await f.manager.handleHostPowerEvent('resume');
+    assert.equal(f.events.filter(value => value === 'stop').length, 1);
+    assert.equal(f.events.filter(value => value === 'revoke-failed').length, 2);
+    const incident = f.manager.protectionEvents(f.e.id)[0];
+    assert.equal(incident.persisted, false);
+    assert.equal(incident.stopResult, 'confirmed');
+    t.mock.restoreAll();
+    await assert.rejects(f.manager.assertAccess(f.e.id), {code: 'QUARANTINED'});
+  } finally { t.mock.restoreAll(); await f.cleanup(); }
 });
 
 test('A suspend arriving during asynchronous startup checks prevents VM launch', async () => {

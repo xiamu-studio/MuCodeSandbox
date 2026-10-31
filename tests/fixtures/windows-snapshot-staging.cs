@@ -1,0 +1,48 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Collections.Generic;
+using System.Threading;
+using System.Security.Cryptography;
+using System.Web.Script.Serialization;
+
+// Ordinary synthetic files only. The protection/stopped/space callbacks do not
+// establish protected ACLs, VM state, or permission to delete retained copies.
+public static class MuSnapshotStagingFixture {
+    private sealed class Fixture {
+        public string root,id,allocation;public int reservations,stops,reads;public string boundary;public Action<string> observer;
+        public Fixture(string directory):this(directory,null){}
+        public Fixture(string directory,string existing){root=directory;id=existing??Guid.NewGuid().ToString("D");Guid parsed;if(!Guid.TryParseExact(id,"D",out parsed)||parsed.ToString("D")!=id)throw new IOException("Fixture identity");allocation=Path.Combine(root,id);if(existing!=null)return;Directory.CreateDirectory(allocation);File.WriteAllBytes(Path.Combine(allocation,"disk.vhdx"),new byte[2*1048576+19]);File.WriteAllBytes(Path.Combine(allocation,"seed.iso"),new byte[65536]);}
+        public MuOfflineSnapshotStore Store(){return new MuOfflineSnapshotStore(allocation,id,p=>{if(!Path.GetFullPath(p).StartsWith(Path.GetFullPath(root)+Path.DirectorySeparatorChar,StringComparison.OrdinalIgnoreCase))throw new IOException("Fixture boundary");Directory.CreateDirectory(p);},p=>{reads++;return new FileStream(p,FileMode.Open,FileAccess.Read,FileShare.Read);},n=>{reservations++;},()=>{stops++;},point=>{if(observer!=null)observer(point);if(point==boundary)throw new OperationCanceledException("Synthetic interruption");});}
+        public Dictionary<string,string> Inventory(){return Directory.GetFiles(allocation,"*",SearchOption.AllDirectories).ToDictionary(p=>p.Substring(allocation.Length),p=>{using(var h=SHA256.Create())using(var input=File.OpenRead(p))return Convert.ToBase64String(h.ComputeHash(input));});}
+        public void Unchanged(Dictionary<string,string> before){var after=Inventory();Require(before.Count==after.Count&&before.All(pair=>after.ContainsKey(pair.Key)&&after[pair.Key]==pair.Value),"Retained file inventory changed");}
+        public MuOfflineSnapshotStore.Snapshot Create(){return Store().Create("synthetic","opaque-owner-encrypted",CancellationToken.None);}
+        public void RetryBlocked(MuOfflineSnapshotStore.Snapshot saved){var before=Inventory();int count=reservations;Require(Fails(()=>Create()),"New creation admitted");if(saved!=null)Require(Fails(()=>Store().PrepareRestore(saved.id,"opaque-current-encrypted",CancellationToken.None)),"Restore preparation admitted");Require(reservations==count,"Retry reserved more capacity");Unchanged(before);}
+    }
+    private static void Require(bool condition,string message){if(!condition)throw new InvalidOperationException(message);}
+    private static bool Fails(Action work){try{work();return false;}catch(InvalidOperationException error){return error.Message.StartsWith("Unpublished snapshot copies remain;");}}
+    public sealed class ProcessState {public string id,snapshotId,operation;public Dictionary<string,string> original;}
+    public static string Process(string root,string mode,string operation){
+        var json=new JavaScriptSerializer();string statePath=Path.Combine(root,"state.json");
+        if(mode=="pause"){
+            var f=new Fixture(root);var saved=operation=="restore"?f.Create():null;var state=new ProcessState{id=f.id,snapshotId=saved==null?null:saved.id,operation=operation,original=f.Inventory()};File.WriteAllText(statePath,json.Serialize(state));
+            f.observer=point=>{if(point!="copy-disk")return;File.WriteAllText(Path.Combine(root,"ready.next"),json.Serialize(new{pid=System.Diagnostics.Process.GetCurrentProcess().Id,id=f.id,operation=operation,boundary=point}));File.Move(Path.Combine(root,"ready.next"),Path.Combine(root,"ready.json"));using(var wait=new ManualResetEvent(false))wait.WaitOne(60000);throw new TimeoutException("Process not terminated at ready boundary");};
+            if(saved==null)f.Create();else f.Store().PrepareRestore(saved.id,"opaque-current-encrypted",CancellationToken.None);throw new IOException("Unreached process interruption");
+        }
+        if(mode!="inspect")throw new ArgumentException("Fixture mode");
+        var previous=json.Deserialize<ProcessState>(File.ReadAllText(statePath));if(previous.operation!=operation)throw new IOException("Fixture operation changed");var reopened=new Fixture(root,previous.id);var staging=reopened.Store().Staging();Require(staging.entries.Length==1&&staging.entries[0].operation==operation,"Process staging missing");Require(reopened.Store().Pending()==null,"Unpublished copy treated as active restore");var before=reopened.Inventory();foreach(var entry in previous.original)Require(before.ContainsKey(entry.Key)&&before[entry.Key]==entry.Value,"Original disk, seed or snapshot changed");var snapshot=previous.snapshotId==null?null:reopened.Store().Get(previous.snapshotId);reopened.RetryBlocked(snapshot);reopened.Unchanged(before);
+        return json.Serialize(new{complete=true,pid=System.Diagnostics.Process.GetCurrentProcess().Id,id=previous.id,operation=operation,retainedEntries=staging.entries.Length,extraReservations=reopened.reservations,originalFilesUnchanged=true,retainedFilesUnchanged=true,actualHyperV=false,protectedAcl=false});
+    }
+    public static string Run(string root){var checks=new List<object>();int number=0;Action<string,Action<Fixture>> test=(name,work)=>{var f=new Fixture(Path.Combine(root,(++number).ToString()));work(f);checks.Add(new{name=name,passed=true});};
+        foreach(string point in new[]{"copy-disk","copy-seed","create-before-publish"})test("create-interruption-"+point,f=>{f.boundary=point;try{f.Create();throw new InvalidOperationException("Expected interruption");}catch(OperationCanceledException){}f.boundary=null;var inventory=f.Store().Staging();Require(inventory.entries.Length==1&&inventory.entries[0].operation=="create"&&!inventory.truncated,"Missing creation entry");Require(f.Store().List().Length==0&&f.Store().Pending()==null,"Unpublished copy became a snapshot/transaction");f.RetryBlocked(null);});
+        foreach(string point in new[]{"copy-disk","copy-seed","restore-before-publish"})test("restore-interruption-"+point,f=>{var saved=f.Create();f.boundary=point;try{f.Store().PrepareRestore(saved.id,"opaque-current-encrypted",CancellationToken.None);throw new InvalidOperationException("Expected interruption");}catch(OperationCanceledException){}f.boundary=null;Require(f.Store().Staging().entries.Single().operation=="restore"&&f.Store().Pending()==null,"Unpublished preparation became active");f.RetryBlocked(saved);Require(f.Store().Get(saved.id).id==saved.id,"Existing snapshot unavailable");});
+        test("published-create-remains-visible-and-does-not-block-next-copy",f=>{f.Create();Require(f.Store().Staging().entries.Length==0,"Published copy classified as staging");f.Create();Require(f.Store().List().Length==2,"Clean next creation blocked");});
+        test("published-restore-retains-recovery-and-acknowledgement",f=>{var saved=f.Create();var restored=f.Store().PrepareRestore(saved.id,"opaque-current-encrypted",CancellationToken.None);Require(f.Store().Staging().entries.Length==0&&f.Store().Pending().id==restored.id,"Active restore misclassified");f.Store().RecoverRestore(restored.id);f.Store().AcknowledgeRestore(restored.id);Require(f.Store().Pending()==null,"Recovery acknowledgement lost");});
+        test("staging-does-not-hide-confirmed-snapshot-or-block-export",f=>{var saved=f.Create();Directory.CreateDirectory(Path.Combine(f.allocation,"snapshots","create-next-unknown"));Require(f.Store().List().Single().id==saved.id,"Existing snapshot hidden");using(var read=f.Store().OpenExport(saved.id,_=>{},()=>{},CancellationToken.None)){Require(read.Metadata.id==saved.id,"Existing export blocked");}f.RetryBlocked(saved);});
+        test("unrecognized-root-entry-is-preserved-without-blanket-fence",f=>{f.Create();string unknown=Path.Combine(f.allocation,"snapshots","unregistered-material");Directory.CreateDirectory(unknown);File.WriteAllText(Path.Combine(unknown,"keep.txt"),"KEEP");f.Create();Require(f.Store().Staging().entries.Length==0&&File.ReadAllText(Path.Combine(unknown,"keep.txt"))=="KEEP","Unknown data changed");});
+        test("malformed-case-and-file-entries-are-listed-without-adopting-contents",f=>{var saved=f.Create();string snapshotRoot=Path.Combine(f.allocation,"snapshots");Directory.CreateDirectory(Path.Combine(snapshotRoot,"CREATE-NEXT-unregistered"));File.WriteAllText(Path.Combine(snapshotRoot,"restore-next-not-a-directory"),"KEEP");int reads=f.reads;var rows=f.Store().Staging().entries;Require(rows.Length==2&&rows.Select(v=>v.operation).Distinct().Count()==2,"Case/file entry ignored");Require(f.reads==reads+1,"Staging read contents beyond the existing operation lock");f.RetryBlocked(saved);});
+        test("bounded-inventory-retains-every-file-and-prevents-more-copies",f=>{var saved=f.Create();string snapshotRoot=Path.Combine(f.allocation,"snapshots");for(int i=0;i<33;i++)Directory.CreateDirectory(Path.Combine(snapshotRoot,"create-next-"+Guid.NewGuid().ToString("D")));var before=f.Inventory();var inventory=f.Store().Staging();Require(inventory.entries.Length==32&&inventory.truncated,"Inventory bound missing");f.RetryBlocked(saved);Require(Directory.GetDirectories(snapshotRoot,"create-next-*").Length==33,"Excess entries changed");f.Unchanged(before);});
+        return new JavaScriptSerializer().Serialize(new{complete=true,realFileSystem=true,actualHyperV=false,protectedAcl=false,deletedRetainedCopies=false,checks=checks});
+    }
+}

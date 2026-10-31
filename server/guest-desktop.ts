@@ -7,6 +7,7 @@ import { AppError } from './errors.ts';
 import { shellQuote,linuxLocales } from './network-guard.ts';
 import { GUEST_AUDIO_ENV } from './guest-audio.ts';
 import { LINK_HELPER,parseGuestLink } from './guest-links.ts';
+import {parseRunningDesktopStatus} from './desktop-receipt.ts';
 
 export const desktopAppSchema=z.enum(['grok-bot','claude-desktop']);
 export const DESKTOP_RECIPES={
@@ -129,7 +130,7 @@ export class GuestDesktop {
   }
   async status(e:Environment):Promise<DesktopAppsStatus> {
     if(e.kind!=='vm'||e.state!=='running')return {supported:e.kind==='vm',apps:[],displaySharedWithBrowser:true,accountTested:false};
-    return JSON.parse(await this.runtime.management(e,['python3','-c',INSPECT_DESKTOP_SCRIPT],{timeoutMs:8000,maxBytes:16_384}));
+    return parseRunningDesktopStatus(await this.runtime.management(e,['python3','-c',INSPECT_DESKTOP_SCRIPT],{timeoutMs:8000,maxBytes:16_384}));
   }
   async install(e:Environment,id:DesktopAppId,options:RunOptions={}) {
     desktopAppSchema.parse(id);const recipe=DESKTOP_RECIPES[id];

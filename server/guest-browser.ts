@@ -28,6 +28,7 @@ import {parseGuestLink} from './guest-links.ts';
 import { displayPixels } from '../shared/guest-display.ts';
 
 export class DetachedTargetError extends Error {}
+export interface DevToolsEvent{method:string;params:any;sessionId?:string}
 
 export class DevTools {
   socket: WebSocket;
@@ -35,6 +36,7 @@ export class DevTools {
   pending = new Map<number, { resolve:(value:any)=>void; reject:(error:Error)=>void; timer:NodeJS.Timeout }>();
   attached?: (params:any)=>void;
   detached?: (params:any)=>void;
+  event?: (message:DevToolsEvent)=>void;
   activeSessions=new Set<string>();
   constructor(socket:WebSocket) {
     this.socket=socket;
@@ -42,8 +44,11 @@ export class DevTools {
       try {
         const message=JSON.parse(data.toString());
         if(message.id){const item=this.pending.get(message.id);if(!item)return;this.pending.delete(message.id);clearTimeout(item.timer);if(message.error)item.reject(message.error.message==='Session with given id not found.'?new DetachedTargetError(message.error.message):new Error(message.error.message));else item.resolve(message.result);}
-        else if(message.method==='Target.attachedToTarget'){this.activeSessions.add(message.params.sessionId);this.attached?.(message.params);}
-        else if(message.method==='Target.detachedFromTarget'){this.activeSessions.delete(message.params.sessionId);this.detached?.(message.params);}
+        else {
+          if(message.method==='Target.attachedToTarget'){this.activeSessions.add(message.params.sessionId);this.attached?.(message.params);}
+          else if(message.method==='Target.detachedFromTarget'){this.activeSessions.delete(message.params.sessionId);this.detached?.(message.params);}
+          if(typeof message.method==='string')this.event?.(message);
+        }
       } catch { socket.close(); }
     });
     socket.on('error',()=>{});

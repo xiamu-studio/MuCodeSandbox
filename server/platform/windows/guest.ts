@@ -153,7 +153,7 @@ sudo nft --check -f /etc/mucodesandbox/lease.nft
 sudo systemctl daemon-reload
 sudo systemctl enable mucodesandbox-lease.service >/dev/null
 sudo systemctl restart mucodesandbox-lease.service
-sudo python3 -c ${shellQuote(`import json,os\nwith open('/proc/sys/kernel/random/boot_id') as f: boot=f.read().strip()\nwith open('/run/mucodesandbox-lease/state','w') as f: json.dump({'session':'${session}','boot':boot,'state':'pending','deadline':0},f)\nos.chmod('/run/mucodesandbox-lease/state',0o600)`)}
+sudo /usr/bin/python3 -I -c ${shellQuote(`import json,os\nwith open('/proc/sys/kernel/random/boot_id') as f: boot=f.read().strip()\nwith open('/run/mucodesandbox-lease/state','w') as f: json.dump({'session':'${session}','boot':boot,'state':'pending','deadline':0},f)\nos.chmod('/run/mucodesandbox-lease/state',0o600)`)}
 ${startTransparentScript(tunnel)}
 # Includes cloud-init host keys/cache and the persistent closed boot rules.
 # This must finish successfully before configure returns an activation token.
@@ -164,7 +164,7 @@ sudo sync
 
 // nftables' expiring element is intentionally removed from the integrity
 // digest. Chain/rule changes and all other tables remain part of the digest.
-export const INSPECT_WINDOWS_GUARD = `sudo python3 - <<'MU_INSPECT'
+export const INSPECT_WINDOWS_GUARD = `sudo /usr/bin/python3 -I - <<'MU_INSPECT'
 import hashlib,json,subprocess,os,stat
 def cmd(*a): return subprocess.run(a,check=True,capture_output=True,text=True).stdout
 tables=[]
@@ -172,7 +172,7 @@ for name in ['mu_egress','mu_lease']:
  data=json.loads(cmd('nft','-j','list','table','inet',name))
  for item in data['nftables']:
   if 'metainfo' in item: continue
-  if 'set' in item: item['set'].pop('elem',None)
+  if name=='mu_lease' and 'set' in item and item['set'].get('family')=='inet' and item['set'].get('table')=='mu_lease' and item['set'].get('name')=='permit': item['set'].pop('elem',None)
   def clean(v):
    if isinstance(v,dict):
     return {k:clean(x) for k,x in v.items() if k not in ['handle','packets','bytes','expires']}
@@ -184,23 +184,50 @@ for f in ['/etc/mucodesandbox/network.nft','/etc/mucodesandbox/lease.nft','/etc/
  s=os.lstat(f)
  if not stat.S_ISREG(s.st_mode) or s.st_uid!=0 or s.st_mode & 0o022: raise RuntimeError('Unsafe guard file ownership')
  with open(f,'rb') as h: files[f]=hashlib.sha256(h.read()).hexdigest()
-for unit in ${JSON.stringify(WINDOWS_CLOUD_AGENT_UNITS)}:
+def check_masked_services(units):
+ output=cmd('systemctl','show','--property=Id','--property=UnitFileState','--property=ActiveState','--property=MainPID',*units)
+ seen=set()
+ for block in output.strip().split('\\n\\n'):
+  properties={}
+  for line in block.splitlines():
+   key,sep,value=line.partition('=')
+   if not sep or key not in ['Id','UnitFileState','ActiveState','MainPID'] or key in properties: raise RuntimeError('Invalid cloud agent status')
+   properties[key]=value
+  if set(properties)!=set(['Id','UnitFileState','ActiveState','MainPID']): raise RuntimeError('Incomplete cloud agent status')
+  if properties['Id'] not in units or properties['Id'] in seen: raise RuntimeError('Unexpected cloud agent identity')
+  seen.add(properties['Id'])
+  if properties['UnitFileState']!='masked': raise RuntimeError('Cloud agent is not masked')
+  if properties['ActiveState'] not in ['inactive','failed'] or properties['MainPID']!='0': raise RuntimeError('Cloud agent remains active')
+ if seen!=set(units): raise RuntimeError('Incomplete cloud agent status')
+cloud_agents=${JSON.stringify(WINDOWS_CLOUD_AGENT_UNITS)}
+for unit in cloud_agents:
  f='/etc/systemd/system/'+unit
  s=os.lstat(f)
  if not stat.S_ISLNK(s.st_mode) or s.st_uid!=0 or os.readlink(f)!='/dev/null': raise RuntimeError('Cloud agent mask changed')
- if cmd('systemctl','show','--property=UnitFileState','--value',unit).strip()!='masked': raise RuntimeError('Cloud agent is not masked')
- if cmd('systemctl','show','--property=ActiveState','--value',unit).strip() not in ['inactive','failed'] or cmd('systemctl','show','--property=MainPID','--value',unit).strip()!='0': raise RuntimeError('Cloud agent remains active')
  files[f]=hashlib.sha256(os.readlink(f).encode()).hexdigest()
-for service in ['mucodesandbox-egress','mucodesandbox-lease','mucodesandbox-tunnel']:
- cmd('systemctl','is-active',service)
- cmd('systemctl','is-enabled',service)
+check_masked_services(cloud_agents)
+def check_network_services(services):
+ active=cmd('systemctl','is-active',*services).splitlines()
+ enabled=cmd('systemctl','is-enabled',*services).splitlines()
+ if len(active)!=len(services) or any(value!='active' for value in active): raise RuntimeError('Network service is not active')
+ if len(enabled)!=len(services) or any(value not in ['enabled','enabled-runtime'] for value in enabled): raise RuntimeError('Network service is not enabled')
+check_network_services(['mucodesandbox-egress','mucodesandbox-lease','mucodesandbox-tunnel'])
 cmd('ip','link','show','mu_tun')
 cmd('systemctl','is-active','systemd-resolved')
 dns=cmd('resolvectl','dns');domains=cmd('resolvectl','domain')
-if 'Global: 172.19.0.2' not in dns or 'Global: ~.' not in domains or os.path.realpath('/etc/resolv.conf')!='/run/systemd/resolve/stub-resolv.conf': raise RuntimeError('Controlled DNS configuration changed')
+def check_controlled_dns(dns,domains):
+ def global_values(output):
+  rows=[line.partition(':')[2].split() for line in output.splitlines() if line.partition(':')[0].strip()=='Global']
+  if len(rows)!=1: raise RuntimeError('Controlled DNS global status missing or duplicated')
+  return rows[0]
+ if global_values(dns)!=['172.19.0.2'] or global_values(domains)!=['~.']: raise RuntimeError('Controlled DNS configuration changed')
+check_controlled_dns(dns,domains)
+if os.path.realpath('/etc/resolv.conf')!='/run/systemd/resolve/stub-resolv.conf': raise RuntimeError('Controlled DNS configuration changed')
 def ordered(value): return sorted(value,key=lambda x:json.dumps(x,sort_keys=True))
 network={'rules':ordered(json.loads(cmd('ip','-j','rule','show'))),'routes':ordered(json.loads(cmd('ip','-j','route','show','table','all'))),'dns':dns,'domains':domains}
 lease=json.loads(cmd('/usr/local/libexec/mu-network-lease','status'))
 digest=hashlib.sha256(json.dumps([tables,files,network],sort_keys=True,separators=(',',':')).encode()).hexdigest()
-print(json.dumps({'digest':digest,'leaseActive':lease['active'],'remainingMs':lease['remainingMs']}))
+def component(value): return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+components={'tables':component(tables),'files':component(files),'networkRules':component(network['rules']),'networkRoutes':component(network['routes']),'networkDns':component(network['dns']),'networkDomains':component(network['domains'])}
+print(json.dumps({'digest':digest,'leaseActive':lease['active'],'remainingMs':lease['remainingMs'],'components':components}))
 MU_INSPECT`;

@@ -1,6 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {execFileSync} from 'node:child_process';
+import path from 'node:path';
 import {safeTerminalPaste,terminalInputChunks,quoteTerminalPath} from '../src/terminal-input.ts';
 
 test('Tool paste keeps plain Unicode and refuses line execution when bracketed paste is unavailable',()=>{
@@ -16,8 +17,11 @@ test('Large terminal input chunks preserve emoji across the WebSocket boundary',
   assert.ok(chunks.every(chunk=>chunk.length<=16000&&!/[\ud800-\udbff]$/.test(chunk)&&!/^[\udc00-\udfff]/.test(chunk)));
 });
 test('Quoted paths stay one literal shell argument including spaces, quotes and substitutions',()=>{
+  // Run the real POSIX shell supplied by Git on Windows; never substitute cmd
+  // quoting or skip guest-shell coverage merely because /bin/sh is absent.
+  const shell=process.platform==='win32'?path.resolve(execFileSync('git',['--exec-path'],{encoding:'utf8'}).trim(),'../../../usr/bin/sh.exe'):'/bin/sh';
   for(const value of ["/home/dev/Transfers/Incoming/中文 file's.txt",'/tmp/$(printf WRONG);x`printf BAD`.txt']){
-    const output=execFileSync('/bin/sh',['-c',`printf '%s' ${quoteTerminalPath(value)}`],{encoding:'utf8'});
+    const output=execFileSync(shell,['-c',`printf '%s' ${quoteTerminalPath(value)}`],{encoding:'utf8',env:{...process.env,MSYS_NO_PATHCONV:'1'}});
     assert.equal(output,value);
   }
 });

@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies','resource-inventory','review-allocation','disk-growth-facts','grow-disk')][string]$Action)
+param([Parameter(Mandatory)][ValidateSet('doctor','register-channel','disk','export-base','seal-base','create','start','stop','status','inspect','fingerprint','recover-allocation','delete-allocation','allocation-absence','cache-dependencies','resource-inventory','review-allocation','review-snapshot-delete','review-snapshot-staging','disk-growth-facts','grow-disk','compact-disk','compact-disk-submit','compact-disk-job','backup-import-verify','snapshot-verify','snapshot-apply')][string]$Action)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -16,10 +16,34 @@ if ($Action -eq 'doctor') {
 }
 if ($Action -eq 'fingerprint') {
   # No addresses are logged; the caller retains only a digest of this snapshot.
-  $adapters = @(Get-NetAdapter | Where-Object { $_.Name -notlike 'vEthernet (mu-win-*' } | Sort-Object InterfaceGuid | Select-Object InterfaceGuid,Status,LinkSpeed)
-  $routes = @(Get-NetRoute -AddressFamily IPv4,IPv6 | Where-Object { $_.InterfaceAlias -notlike 'vEthernet (mu-win-*' } | Sort-Object DestinationPrefix,InterfaceIndex,NextHop | Select-Object DestinationPrefix,NextHop,InterfaceIndex,RouteMetric)
-  $dns = @(Get-DnsClientServerAddress | Where-Object { $_.InterfaceAlias -notlike 'vEthernet (mu-win-*' } | Sort-Object InterfaceIndex,AddressFamily | Select-Object InterfaceIndex,AddressFamily,ServerAddresses)
-  [pscustomobject]@{ adapters=$adapters; routes=$routes; dns=$dns } | ConvertTo-Json -Depth 6 -Compress
+  $queries = [ordered]@{
+    adapters = { Get-NetAdapter | Where-Object { $_.Name -notlike 'vEthernet (mu-win-*' } | Sort-Object InterfaceGuid | Select-Object InterfaceGuid,Status,LinkSpeed }.ToString()
+    routes = { Get-NetRoute -AddressFamily IPv4,IPv6 | Where-Object { $_.InterfaceAlias -notlike 'vEthernet (mu-win-*' } | Sort-Object DestinationPrefix,InterfaceIndex,NextHop,RouteMetric | Select-Object DestinationPrefix,NextHop,InterfaceIndex,RouteMetric }.ToString()
+    dns = { Get-DnsClientServerAddress | Where-Object { $_.InterfaceAlias -notlike 'vEthernet (mu-win-*' } | Sort-Object InterfaceIndex,AddressFamily | Select-Object InterfaceIndex,AddressFamily,ServerAddresses }.ToString()
+  }
+  $pool = [RunspaceFactory]::CreateRunspacePool(1,3)
+  $pending = @()
+  try {
+    $pool.Open()
+    foreach($name in $queries.Keys){
+      $worker = [PowerShell]::Create()
+      $pending += @{ name=$name; worker=$worker; handle=$null }
+      $worker.RunspacePool = $pool
+      [void]$worker.AddScript("`$ErrorActionPreference='Stop';" + $queries[$name])
+      $pending[-1].handle = $worker.BeginInvoke()
+    }
+    $snapshot = [ordered]@{}; $queryFailed = $false
+    # Drain every independent read even on failure; never publish a partial snapshot.
+    foreach($item in $pending){
+      try { $snapshot[$item.name] = @($item.worker.EndInvoke($item.handle)); if($item.worker.HadErrors){ $queryFailed=$true } }
+      catch { $queryFailed=$true }
+    }
+    if($queryFailed){ throw 'Network fingerprint queries failed' }
+    [pscustomobject]$snapshot | ConvertTo-Json -Depth 6 -Compress
+  } finally {
+    foreach($item in $pending){ $item.worker.Dispose() }
+    $pool.Dispose()
+  }
   exit 0
 }
 if (-not $isAdmin) { throw 'Administrator PowerShell is required for this preview' }
@@ -176,7 +200,144 @@ function ReviewAllocation {
     }}
     @{platformId=[string]$v.Id;cpus=[int]$processor.Count;memoryGiB=[int]($memory.Startup/1GB);diskGiB=[int]($disk.Size/1GB)} | ConvertTo-Json -Compress
   }
+function SnapshotDependencyPath([string]$value,[bool]$allowMissing=$false){
+    if([string]::IsNullOrWhiteSpace($value)){throw 'Empty snapshot dependency path'}
+    $full=[IO.Path]::GetFullPath($value)
+    if($full -notmatch '^[a-zA-Z]:\\' -or [IO.DriveInfo]::new([IO.Path]::GetPathRoot($full)).DriveType -eq 'Network'){throw 'Remote snapshot dependencies cannot be inspected'}
+    $cursor=[IO.Path]::GetPathRoot($full)
+    foreach($part in $full.Substring($cursor.Length).Split('\')){
+      $cursor=Join-Path $cursor $part
+      try{$attributes=[IO.File]::GetAttributes($cursor)}
+      catch [IO.FileNotFoundException]{if($allowMissing){return $full};throw}
+      catch [IO.DirectoryNotFoundException]{if($allowMissing){return $full};throw}
+      if($attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Snapshot dependency reparse point rejected'}
+    }
+    return $full
+}
+function ReviewSnapshotDeletion {
+    param([string]$StagingOperation='')
+    # Admission only: never stop, mount, detach or repair a dependency. This is
+    # deliberately separate from stopped disk/configuration adoption. The live
+    # deletion coordinator must also hold its own authority and cancellation
+    # fence; this receipt alone is not permission to delete files.
+    if(-not $c.brokerResourceLimit){throw 'Snapshot deletion requires the protected broker'}
+    $snapshotId=[string]$c.snapshotId;$parsed=[guid]::Empty
+    if($StagingOperation -and $StagingOperation -cnotin @('create','restore')){throw 'Fixed staging operation required'}
+    if(-not [guid]::TryParseExact($snapshotId,'D',[ref]$parsed) -or $parsed -eq [guid]::Empty -or $parsed.ToString('D') -cne $snapshotId){throw 'Canonical snapshot deletion identity required'}
+    if(-not $c.expectedPlatformId){throw 'Protected platform identity required'}
+    $v=AllocationVM
+    if(-not $v -or [string]$v.State -notin @('Off','Running') -or $v.Generation -ne 1 -or [string]$v.CheckpointType -ne 'Disabled' -or [string]$v.AutomaticStopAction -ne 'TurnOff'){throw 'Only an intact stopped or running preview VM can delete a snapshot'}
+    if($StagingOperation -and [string]$v.State -ne 'Off'){throw 'Staging cleanup requires a stopped VM'}
+    InspectVM | Out-Null
+    if(@(Get-VMSnapshot -VM $v -ErrorAction Stop).Count){throw 'Hyper-V checkpoints require separate review'}
+    $memory=Get-VMMemory -VM $v -ErrorAction Stop;$processor=Get-VMProcessor -VM $v -ErrorAction Stop
+    $current=SnapshotDependencyPath ([string]$c.disk);$seed=SnapshotDependencyPath ([string]$c.seed)
+    $disk=Get-VHD -Path $current -ErrorAction Stop
+    if($memory.DynamicMemoryEnabled -or $memory.Startup % 1GB -or $disk.Size % 1GB -or $disk.ParentPath -or [string]$disk.VhdType -ne 'Dynamic' -or [string]$disk.VhdFormat -ne 'VHDX' -or $processor.ExposeVirtualizationExtensions){throw 'Snapshot deletion resource boundary changed'}
+    if([long]$processor.Count -ne [long]$c.cpus -or [long]$memory.Startup -ne [long]$c.memoryGiB*1GB -or [long]$disk.Size -ne [long]$c.diskGiB*1GB){throw 'Snapshot deletion resources differ from protected registration'}
+    $nic=@(Get-VMNetworkAdapter -VM $v -ErrorAction Stop)[0]
+    if($nic.DynamicMacAddressEnabled -or $nic.MacAddress -ne $c.mac -or [string]$nic.MacAddressSpoofing -ne 'Off' -or [string]$nic.DhcpGuard -ne 'On' -or [string]$nic.RouterGuard -ne 'On'){throw 'Snapshot deletion adapter policy changed'}
+    $dvd=@(Get-VMDvdDrive -VM $v -ErrorAction Stop)
+    if($dvd.Count -ne 1 -or (SnapshotDependencyPath ([string]$dvd[0].Path)) -ne $seed){throw 'Snapshot deletion current seed changed'}
+    $root=Join-Path ([string]$c.directory) 'snapshots'
+    # Both names are fixed by the durable deletion protocol. Partial retries
+    # can have neither copy left; provider errors still fail closed below.
+    $candidates=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $candidateNames=if($StagingOperation){@($StagingOperation+'-next-'+$snapshotId)}else{@($snapshotId,('delete-active-'+$snapshotId))}
+    $candidateFiles=if($StagingOperation -eq 'restore'){@('disk.next','seed.next')}else{@('disk.vhdx','seed.iso')}
+    foreach($name in $candidateNames){
+      foreach($file in $candidateFiles){
+        $candidate=SnapshotDependencyPath (Join-Path (Join-Path $root $name) $file) $true
+        if($candidate -eq $current -or $candidate -eq $seed){throw 'Snapshot deletion aliases current storage'}
+        [void]$candidates.Add($candidate)
+        # File.Exists hides access failures. GetAttributes distinguishes only
+        # ordinary absence, including a partially completed prior deletion.
+        $exists=$true;try{$attributes=[IO.File]::GetAttributes($candidate)}catch [IO.FileNotFoundException]{$exists=$false}catch [IO.DirectoryNotFoundException]{$exists=$false}
+        if($exists){
+          if($attributes -band ([IO.FileAttributes]::Directory -bor [IO.FileAttributes]::ReparsePoint)){throw 'Snapshot deletion candidate must be an ordinary file'}
+          if(-not $StagingOperation -and $file -eq 'disk.vhdx'){$copy=Get-VHD -Path $candidate -ErrorAction Stop;if($copy.Attached -isnot [bool] -or $copy.Attached -or $copy.ParentPath -or [string]$copy.VhdType -ne 'Dynamic' -or [string]$copy.VhdFormat -ne 'VHDX'){throw 'Snapshot deletion disk is attached or not an independent full copy'}}
+        }
+      }
+    }
+    $all=@(Get-VM -ErrorAction Stop);if($all.Count -gt 1024){throw 'Snapshot VM inventory exceeds its fixed bound'}
+    $drives=[Collections.Generic.List[object]]::new();$snapshots=0
+    foreach($other in $all){
+      foreach($drive in @(Get-VMHardDiskDrive -VM $other -ErrorAction Stop)){$drives.Add(@{path=[string]$drive.Path;owner=[string]$other.Id;checkpoint=$false;iso=$false})}
+      foreach($drive in @(Get-VMDvdDrive -VM $other -ErrorAction Stop)){$drives.Add(@{path=[string]$drive.Path;owner=[string]$other.Id;checkpoint=$false;iso=$true})}
+      $points=@(Get-VMSnapshot -VM $other -ErrorAction Stop);$snapshots+=$points.Count;if($snapshots -gt 1024){throw 'Snapshot checkpoint inventory exceeds its fixed bound'}
+      foreach($point in $points){
+        foreach($drive in @(Get-VMHardDiskDrive -VMSnapshot $point -ErrorAction Stop)){$drives.Add(@{path=[string]$drive.Path;owner=[string]$other.Id;checkpoint=$true;iso=$false})}
+        foreach($drive in @(Get-VMDvdDrive -VMSnapshot $point -ErrorAction Stop)){$drives.Add(@{path=[string]$drive.Path;owner=[string]$other.Id;checkpoint=$true;iso=$true})}
+      }
+      if($drives.Count -gt 1024){throw 'Snapshot dependency inventory exceeds its fixed bound'}
+    }
+    $ownDisks=0;$ownSeeds=0
+    foreach($drive in $drives){
+      if(-not $drive.path){if($drive.iso){continue};throw 'Empty VM disk dependency'}
+      $path=$drive.path;$depth=0;$seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+      while($path){
+        if(++$depth -gt 32){throw 'Snapshot dependency parent chain exceeds its fixed bound'}
+        $full=SnapshotDependencyPath $path
+        if(-not $seen.Add($full)){throw 'Snapshot dependency parent cycle rejected'}
+        if($candidates.Contains($full)){throw 'A VM or checkpoint references the snapshot deletion copy'}
+        if($full -eq $current){if($depth -ne 1 -or $drive.owner -ne [string]$v.Id -or $drive.checkpoint -or $drive.iso){throw 'Current disk has another dependency'};$ownDisks++}
+        if($full -eq $seed){if($depth -ne 1 -or $drive.owner -ne [string]$v.Id -or $drive.checkpoint -or -not $drive.iso){throw 'Current seed has another dependency'};$ownSeeds++}
+        if($drive.iso){break}
+        $parent=Get-VHD -Path $full -ErrorAction Stop;$path=[string]$parent.ParentPath
+      }
+    }
+    if($ownDisks -ne 1 -or $ownSeeds -ne 1){throw 'Current storage dependency inventory changed'}
+    $images=@(Get-CimInstance -Namespace root/Microsoft/Windows/Storage -ClassName MSFT_DiskImage -ErrorAction Stop)
+    if($images.Count -gt 2048){throw 'Mounted image inventory exceeds its fixed bound'}
+    foreach($image in $images){if($image.Attached -isnot [bool]){throw 'Mounted image attachment state is unknown'};if($image.Attached){$full=SnapshotDependencyPath ([string]$image.ImagePath);if($candidates.Contains($full)){throw 'The host has mounted the snapshot deletion copy'}}}
+    # Catch identity/state changes during inventory; never turn a transition
+    # into an affirmative receipt, and never repair it in an admission check.
+    $after=AllocationVM
+    if(-not $after -or [string]$after.Id -ne [string]$v.Id -or [string]$after.State -notin @('Off','Running')){throw 'Snapshot deletion allocation changed during review'}
+    if($StagingOperation -and [string]$after.State -ne 'Off'){throw 'Staging cleanup stop state changed during review'}
+    @{platformId=[string]$v.Id;snapshotId=$snapshotId;state=[string]$after.State;cpus=[int]$processor.Count;memoryGiB=[int]($memory.Startup/1GB);diskGiB=[int]($disk.Size/1GB);unreferenced=$true} | ConvertTo-Json -Compress
+}
 switch ($Action) {
+  'review-snapshot-delete' { ReviewSnapshotDeletion }
+  'review-snapshot-staging' { if([string]$c.stagingOperation -cnotin @('create','restore')){throw 'Fixed staging operation required'};ReviewSnapshotDeletion -StagingOperation ([string]$c.stagingOperation) }
+  'snapshot-verify' {
+    if(-not $c.brokerResourceLimit){throw 'Snapshots require the protected broker'}
+    ReviewAllocation | Out-Null
+    $expectedRoot=[IO.Path]::GetFullPath((Join-Path $c.directory 'snapshots')).TrimEnd('\')+'\'
+    $snapshotFile=[IO.Path]::GetFullPath([string]$c.snapshotDisk)
+    if(-not $snapshotFile.StartsWith($expectedRoot,[StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($snapshotFile) -ne 'disk.vhdx' -or ([IO.Path]::GetFileName([IO.Path]::GetDirectoryName($snapshotFile))) -notmatch '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$'){throw 'Fixed snapshot disk required'}
+    $disk=Get-VHD -Path $snapshotFile -ErrorAction Stop
+    if($disk.Attached -or $disk.ParentPath -or [string]$disk.VhdFormat -ne 'VHDX' -or [string]$disk.VhdType -ne 'Dynamic' -or $disk.Size -ne ([long]$c.snapshotDiskGiB*1GB)){throw 'Snapshot disk layout differs from its protected resource record'}
+    @{verified=$true;state='Off'} | ConvertTo-Json -Compress
+  }
+  'snapshot-apply' {
+    if(-not $c.brokerResourceLimit){throw 'Snapshots require the protected broker'}
+    $review=ReviewAllocation | ConvertFrom-Json
+    $disk=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($disk.Attached -or $disk.ParentPath -or [string]$disk.VhdFormat -ne 'VHDX' -or [string]$disk.VhdType -ne 'Dynamic' -or $disk.Size -ne ([long]$c.diskGiB*1GB)){throw 'Restored snapshot capacity or disk layout changed'}
+    $vm=OwnedVM
+    Set-VMProcessor -VM $vm -Count $c.cpus -ExposeVirtualizationExtensions $false
+    Set-VMMemory -VM $vm -DynamicMemoryEnabled $false -StartupBytes ([long]$c.memoryGiB*1GB)
+    $actual=ReviewAllocation | ConvertFrom-Json
+    if($actual.cpus -ne $c.cpus -or $actual.memoryGiB -ne $c.memoryGiB -or $actual.diskGiB -ne $c.diskGiB){throw 'Snapshot resources were not applied exactly'}
+    $actual | ConvertTo-Json -Compress
+  }
+  'backup-import-verify' {
+    if(-not $c.brokerResourceLimit){throw 'Backup restore requires the protected broker'}
+    $v=AllocationVM
+    if($v){
+      if($v.State -ne 'Off'){throw 'A restore cannot use a running VM'}
+      # A resumed or newly created VM must still match the reviewed backup.
+      # Reuse read-only topology, policy, seed and dependency validation; do not
+      # silently repair an existing allocation to make it pass.
+      $review=ReviewAllocation | ConvertFrom-Json
+      if($review.cpus -ne $c.cpus -or $review.memoryGiB -ne $c.memoryGiB -or $review.diskGiB -ne $c.diskGiB){throw 'Restored VM resources differ from the reviewed backup'}
+    }
+    foreach($path in @($c.disk,$c.seed)){if((Get-Item -LiteralPath $path).Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Restore input reparse point rejected'}}
+    $disk=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($disk.Attached -or $disk.ParentPath -or [string]$disk.VhdFormat -ne 'VHDX' -or [string]$disk.VhdType -ne 'Dynamic' -or $disk.Size -ne ([long]$c.diskGiB*1GB)){throw 'Restored disk must be a detached standalone dynamic VHDX with the exact reviewed capacity'}
+    @{verified=$true;state='Off';diskGiB=[int]$c.diskGiB}|ConvertTo-Json -Compress
+  }
   'disk-growth-facts' {
     $review=ReviewAllocation | ConvertFrom-Json
     $disk=Get-VHD -Path $c.disk -ErrorAction Stop
@@ -193,6 +354,77 @@ switch ($Action) {
     $actual=Get-VHD -Path $c.disk -ErrorAction Stop
     if($actual.Size -ne $target -or ([guid]$actual.DiskIdentifier).ToString('D') -ne [string]$c.growthDiskIdentifier -or (OwnedVM).State -ne 'Off'){throw 'Disk growth completion is unconfirmed'}
     @{platformId=$review.platformId;diskGiB=[int]$c.diskGiB;diskIdentifier=([guid]$actual.DiskIdentifier).ToString('D');bytes=[long]$actual.Size} | ConvertTo-Json -Compress
+  }
+  'compact-disk-submit' {
+    # Experimental primitive: callers must persist their own submission fence
+    # before invoking this and preserve it if the returned job is lost.
+    if(-not $c.brokerResourceLimit -or -not $c.expectedPlatformId){throw 'Protected disk maintenance authority required'}
+    $diskId=[guid]::Empty
+    if(-not [guid]::TryParseExact([string]$c.compactDiskIdentifier,'D',[ref]$diskId) -or $diskId -eq [guid]::Empty -or $diskId.ToString('D') -cne [string]$c.compactDiskIdentifier){throw 'Canonical compact disk identity required'}
+    if(($c.diskGiB -isnot [int] -and $c.diskGiB -isnot [long]) -or $c.diskGiB -lt 16 -or $c.diskGiB -gt 256){throw 'Unexpected disk capacity'}
+    $review=ReviewAllocation | ConvertFrom-Json
+    if([string]$review.platformId -ne [string]$c.expectedPlatformId -or $review.diskGiB -ne $c.diskGiB){throw 'Compaction VM identity or capacity changed'}
+    $disk=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($disk.Attached -or $disk.ParentPath -or [string]$disk.VhdFormat -ne 'VHDX' -or [string]$disk.VhdType -ne 'Dynamic' -or $disk.Size -ne ([long]$c.diskGiB*1GB) -or ([guid]$disk.DiskIdentifier) -ne $diskId){throw 'Compaction input identity changed'}
+      if($c.compactOperationId){
+        $operation=[guid]::Empty
+        if(-not [guid]::TryParseExact([string]$c.compactOperationId,'D',[ref]$operation) -or $operation -eq [guid]::Empty -or $operation.ToString('D') -cne [string]$c.compactOperationId){throw 'Canonical compaction operation identity required'}
+        $directory=Join-Path $env:USERPROFILE 'compaction-receipts'
+        if(-not (Test-Path -LiteralPath $directory -PathType Container) -or ((Get-Item -LiteralPath $directory).Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Protected compaction receipt directory unavailable'}
+        $final=Join-Path $directory ($operation.ToString('D')+'.json');$next=$final+'.next'
+        if((Test-Path -LiteralPath $final) -or (Test-Path -LiteralPath $next)){throw 'Compaction receipt already exists'}
+      }
+    $service=@(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_ImageManagementService -ErrorAction Stop)
+    if($service.Count -ne 1 -or $service[0].Name -ne 'vhdsvc'){throw 'Image management service identity unavailable'}
+    $result=Invoke-CimMethod -InputObject $service[0] -MethodName CompactVirtualHardDisk -Arguments @{Path=[string]$c.disk;Mode=[uint16]3} -ErrorAction Stop
+    if($null -eq $result.ReturnValue){throw 'Compaction submission result is unconfirmed'}
+      if([int]$result.ReturnValue -eq 0){$receipt=@{submitted='completed';jobId=$null}}
+    else{
+      $jobId=[guid]::Empty
+      if([int]$result.ReturnValue -ne 4096 -or -not $result.Job -or $result.Job.CimClass.CimClassName -ne 'Msvm_StorageJob' -or -not [guid]::TryParseExact([string]$result.Job.InstanceID,'D',[ref]$jobId) -or $jobId -eq [guid]::Empty){throw 'Compaction submission result is unconfirmed'}
+        $receipt=@{submitted='started';jobId=$jobId.ToString('D')}
+    }
+      # The protected broker may supply a journal-bound nonce. Publish the
+      # exact provider receipt before replying, so a broker restart can inspect
+      # it without guessing a job or re-submitting. A crash before publication
+      # remains unconfirmed and must keep the existing fence.
+      if($c.compactOperationId){
+        $body=@{operationId=$operation.ToString('D');platformId=[string]$c.expectedPlatformId;diskIdentifier=$diskId.ToString('D');submitted=$receipt.submitted;jobId=$receipt.jobId}|ConvertTo-Json -Compress
+        $bytes=[Text.UTF8Encoding]::new($false).GetBytes($body)
+        $file=[IO.FileStream]::new($next,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
+        try{$file.Write($bytes,0,$bytes.Length);$file.Flush($true)}finally{$file.Dispose()}
+        [IO.File]::Move($next,$final)
+      }
+      $receipt | ConvertTo-Json -Compress
+  }
+  'compact-disk-job' {
+    # Observation only; no timeout, disappearance or non-successful state is
+    # evidence that the operation ended or that it may be repeated.
+    if(-not $c.brokerResourceLimit -or -not $c.expectedPlatformId){throw 'Protected disk maintenance authority required'}
+    $jobId=[guid]::Empty
+    if(-not [guid]::TryParseExact([string]$c.compactJobId,'D',[ref]$jobId) -or $jobId -eq [guid]::Empty -or $jobId.ToString('D') -cne [string]$c.compactJobId){throw 'Canonical compaction job identity required'}
+    $jobs=@(Get-CimInstance -Namespace root/virtualization/v2 -ClassName Msvm_StorageJob -Filter ("InstanceID='"+$jobId.ToString('D')+"'") -ErrorAction Stop)
+    if($jobs.Count -ne 1 -or ([guid]$jobs[0].InstanceID) -ne $jobId){throw 'Compaction job not uniquely available'}
+    if($null -eq $jobs[0].JobState -or $null -eq $jobs[0].ErrorCode -or $null -eq $jobs[0].JobCompletionStatusCode -or $null -eq $jobs[0].JobType -or [int]$jobs[0].JobType -ne 3){throw 'Compaction job status is incomplete or has the wrong type'}
+    @{jobId=$jobId.ToString('D');state=[int]$jobs[0].JobState;errorCode=[int]$jobs[0].ErrorCode;completionCode=[long]$jobs[0].JobCompletionStatusCode} | ConvertTo-Json -Compress
+  }
+  'compact-disk' {
+    # Internal primitive only. The protected broker must hold a durable
+    # compaction journal and its VM/operation gates before invoking this.
+    if(-not $c.brokerResourceLimit -or -not $c.expectedPlatformId){throw 'Protected disk maintenance authority required'}
+    $diskId=[guid]::Empty
+    if(-not [guid]::TryParseExact([string]$c.compactDiskIdentifier,'D',[ref]$diskId) -or $diskId -eq [guid]::Empty -or $diskId.ToString('D') -cne [string]$c.compactDiskIdentifier){throw 'Canonical compact disk identity required'}
+    if(($c.diskGiB -isnot [int] -and $c.diskGiB -isnot [long]) -or $c.diskGiB -lt 16 -or $c.diskGiB -gt 256){throw 'Unexpected disk capacity'}
+    $review=ReviewAllocation | ConvertFrom-Json
+    if([string]$review.platformId -ne [string]$c.expectedPlatformId -or $review.diskGiB -ne $c.diskGiB){throw 'Compaction VM identity or capacity changed'}
+    $disk=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($disk.Attached -or $disk.ParentPath -or [string]$disk.VhdFormat -ne 'VHDX' -or [string]$disk.VhdType -ne 'Dynamic' -or $disk.Size -ne ([long]$c.diskGiB*1GB) -or ([guid]$disk.DiskIdentifier) -ne $diskId){throw 'Compaction input identity changed'}
+    Optimize-VHD -Path $c.disk -Mode Pretrimmed -ErrorAction Stop
+    $actual=Get-VHD -Path $c.disk -ErrorAction Stop
+    if($actual.Attached -or $actual.ParentPath -or [string]$actual.VhdFormat -ne 'VHDX' -or [string]$actual.VhdType -ne 'Dynamic' -or $actual.Size -ne ([long]$c.diskGiB*1GB) -or ([guid]$actual.DiskIdentifier) -ne $diskId){throw 'Compaction completion identity changed'}
+    $after=ReviewAllocation | ConvertFrom-Json
+    if([string]$after.platformId -ne [string]$review.platformId -or $after.diskGiB -ne $review.diskGiB){throw 'Compaction completion VM review changed'}
+    @{platformId=$after.platformId;diskGiB=[int]$c.diskGiB;diskIdentifier=$diskId.ToString('D');bytes=[long]$actual.Size} | ConvertTo-Json -Compress
   }
   'review-allocation' { ReviewAllocation }
   'allocation-absence' {

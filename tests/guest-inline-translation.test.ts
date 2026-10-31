@@ -7,12 +7,16 @@ import {TRANSLATION_INPUT_LIMIT,TRANSLATION_OUTPUT_LIMIT,TRANSLATION_MAX_TOKENS,
 import {LimaRuntime} from '../server/runtime.ts';
 import {environmentSchema} from '../server/validation.ts';
 import type {Environment} from '../shared/types.ts';
+import {AppError} from '../server/errors.ts';
 const e={...environmentSchema.parse({name:'Translate fixture'}),id:'fixture',instanceName:'fixture',state:'running',updatedAt:'one'} as Environment;
 const key='sk-local-fixture-not-a-real-key';
 const credentials={revision:0,credential(){return{apiKey:key,revision:this.revision};}};
 const input=(text='private source',target='zh')=>({text,apiKey:key,target,model:TRANSLATION_MODEL,prompt:TRANSLATION_PROMPT});
 const response=(text='English',target='en')=>({text,provider:'DeepSeek',target,model:TRANSLATION_MODEL});
-function guest(stub:string,request=input()) {return execFileSync('python3',['-c',stub+DEEPSEEK_TRANSLATE_PYTHON],{input:JSON.stringify(request),encoding:'utf8'});}
+function guest(stub:string,request=input()) {
+ const bootstrap='import sys,json;exec(compile(json.loads(sys.stdin.buffer.readline()), "<translation-fixture>", "exec"))';
+ return execFileSync(process.platform==='win32'?'python':'python3',['-I','-X','utf8','-c',bootstrap],{input:JSON.stringify(stub+DEEPSEEK_TRANSLATE_PYTHON)+'\n'+JSON.stringify(request),encoding:'utf8',windowsHide:true,timeout:5000,maxBuffer:2*1024*1024});
+}
 
 test('Translation goes through guarded guest stdin, with no key/source in argv and no host fallback',async()=>{
  const runtime=new LimaRuntime('/tmp/mu-inline-unused');let allowed=true,calls=0;
@@ -35,6 +39,12 @@ test('Missing or changed credentials do not issue or deliver a request',async()=
 test('Raw runtime/provider errors cannot leak source, key or body and never cause retries',async()=>{
  const runtime=new LimaRuntime('/tmp/mu-inline-unused');let calls=0;runtime.guest=async()=>{calls++;throw Error(key+' private source');};
  await assert.rejects(new GuestExchange(runtime,async()=>e,credentials).translate(e.id,'private source'),err=>!String(err).includes(key)&&!String(err).includes('private source')&&String(err).includes('原文已保留'));assert.equal(calls,1);
+});
+
+test('Cancelling translation aborts authorization/guest work and never delivers a late result',async()=>{
+ const runtime=new LimaRuntime('/tmp/mu-inline-unused'),controller=new AbortController();let entered=false,cancelled=0;
+ runtime.guest=async(_e,_args,options={})=>{entered=true;return new Promise<string>((_resolve,reject)=>options.signal?.addEventListener('abort',()=>{cancelled++;reject(new AppError('cancelled',409,'CANCELLED'));},{once:true}));};
+ const exchange=new GuestExchange(runtime,async(_id,signal)=>{signal?.throwIfAborted();return e;},credentials);const pending=exchange.translate(e.id,'中文 secret','en',controller.signal);while(!entered)await new Promise(resolve=>setImmediate(resolve));controller.abort();await assert.rejects(pending,{code:'CANCELLED'});assert.equal(cancelled,1);assert.equal(exchange.busy.has(e.id),false);
 });
 test('Both languages use fixed official endpoint and translation-only prompt, with thinking/tools disabled',()=>{
  for(const target of ['en','zh']){

@@ -2,13 +2,15 @@ import type { Environment, Snapshot, Job, LogEntry, AgentStatus, Metrics, Networ
 import type { ConnectionQuery,NetworkObservations } from '../shared/network-observations.ts';
 import type { DisplayRequest, GuestDisplay } from '../shared/guest-display.ts';
 import type { DesktopAppId,DesktopAppsStatus } from '../shared/guest-desktop.ts';
+import type {WindowsDesktopComponentsStatus} from '../shared/windows-desktop-components.ts';
+import type {WindowsDesktopClientsState} from '../shared/windows-desktop-clients.ts';
 import type {AccessLatency,LatencyTarget} from '../shared/latency.ts';
 import type {ProtectionEvent} from '../shared/protection-events.ts';
 
 declare global {
   interface Window {
-    __MU_CONFIG__: { token: string; version: string; platform?: 'win32'; windowsMode?:'normal'|'recovery'; capabilities?:{terminal:boolean;files:boolean;fileDirectories?:boolean;fileManager?:boolean;browser?:boolean;audio?:boolean;imageClipboard?:boolean;translation?:boolean;diskGrowth?:boolean;remove?:boolean;setup?:boolean;hostSetup?:boolean;storage?:boolean} };
-    muWindowsDesktop?: {readClipboardImage:()=>Promise<import('../shared/clipboard-image.ts').ClipboardImage>;readClipboardText?:()=>Promise<string>;writeClipboardText?:(text:string)=>Promise<unknown>};
+    __MU_CONFIG__: { token: string; version: string; platform?: 'win32'; windowsMode?:'normal'|'recovery'; capabilities?:{desktopClients?:boolean;desktopComponents?:boolean;agent?:boolean;networkObservations?:boolean;snapshots?:boolean;snapshotRecovery?:boolean;backups?:boolean;terminal:boolean;files:boolean;fileDirectories?:boolean;fileManager?:boolean;independentFileView?:boolean;browser?:boolean;browserDetails?:boolean;browserStartup?:boolean;browserReset?:boolean;browserRepair?:boolean;localChecks?:boolean;audio?:boolean;imageClipboard?:boolean;translation?:boolean;diskGrowth?:boolean;diskCompaction?:boolean;remove?:boolean;setup?:boolean;hostSetup?:boolean;storage?:boolean} };
+    muWindowsDesktop?: {openHostLab?:(value:import('../shared/windows-host-lab.ts').WindowsHostLabWindow)=>Promise<{opened:true;runId:string}>;closeHostLab?:(runId:string)=>Promise<{closed:true}>;chooseBackupFile?:(action:'export'|'restore')=>Promise<string|null>;readClipboardImage:()=>Promise<import('../shared/clipboard-image.ts').ClipboardImage>;writeClipboardImage?:(data:Uint8Array)=>Promise<{ok:boolean;width:number;height:number}>;readClipboardText?:()=>Promise<string>;writeClipboardText?:(text:string)=>Promise<unknown>;setViewerFullscreen?:(value:boolean)=>Promise<boolean>;onViewerFullscreenChange?:(listener:(value:boolean)=>void)=>()=>void};
     muDesktop?: { readClipboardImage?:()=>Promise<import('../shared/clipboard-image.ts').ClipboardImage>; onGuestApplication?:(callback:(value:{id:string;target:'browser'|'desktop';application?:string})=>void)=>()=>void; browserAction(input: { id: string; action: string; url?: string }): Promise<void>; onBrowserState(callback: (state: BrowserState) => void): () => void };
   }
 }
@@ -24,14 +26,23 @@ export async function request<T>(endpoint: string, init: RequestInit = {}): Prom
   return result as T;
 }
 export const api = {
-  protectionEvents:(id:string)=>request<ProtectionEvent[]>(`/environments/${id}/protection-events`),
+  protectionEvents:(id:string,signal?:AbortSignal)=>request<ProtectionEvent[]>(`/environments/${id}/protection-events`,{signal}),
   retryProtection:(id:string)=>request<Job>(`/environments/${id}/protection-events/retry`,{method:'POST',body:'{}'}),
   focusGuest:(id:string,target:'browser'|'grok-bot'|'claude-desktop')=>request<{focused:boolean;pending:boolean}>(`/environments/${id}/guest-focus`,{method:'POST',body:JSON.stringify({target})}),
   snapshot: () => request<Snapshot>('/snapshot'),
   desktopApps:(id:string)=>request<DesktopAppsStatus>(`/environments/${id}/desktop-apps`),
+  windowsDesktopComponents:(id:string)=>request<WindowsDesktopComponentsStatus>(`/environments/${id}/desktop-components`),
+  windowsDesktopClients:(id:string)=>request<WindowsDesktopClientsState>(`/environments/${id}/desktop-clients`),
+  focusWindowsDesktopClient:(id:string,application:DesktopAppId,viewId:string,signal?:AbortSignal)=>request<{focused:boolean}>(`/environments/${id}/desktop-clients/${application}/focus`,{method:'POST',body:JSON.stringify({viewId}),signal}),
+  startWindowsDesktopClient:(id:string,application:DesktopAppId,environmentName:string)=>request<Job>(`/environments/${id}/desktop-clients/${application}/start`,{method:'POST',body:JSON.stringify({confirm:'start-approved-desktop',environmentName})}),
+  stopWindowsDesktopClient:(id:string,application:DesktopAppId,viewId:string)=>request<Job>(`/environments/${id}/desktop-clients/${application}/stop`,{method:'POST',body:JSON.stringify({viewId})}),
+  windowsDesktopClientTicket:(id:string,application:DesktopAppId,viewId:string)=>request<{ticket:string;password:string}>(`/environments/${id}/desktop-clients/${application}/view-ticket`,{method:'POST',body:JSON.stringify({viewId})}),
+  windowsDesktopClientView:(id:string,application:DesktopAppId,viewId:string)=>request<{ready:true;display?:GuestDisplay}>(`/environments/${id}/desktop-clients/${application}/view?viewId=${encodeURIComponent(viewId)}`),
+  resizeWindowsDesktopClientView:(id:string,application:DesktopAppId,viewId:string,display:DisplayRequest)=>request<GuestDisplay>(`/environments/${id}/desktop-clients/${application}/display`,{method:'POST',body:JSON.stringify({viewId,display})}),
+  installWindowsDesktopComponent:(id:string,application:DesktopAppId,environmentName:string)=>request<Job>(`/environments/${id}/desktop-components/${application}/install`,{method:'POST',body:JSON.stringify({confirm:'install-approved-desktop',environmentName})}),
   desktopAppAction:(id:string,application:DesktopAppId,action:'install'|'start'|'stop')=>request<Job>(`/environments/${id}/desktop-apps/${application}/${action}`,{method:'POST',body:'{}'}),
   cleanRebuild:(id:string)=>request<{job:Job;replacementEnvironmentId:string}>(`/environments/${id}/rebuild-clean`,{method:'POST',body:JSON.stringify({confirm:'erase-entire-environment'})}),
-  networkObservations:(id:string,query?:ConnectionQuery)=>{const params=new URLSearchParams();if(query){params.set('scope',query.scope??'traffic');if(query.q)params.set('q',query.q);if(query.failures)params.set('failures','1');if(query.before!==undefined)params.set('before',String(query.before));}return request<NetworkObservations>(`/environments/${id}/network/observations${params.size?'?'+params:''}`);},
+  networkObservations:(id:string,query?:ConnectionQuery,signal?:AbortSignal)=>{const params=new URLSearchParams();if(query){params.set('scope',query.scope??'traffic');if(query.q)params.set('q',query.q);if(query.failures)params.set('failures','1');if(query.before!==undefined)params.set('before',String(query.before));}return request<NetworkObservations>(`/environments/${id}/network/observations${params.size?'?'+params:''}`,{signal});},
   sampleNetwork:(id:string)=>request<NetworkObservations>(`/environments/${id}/network/observations`,{method:'POST',body:'{}'}),
   bridgeGrants: (id:string) => request<BridgeGrant[]>(`/environments/${id}/bridge`),
   grantBridge: (id:string,root:string,writable:boolean,minutes:number,commands:HostCommand[]=[]) => request<Job>(`/environments/${id}/bridge`,{method:'POST',body:JSON.stringify({root,writable,minutes,commands})}),
@@ -69,13 +80,13 @@ export const api = {
   testNetwork: (id: string) => request<NetworkResult>(`/environments/${id}/network/test`, { method: 'POST' }),
   accessLatency:(id:string)=>request<AccessLatency|null>(`/environments/${id}/network/latency`),
   testAccessLatency:(id:string,target:LatencyTarget='google')=>request<AccessLatency>(`/environments/${id}/network/latency`,{method:'POST',body:JSON.stringify({target})}),
-  egress: (id: string) => request<EgressStatus>(`/environments/${id}/network/egress`),
-  protection: (id: string) => request<NetworkProtection>(`/environments/${id}/network/protection`),
+  egress: (id: string, signal?:AbortSignal) => request<EgressStatus>(`/environments/${id}/network/egress`,{signal}),
+  protection: (id: string, signal?:AbortSignal) => request<NetworkProtection>(`/environments/${id}/network/protection`,{signal}),
   inspectBrowser: (id: string) => request<BrowserInspection>(`/environments/${id}/browser/inspect`),
   installRuntime: () => request<Job>('/runtime/install', { method: 'POST' }),
   cancel: (id: string) => request(`/jobs/${id}/cancel`, { method: 'POST' }),
   pickDirectory: () => request<{ path: string | null }>('/directories/pick', { method: 'POST' }),
-  terminalTicket: (id: string, command: 'shell' | 'claude', cols: number, rows: number) => request<{ ticket: string }>(`/environments/${id}/terminal-ticket`, { method: 'POST', body: JSON.stringify({ command, cols, rows }) }),
+  terminalTicket: (id: string, command: 'shell' | 'claude', cols: number, rows: number,signal?:AbortSignal) => request<{ ticket: string }>(`/environments/${id}/terminal-ticket`, { method: 'POST', body: JSON.stringify({ command, cols, rows }),signal }),
 };
 
 export function editConfig(e: Environment) {

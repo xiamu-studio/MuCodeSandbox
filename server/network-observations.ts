@@ -99,12 +99,18 @@ export function parseJournal(output: string, context=new JournalContext()): Jour
 
 export function connectionExit(at:string,locked:boolean,approvals:ExitVerificationObservation[],samples:ExitObservation[]):Pick<ConnectionObservation,'exitIp'|'exitCheckedAt'|'exitSource'> {
   const eventTime=Date.parse(at);
+  // Records can be persisted out of timestamp order when probes finish later.
+  // On a tie, keep an unsuccessful receipt instead of asserting an exit IP.
+  const latest=<T extends {at:string;status:string}>(rows:T[],success:string) => rows.reduce<T|undefined>((best,row)=>{
+    const time=Date.parse(row.at),bestTime=best?Date.parse(best.at):-Infinity;
+    return Number.isFinite(time)&&time<=eventTime&&(time>bestTime||(time===bestTime&&row.status!==success))?row:best;
+  },undefined);
   if(locked){
-    const receipt=approvals.filter(s=>Date.parse(s.at)<=eventTime).at(-1);
+    const receipt=latest(approvals,'verified');
     return receipt?.status==='verified'&&receipt.ip&&eventTime-Date.parse(receipt.at)<=45_000
       ?{exitIp:receipt.ip,exitCheckedAt:receipt.at,exitSource:'verification'}:{};
   }
-  const receipt=samples.filter(s=>Date.parse(s.at)<=eventTime).at(-1);
+  const receipt=latest(samples,'success');
   return receipt?.status==='success'&&receipt.ip&&eventTime-Date.parse(receipt.at)<=90_000
     ?{exitIp:receipt.ip,exitCheckedAt:receipt.at,exitSource:'observation'}:{};
 }
@@ -118,36 +124,46 @@ export class NetworkObserver {
   private configured = new Map<string,string>();
   private contexts = new Map<string,{key:string;generation:number;context:JournalContext}>();
   private sampling = new Map<string,Promise<void>>();
+  private writeIssues = new Map<string,{key:string;generation:number;sample:boolean;approval:boolean}>();
   private pending?: Promise<void>;
-  private timer: ReturnType<typeof setInterval>;
+  private timer: ReturnType<typeof setInterval>|undefined;
   private closed = false;
-  private store:Store; private runtime:LimaRuntime;
+  private store:Store; private runtime:Pick<LimaRuntime,'management'>;
   private probe:(e:Environment,provider:ProbeProvider)=>Promise<NetworkResult>;
   private available:(e:Environment)=>boolean; private generation:(id:string)=>number;
-  constructor(store: Store, runtime: LimaRuntime,
+  private failureCategory?:(error:unknown)=>import('../shared/network-observations.ts').ObservationFailure;
+  constructor(store: Store, runtime: Pick<LimaRuntime,'management'>,
     probe: (e:Environment,provider:ProbeProvider)=>Promise<NetworkResult>,
-    available:(e:Environment)=>boolean,generation:(id:string)=>number=()=>0) {
+    available:(e:Environment)=>boolean,generation:(id:string)=>number=()=>0,automatic=true,failureCategory?:(error:unknown)=>import('../shared/network-observations.ts').ObservationFailure) {
     this.store=store;this.runtime=runtime;this.probe=probe;this.available=available;this.generation=generation;
-    this.timer=setInterval(()=>{void this.tick().catch(()=>{});},8000);this.timer.unref();
+    this.failureCategory=failureCategory;
+    if(automatic){this.timer=setInterval(()=>{void this.tick().catch(()=>{});},8000);this.timer.unref();}
   }
   private current(e: Environment, generation=this.generation(e.id)) {
     if(this.closed)return false;
     try { const current=this.store.get(e.id);return this.generation(e.id)===generation&&current.state==='running'&&observationKey(current)===observationKey(e)&&this.available(current); } catch{return false;}
   }
-  record(e:Environment,provider:ProbeProvider,result?:NetworkResult,generation=this.generation(e.id)) {
+  private writeIssue(e:Environment,kind:'sample'|'approval',failed:boolean,generation=this.generation(e.id)){
+    const key=observationKey(e),old=this.writeIssues.get(e.id);
+    const value=old?.key===key&&old.generation===generation?{...old}:{key,generation,sample:false,approval:false};
+    value[kind]=failed;if(value.sample||value.approval)this.writeIssues.set(e.id,value);else this.writeIssues.delete(e.id);
+  }
+  record(e:Environment,provider:ProbeProvider,result?:NetworkResult,generation=this.generation(e.id),at=new Date().toISOString(),failureReason?:import('../shared/network-observations.ts').ObservationFailure) {
     if(!this.current(e,generation))return;
     if(result&&(!isIP(result.ip)||result.source!=='guest'))throw new Error('Invalid guest receipt');
-    const value:Omit<ExitObservation,'id'>={at:new Date().toISOString(),provider,status:result?'success':'failed',
-      ...(result?{ip:result.ip,country:result.country.slice(0,120),city:result.city.slice(0,120),latencyMs:result.latencyMs}:{})};
-    this.store.addNetworkRecord(e.id,'sample',`${this.session}:${observationKey(e)}:${generation}`,randomUUID(),value);
+    if(!Number.isFinite(Date.parse(at))||Date.parse(at)>Date.now()+60_000)throw new Error('Invalid observation time');
+    const value:Omit<ExitObservation,'id'>={at,provider,status:result?'success':'failed',
+      ...(result?{ip:result.ip,country:result.country.slice(0,120),city:result.city.slice(0,120),latencyMs:result.latencyMs}:failureReason?{failureReason}:{})};
+    try{this.store.addNetworkRecord(e.id,'sample',`${this.session}:${observationKey(e)}:${generation}`,randomUUID(),value);}
+    catch(error){this.writeIssue(e,'sample',true,generation);throw error;}
   }
   recordVerification(e:Environment,result:EgressStatus) {
     if(this.closed||!result.checkedAt||!['verified','changed','unavailable'].includes(result.status))return;
     if(result.actualIp&&!isIP(result.actualIp))throw new Error('Invalid exit verification IP');
     // Recording is observational: a storage error cannot change the approval policy.
     try {this.store.addNetworkRecord(e.id,'approval',`${this.session}:${observationKey(e)}:${this.generation(e.id)}`,randomUUID(),
-      {at:result.checkedAt,status:result.status,...(result.actualIp?{ip:result.actualIp}:{})});}
-    catch {this.status.set(e.id,{key:observationKey(e),generation:this.generation(e.id),capture:'error',captureIssue:'出口回执暂不可保存，连接出口列可能缺失；联网核验独立运行'});}
+      {at:result.checkedAt,status:result.status,...(result.actualIp?{ip:result.actualIp}:{})});this.writeIssue(e,'approval',false);}
+    catch {this.writeIssue(e,'approval',true);}
   }
   sample(e:Environment):Promise<void> {
     if(this.sampling.has(e.id))return this.sampling.get(e.id)!;
@@ -155,9 +171,11 @@ export class NetworkObserver {
     const generation=this.generation(e.id);
     this.due.set(e.id,Date.now());
     const pending=Promise.allSettled((['ipwho','ipify'] as const).map(async provider=>{
-      try { const result=await this.probe(e,provider);this.record(e,provider,result,generation); }
-      catch { this.record(e,provider,undefined,generation); }
-    })).then(()=>{}).finally(()=>{if(this.sampling.get(e.id)===pending)this.sampling.delete(e.id);});
+      let result:NetworkResult|undefined,category:import('../shared/network-observations.ts').ObservationFailure|undefined;
+      try { result=await this.probe(e,provider); }
+      catch(error) {try{category=this.failureCategory?.(error);}catch{/* Diagnostics must not interrupt collection. */}}
+      this.record(e,provider,result,generation,undefined,category);
+    })).then(results=>{if(this.current(e,generation))this.writeIssue(e,'sample',results.some(result=>result.status==='rejected'),generation);}).finally(()=>{if(this.sampling.get(e.id)===pending)this.sampling.delete(e.id);});
     this.sampling.set(e.id,pending);return pending;
   }
   private async collect(e:Environment) {
@@ -180,16 +198,19 @@ export class NetworkObserver {
       const sessionKey=`${this.session}:${key}:${generation}`;
       const approvals=this.store.networkRecords(e.id,'approval',sessionKey) as ExitVerificationObservation[];
       const samples=this.store.networkRecords(e.id,'sample',sessionKey) as ExitObservation[];
-      for(const entry of batch.events)this.store.addNetworkRecord(e.id,'connection',key,entry.key,
-        {...entry.value,at:entry.at,...connectionExit(entry.at,!!e.network.egressLock,approvals,samples)});
+      this.store.addNetworkRecords(e.id,'connection',key,batch.events.map(entry=>({source:entry.key,
+        payload:{...entry.value,at:entry.at,...connectionExit(entry.at,!!e.network.egressLock,approvals,samples)}})));
       if(batch.cursor)this.cursors.set(e.id,{key,cursor:batch.cursor});
       if(batch.truncated)this.store.addNetworkRecord(e.id,'gap',key,`gap:${batch.cursor??randomUUID()}`,{at:new Date().toISOString(),reason:'capacity'});
       this.status.set(e.id,{key,generation,capture:batch.truncated?'error':'ready',collectedAt:new Date().toISOString(),
         ...(batch.truncated?{captureIssue:'连接较多，部分记录可能已超出本次采集范围'}:{})});
     }catch{
       if(this.current(e,generation)) {
-        if(this.status.get(e.id)?.capture!=='error')this.store.addNetworkRecord(e.id,'gap',key,randomUUID(),{at:new Date().toISOString(),reason:'unavailable'});
-        this.status.set(e.id,{key,generation,capture:'error',captureIssue:'连接记录暂不可读取；这不代表没有网络访问；升级后请重新启动环境'});
+        const reportGap=this.status.get(e.id)?.capture!=='error';
+        this.status.set(e.id,{key,generation,capture:'error',captureIssue:'连接记录暂不可读取或保存；这不代表没有网络访问；升级后请重新启动环境'});
+        // A full or temporarily unwritable database must not hide the failed
+        // capture behind its last successful in-memory status.
+        if(reportGap)try{this.store.addNetworkRecord(e.id,'gap',key,randomUUID(),{at:new Date().toISOString(),reason:'unavailable'});}catch{/* Keep the explicit in-memory failure when persistence is unavailable. */}
       }
     }
   }
@@ -212,11 +233,13 @@ export class NetworkObserver {
     const connections=paged?.connections??this.store.networkRecords(e.id,'connection',key) as ConnectionObservation[];
     const candidate=captureSupported(e)?this.status.get(e.id):undefined;
     const state=candidate?.key===key&&candidate.generation===this.generation(e.id)?candidate:undefined;
-    return {enabled:e.kind==='vm'&&e.state==='running',capture:captureSupported(e)?state?.capture??'waiting':'unsupported',
+    const issue=this.writeIssues.get(e.id),storageIssue=issue?.key===key&&issue.generation===this.generation(e.id);
+    return {enabled:e.kind==='vm'&&e.state==='running',environmentState:e.state,capture:captureSupported(e)?state?.capture??'waiting':'unsupported',
       ...(state?{capture:state.capture,captureIssue:state.captureIssue,collectedAt:state.collectedAt}:{}),
+      ...(storageIssue?{storageIssue:'部分出口检测或核验回执暂不可保存，历史记录可能不完整；联网防护独立运行。'}:{}),
       captureGaps:this.store.networkRecords(e.id,'gap',key).length,startedAt:this.startedAt,sampleIntervalSeconds:30,lockIp:e.network.egressLock?.expectedIp??null,
       samples,connections,...(paged?{connectionPage:paged.connectionPage}:{}),summary:exitSummary(e.state==='running'?currentSamples:samples)};
   }
   async close(){this.closed=true;clearInterval(this.timer);await this.pending;await Promise.allSettled(this.sampling.values());}
-  forget(id:string){this.cursors.delete(id);this.status.delete(id);this.due.delete(id);this.configured.delete(id);this.contexts.delete(id);}
+  forget(id:string){this.cursors.delete(id);this.status.delete(id);this.due.delete(id);this.configured.delete(id);this.contexts.delete(id);this.writeIssues.delete(id);}
 }

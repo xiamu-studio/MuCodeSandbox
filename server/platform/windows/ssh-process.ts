@@ -1,6 +1,6 @@
 import {spawn} from 'node:child_process';
 import {StringDecoder} from 'node:string_decoder';
-import {AppError} from '../../errors.ts';
+import {AppError,SshProcessError} from '../../errors.ts';
 import type {Runner} from '../../process.ts';
 
 // SSH stdout carries JSON, base64 and exact guest bytes. Windows OpenSSH can
@@ -15,7 +15,7 @@ export const runWindowsSsh:Runner=(file,args,options={})=>new Promise((resolve,r
  const finish=(error?:Error,code?:number|null)=>{
   if(settled)return;settled=true;clearTimeout(deadline);clearTimeout(force);options.signal?.removeEventListener('abort',abort);
   const tail=stdout.end();data+=tail;diagnostics=(diagnostics+stderr.end()).slice(-65536);
-  if(error)reject(error);else if(code!==0)reject(new AppError((diagnostics||data).trim().slice(-4000)||`SSH 任务失败（${code}）`,500,'PROCESS_FAILED'));else resolve(data);
+  if(error)reject(error);else if(code!==0)reject(new SshProcessError((diagnostics||data).trim().slice(-4000)||`SSH 任务失败（${code}）`,code??null));else resolve(data);
  };
  const stop=(error:Error)=>{
   if(settled||reason)return;reason=error;child.kill('SIGTERM');
@@ -26,9 +26,10 @@ export const runWindowsSsh:Runner=(file,args,options={})=>new Promise((resolve,r
  const abort=()=>stop(new AppError('操作已取消',409,'CANCELLED'));
  const deadline=setTimeout(()=>stop(new AppError('SSH 操作超时，请检查日志和网络连接',504,'TIMEOUT')),timeoutMs);
  options.signal?.addEventListener('abort',abort,{once:true});
- child.stdout.on('data',(part:Buffer)=>{bytes+=part.length;if(bytes>maxBytes){stop(new AppError('SSH 返回数据超过限制',413,'PROCESS_OUTPUT_TOO_LARGE'));return;}const text=stdout.write(part);data+=text;if(text)options.onOutput?.(text);});
- child.stderr.on('data',(part:Buffer)=>{const text=stderr.write(part);diagnostics=(diagnostics+text).slice(-65536);if(text)options.onOutput?.(text);});
+ const report=(text:string)=>{if(!text||!options.onOutput||reason)return;try{options.onOutput(text);}catch{stop(new AppError('处理 SSH 运行输出失败，请查看任务状态后重试',500,'PROCESS_OUTPUT_HANDLER_FAILED'));}};
+ child.stdout.on('data',(part:Buffer)=>{bytes+=part.length;if(bytes>maxBytes){stop(new AppError('SSH 返回数据超过限制',413,'PROCESS_OUTPUT_TOO_LARGE'));return;}const text=stdout.write(part);data+=text;report(text);});
+ child.stderr.on('data',(part:Buffer)=>{const text=stderr.write(part);diagnostics=(diagnostics+text).slice(-65536);report(text);});
  child.stdin.on('error',()=>stop(new AppError('传入数据时 SSH 连接已关闭，请刷新确认保存结果',502,'PROCESS_INPUT_CLOSED')));
- child.once('error',error=>{reason=error;});child.once('close',code=>finish(reason,code));
+ child.on('error',error=>{if(!settled)reason??=error;});child.once('close',code=>finish(reason,code));
  child.stdin.end(options.inputBytes??options.input);
 });

@@ -5,6 +5,13 @@ if(Test-Path -LiteralPath $Destination){throw 'Broker already exists'}
 if($ChannelFile -notmatch '^hv-channel-[0-9a-f]{16}\.exe$'){throw 'Expected a fixed channel helper filename'}
 if($SourceDigest -notmatch '^[a-f0-9]{64}$'){throw 'Expected a broker source digest'}
 $source=[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/HyperVBroker.cs'))
+$source='using System.Globalization; using Microsoft.Win32.SafeHandles;'+[Environment]::NewLine+$source
+# These helpers also compile as standalone units in ordinary-token fixtures.
+# Only their namespace imports are removed for this existing concatenation build.
+foreach($helper in @('RestoreOriginProof.cs','OriginPreparation.cs','RestoreOriginStore.cs','RestoreOriginFrames.cs')){
+    $unit=[IO.File]::ReadAllText((Join-Path $ScriptDirectory ('../../native/windows/'+$helper)))
+    $source+=[Environment]::NewLine+[Text.RegularExpressions.Regex]::Replace($unit,'(?m)^using [A-Za-z0-9_.]+;\r?$','')
+}
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/SealedBases.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/HostComponents.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/ProtectedLedger.cs'))
@@ -14,6 +21,13 @@ $source+=[Environment]::NewLine+$metrics
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/Resources.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/DiskGrowth.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/BackupRead.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/BackupRestore.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/RestoreOriginOperations.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/RestoreOriginInitialization.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/RestoreOriginSnapshots.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/OfflineSnapshots.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/SnapshotStaging.cs'))
+$source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/SnapshotOperations.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/BackupCursor.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/Recovery.cs'))
 $source+=[Environment]::NewLine+[IO.File]::ReadAllText((Join-Path $ScriptDirectory '../../native/windows/RecoveryPermissions.cs'))

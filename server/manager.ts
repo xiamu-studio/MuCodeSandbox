@@ -51,6 +51,9 @@ export class Manager {
   monitoring: Promise<void> | null = null;
   closing = false;
   quarantines = new Map<string, Promise<void>>();
+  // Disk writes can fail while the persisted state still says running.
+  // Only a new verified lifecycle start may release this access fence.
+  private revokedAccess = new Set<string>();
   hostSuspended = false;
   hostPowerChanges = new Set<Promise<void>>();
   hostNetwork: { state: 'starting' | 'ready' | 'failed'; issue: string | null } | undefined;
@@ -76,7 +79,7 @@ export class Manager {
     this.backups = new Backups(this.store, this.snapshots);
     this.diskRecovery = new DiskRecovery(this.store, this.runtime);
     this.networkObserver=new NetworkObserver(this.store,this.runtime,(e,provider)=>this.measureTrafficExit(e,provider),
-      e=>!this.closing&&!this.active.has(e.id)&&!this.quarantines.has(e.id)&&!this.hostSuspended&&(!this.hostNetwork||this.hostNetwork.state==='ready'),id=>this.generations.get(id)??0);
+      e=>!this.closing&&!this.active.has(e.id)&&!this.quarantines.has(e.id)&&!this.revokedAccess.has(e.id)&&!this.hostSuspended&&(!this.hostNetwork||this.hostNetwork.state==='ready'),id=>this.generations.get(id)??0);
     this.protectionTimer=setInterval(()=>{void this.monitorProtection().catch(error=>{
       if(!this.closing)this.store.log(null,null,`防护监测失败：${redact(errorMessage(error))}`,'error');
     });},8000);
@@ -151,9 +154,9 @@ export class Manager {
       return;
     }
     this.hostNetworkGeneration++;
-    const issue = event === 'failed' ? '电脑网络监测失效，保护环境已关闭；请重新打开应用' : '电脑网络已变化，保护环境已关闭；请手动重新启动并核验';
+    const issue = event === 'failed' ? '电脑网络监测失效，触发保护停机；请重新打开应用' : '电脑网络已变化，触发保护停机；请手动重新启动并核验';
     if (event === 'failed') this.hostNetwork = { state: 'failed', issue };
-    this.store.log(null, null, issue, 'error');
+    try { this.store.log(null, null, issue, 'error'); } catch { /* Disk failure cannot prevent protection. */ }
     const stops = this.store.list().filter(e => e.kind === 'vm' && e.network.strict && ['creating', 'starting', 'running', 'stopping'].includes(e.state))
       .map(e => this.quarantine(e, issue));
     const pending = Promise.allSettled(stops).then(() => {});
@@ -163,7 +166,7 @@ export class Manager {
   async handleHostPowerEvent(event: 'suspend' | 'resume') {
     if (this.closing) return;
     this.hostSuspended = event === 'suspend';
-    const issue = event === 'suspend' ? '电脑休眠，保护环境已关闭；唤醒后请手动启动' : '电脑唤醒，保护环境需要手动重新启动并核验';
+    const issue = event === 'suspend' ? '电脑休眠，触发保护停机；唤醒后请手动启动' : '电脑唤醒，保护环境需要手动重新启动并核验';
     // Close access synchronously before any asynchronous guest shutdown.
     const stops = this.store.list().filter(e => e.kind === 'vm' && e.network.strict && ['creating', 'starting', 'running', 'stopping'].includes(e.state))
       .map(e => this.quarantine(e, issue));
@@ -250,7 +253,7 @@ export class Manager {
     return result!;
   }
   async assertAccess(id: string, allowBusy = false) {
-    if (this.closing || this.quarantines.has(id)) throw new AppError('环境访问已关闭',409,'QUARANTINED');
+    if (this.closing || this.quarantines.has(id) || this.revokedAccess.has(id)) throw new AppError('环境访问已关闭',409,'QUARANTINED');
     if (!allowBusy) this.ensureIdle(id);
     const e = this.store.get(id), key = this.networkKey(e), generation = this.generations.get(id) ?? 0;
     this.assertHostPowerReady(e);
@@ -283,23 +286,25 @@ export class Manager {
     issue=protectionDiagnosticIssue(issue);
     const current = this.quarantines.get(e.id); if (current) return current;
     const task = this.tasks.get(this.active.get(e.id) ?? '');
+    this.revokedAccess.add(e.id);
     this.generations.set(e.id, (this.generations.get(e.id) ?? 0) + 1);
     const protectionEvent=this.recordProtectionFailure(e,issue);
-    this.store.state(e.id, 'stopping');
-    this.store.log(e.id,null,`防护异常，撤销访问并停止环境：${issue}`,'error');
-    const job = this.store.newJob(e.id,'quarantine');
+    const persist = <T>(write: () => T): T | undefined => { try { return write(); } catch { return undefined; } };
+    persist(() => this.store.state(e.id, 'stopping'));
+    persist(() => this.store.log(e.id,null,`防护异常，撤销访问并停止环境：${issue}`,'error'));
+    const job = persist(() => this.store.newJob(e.id,'quarantine'));
     task?.controller.abort();
-    const revoke = async () => { try { await this.onQuarantine?.(e.id); } catch (error) { this.store.log(e.id,null,`撤销连接时发生错误：${redact(errorMessage(error))}`,'error'); } };
+    const revoke = async () => { try { await this.onQuarantine?.(e.id); } catch (error) { persist(() => this.store.log(e.id,null,`撤销连接时发生错误：${redact(errorMessage(error))}`,'error')); } };
     const pending = Promise.resolve().then(async () => {
       const revoked = revoke();
       let failure = '';
       try { await this.runtime.stop(e); } catch (error) { failure = `隔离停机未能确认完成：${redact(errorMessage(error))}`; }
       this.updateProtectionStop(protectionEvent,failure?'failed':'confirmed',failure||undefined);
-      await task?.promise;
+      await task?.promise.catch(() => {});
       await revoked; await revoke();
-      this.store.state(e.id,'error',failure || `环境已停止：${issue}`);
-      this.store.finishJob(job.id,failure ? 'failed' : 'succeeded',failure || issue);
-    }).catch(error => { this.store.state(e.id,'error',redact(errorMessage(error))); this.store.finishJob(job.id,'failed',redact(errorMessage(error))); })
+      persist(() => this.store.state(e.id,'error',failure || `环境已停止：${issue}`));
+      if(job)persist(() => this.store.finishJob(job.id,failure ? 'failed' : 'succeeded',failure || issue));
+    }).catch(error => { persist(() => this.store.state(e.id,'error',redact(errorMessage(error)))); if(job)persist(() => this.store.finishJob(job.id,'failed',redact(errorMessage(error)))); })
       .finally(() => { if (this.quarantines.get(e.id) === pending) this.quarantines.delete(e.id); });
     this.quarantines.set(e.id,pending); return pending;
   }
@@ -447,6 +452,7 @@ export class Manager {
       if (action === 'delete') {
         await this.purgeEnvironmentFiles(e,options);
         this.store.remove(id);
+        this.revokedAccess.delete(id);
       } else if (action === 'prepare-network') { await this.runtime.prepareNetwork(e, options); this.store.state(id, 'stopped'); }
       else if (action === 'install-agent') { await this.assertAccess(id,true); await this.runtime.installAgent(e, options); }
       else if (e.kind === 'browser') {
@@ -474,7 +480,10 @@ export class Manager {
           }
         }
         this.store.state(id, action === 'stop' ? 'stopped' : 'running');
-        if(action==='start'||action==='restart')this.resolveProtectionFailures(this.store.get(id));
+        if(action==='start'||action==='restart') {
+          this.revokedAccess.delete(id);
+          this.resolveProtectionFailures(this.store.get(id));
+        }
       }
     });
   }

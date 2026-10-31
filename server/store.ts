@@ -32,6 +32,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS logs_environment ON logs(environment_id,id);
       CREATE TABLE IF NOT EXISTS network_records (id INTEGER PRIMARY KEY AUTOINCREMENT, environment_id TEXT NOT NULL, kind TEXT NOT NULL, config_key TEXT NOT NULL, source_key TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(environment_id,kind,source_key));
       CREATE INDEX IF NOT EXISTS network_records_environment ON network_records(environment_id,kind,config_key,id);
+      CREATE INDEX IF NOT EXISTS network_records_created_at ON network_records(created_at);
       CREATE TABLE IF NOT EXISTS protection_events (id TEXT PRIMARY KEY, environment_id TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS protection_events_environment ON protection_events(environment_id,created_at);
       PRAGMA user_version=1;`);
@@ -129,10 +130,22 @@ export class Store {
   }
   close() { this.db.close(); }
   addNetworkRecord(id:string,kind:'sample'|'connection'|'gap'|'approval',key:string,source:string,payload:unknown) {
-    this.db.prepare('INSERT OR IGNORE INTO network_records(environment_id,kind,config_key,source_key,payload,created_at) VALUES(?,?,?,?,?,?)')
-      .run(id,kind,key,source,JSON.stringify(payload),new Date().toISOString());
-    this.db.prepare('DELETE FROM network_records WHERE created_at<?').run(new Date(Date.now()-7*86400_000).toISOString());
-    this.db.exec('DELETE FROM network_records WHERE id <= (SELECT COALESCE(MAX(id),0)-10000 FROM network_records)');
+    this.addNetworkRecords(id,kind,key,[{source,payload}]);
+  }
+  addNetworkRecords(id:string,kind:'sample'|'connection'|'gap'|'approval',key:string,records:{source:string;payload:unknown}[]) {
+    if(!records.length)return;
+    const at=new Date().toISOString(),cutoff=new Date(Date.now()-7*86400_000).toISOString();
+    const insert=this.db.prepare('INSERT OR IGNORE INTO network_records(environment_id,kind,config_key,source_key,payload,created_at) VALUES(?,?,?,?,?,?)');
+    // A savepoint also preserves any outer transaction owned by the caller.
+    this.db.exec('SAVEPOINT network_record_batch');
+    try{
+      for(const record of records)insert.run(id,kind,key,record.source,JSON.stringify(record.payload),at);
+      this.db.prepare('DELETE FROM network_records WHERE created_at<?').run(cutoff);
+      // Ignored duplicate inserts consume AUTOINCREMENT IDs too. Locate the
+      // actual 10,001st newest row rather than treating IDs as row counts.
+      this.db.exec('DELETE FROM network_records WHERE id <= (SELECT id FROM network_records ORDER BY id DESC LIMIT 1 OFFSET 10000)');
+      this.db.exec('RELEASE network_record_batch');
+    }catch(error){this.db.exec('ROLLBACK TO network_record_batch; RELEASE network_record_batch');throw error;}
   }
   networkRecords(id:string,kind:'sample'|'connection'|'gap'|'approval',key:string) {
     return (this.db.prepare('SELECT id,payload FROM network_records WHERE environment_id=? AND kind=? AND config_key=? ORDER BY id DESC LIMIT 300').all(id,kind,key) as {id:number;payload:string}[])

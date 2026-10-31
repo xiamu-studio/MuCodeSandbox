@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createServer, type Socket } from 'node:net';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { measureEgress, EGRESS_URL, EGRESS_RECEIVERS } from '../server/egress.ts';
 import { LimaRuntime } from '../server/runtime.ts';
 import { environmentSchema } from '../server/validation.ts';
@@ -33,7 +34,7 @@ function captureRuntime(proxy: string) {
   assert.equal((await measureEgress(runtime, e)).ip, '8.8.8.8');
   assert.equal(calls.length, 3); const command = calls[0].args;
   assert.deepEqual(command.slice(0, 10), ['/usr/bin/sudo', '-H', '-u', 'mu-probe', '--', 'env', '-i', 'PATH=/usr/bin:/bin', '/usr/bin/curl', '-q']);
-  for (const [flag, value] of [['--proxy', ''], ['--noproxy', '*'], ['--proto', '=https'], ['--cacert', '/etc/ssl/certs/ca-certificates.crt'], ['--doh-url', 'https://dns.quad9.net:443/dns-query'], ['--resolve', 'dns.quad9.net:443:9.9.9.9'], ['--connect-timeout', '4'], ['--max-time', '12']]) {
+  for (const [flag, value] of [['--proxy', ''], ['--noproxy', '*'], ['--proto', '=https'], ['--cacert', '/etc/ssl/certs/ca-certificates.crt'], ['--doh-url', 'https://dns.quad9.net:443/dns-query'], ['--resolve', 'dns.quad9.net:443:9.9.9.9'], ['--connect-timeout', '8'], ['--max-time', '12']]) {
     assert.equal(command[command.indexOf(flag) + 1], value);
   }
   assert.ok(command.includes('--tlsv1.2') && command.includes('--ipv4'));
@@ -84,8 +85,11 @@ test('proxy or controlled-DNS failure aborts verification without any receiver r
 test('the real curl command sends the fixed target hostname to SOCKS5 and terminates when that controlled listener refuses DNS', async () => {
   const requests: { addressType: number; hostname: string; port: number }[] = [];
   const sockets = new Set<Socket>();
+  const pending: Socket[] = [];
+  const socketErrors: string[] = [];
   const server = createServer(socket => {
     sockets.add(socket); socket.once('close', () => sockets.delete(socket));
+    socket.on('error', error => { if ((error as NodeJS.ErrnoException).code !== 'ECONNRESET') socketErrors.push(error.message); });
     let buffer = Buffer.alloc(0), greeted = false;
     socket.on('data', bytes => {
       buffer = Buffer.concat([buffer, bytes]);
@@ -99,8 +103,12 @@ test('the real curl command sends the fixed target hostname to SOCKS5 and termin
       const length = buffer[4];
       requests.push({ addressType: buffer[3], hostname: buffer.subarray(5, 5 + length).toString('ascii'), port: buffer.readUInt16BE(5 + length) });
       buffer = Buffer.alloc(0);
-      // SOCKS host-unreachable response models a controlled resolver failure.
-      socket.end(Buffer.from([5, 4, 0, 1, 0, 0, 0, 0, 0, 0]));
+      // Wait for all three hostnames before refusing: the first failure
+      // intentionally aborts outstanding production probes immediately.
+      pending.push(socket);
+      if (pending.length === EGRESS_RECEIVERS.length) {
+        for (const connection of pending) connection.end(Buffer.from([5, 4, 0, 1, 0, 0, 0, 0, 0, 0]));
+      }
     });
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -108,14 +116,25 @@ test('the real curl command sends the fixed target hostname to SOCKS5 and termin
   const execute = promisify(execFile); let calls = 0;
   const runtime = { egressProbeProxy: () => `socks5h://127.0.0.1:${port}`, management: async (_e: Environment, args: string[]) => {
     calls++; const index = args.indexOf('/usr/bin/curl');
-    // Strip the guest sudo/env wrapper. Run the exact curl arguments as the
-    // current user; the local fixture never connects to the real target.
-    const result = await execute('/usr/bin/curl', args.slice(index + 1), { env: { PATH: '/usr/bin:/bin' }, timeout: 10_000, maxBuffer: 65536 });
+    // Strip the guest wrapper. Windows curl checks the guest-only CA path
+    // before opening SOCKS, so substitute an existing fixture file there.
+    // The local SOCKS server always refuses the request before TLS; this test
+    // proves hostname routing and refusal, not certificate verification.
+    const curlArgs = args.slice(index + 1);
+    const windows = process.platform === 'win32';
+    const caIndex = curlArgs.indexOf('--cacert');
+    assert.ok(caIndex >= 0);
+    assert.equal(curlArgs[caIndex + 1], '/etc/ssl/certs/ca-certificates.crt');
+    if (windows) curlArgs[caIndex + 1] = fileURLToPath(import.meta.url);
+    const curl = windows ? `${process.env.SystemRoot}\\System32\\curl.exe` : '/usr/bin/curl';
+    const env = windows ? { SystemRoot: process.env.SystemRoot, PATH: process.env.PATH } : { PATH: '/usr/bin:/bin' };
+    const result = await execute(curl, curlArgs, { env, timeout: 10_000, maxBuffer: 65536 });
     return result.stdout;
   } } as unknown as LimaRuntime;
   try {
     await assert.rejects(measureEgress(runtime, environment()));
     assert.equal(calls, 3);
+    assert.deepEqual(socketErrors, []);
     for(let i=0;i<20&&requests.length<3;i++)await new Promise(resolve=>setTimeout(resolve,10));
     assert.deepEqual(requests.map(value=>({ ...value })).sort((a,b)=>a.hostname.localeCompare(b.hostname)), EGRESS_RECEIVERS.map(value=>({addressType:3,hostname:new URL(value.url).hostname,port:443})).sort((a,b)=>a.hostname.localeCompare(b.hostname)));
   } finally {

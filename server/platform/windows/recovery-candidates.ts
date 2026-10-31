@@ -10,7 +10,7 @@ const id=z.uuid().refine(value=>value===value.toLowerCase()&&value!=='00000000-0
 const saved=z.object({id,name:z.string().min(1).max(60),kind:z.literal('vm'),cpus:z.number().int().min(1).max(16),memoryGiB:z.number().int().min(2).max(32),diskGiB:z.number().int().min(16).max(256)});
 const manifest=z.object({version:z.literal(1),id,platformId:id,imageSha256:z.string().regex(/^[a-f0-9]{64}$/),purpose:z.literal('environment')});
 async function regular(file:string,max:number){const entry=await lstat(file);if(!entry.isFile()||entry.isSymbolicLink()||entry.nlink!==1||entry.size<1||entry.size>max)throw Error('Original management file is unavailable');return entry;}
-async function readOriginal(file:string,max:number){
+export async function readOriginal(file:string,max:number){
  const before=await regular(file,max),handle=await open(file,'r');
  try{
   const pinned=await handle.stat();if(!pinned.isFile()||pinned.nlink!==1||pinned.dev!==before.dev||pinned.ino!==before.ino||pinned.size!==before.size)throw Error('Original management file changed');

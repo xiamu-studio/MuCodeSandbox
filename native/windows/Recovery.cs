@@ -21,30 +21,39 @@ public static partial class MuHyperVBroker {
         if(action!="recovery-review"&&action!="recovery-adopt")throw new UnauthorizedAccessException("This recovery session only reviews and registers stopped protected resources");
         if(action=="recovery-review")ValidateKeys(request,"action","id","imageSha256");else ValidateKeys(request,"action","id","imageSha256","plan","confirmName");
         string id=Id(request),digest=Digest(request,"imageSha256"),name="mu-win-"+id.Replace("-","");
+        if(HasStorage(Path.Combine(UserRoot,"vms",id,"snapshots","restore-active")))throw new MuStorageException("SNAPSHOT_PENDING","Replay the pending snapshot with the original owner configuration before adopting this allocation");
         if(digest==CanonicalBuilderDigest)throw new UnauthorizedAccessException("Base builders cannot be adopted as work environments");
         lock(VmGate(id))lock(ImportGate)using(ImportReservation()){
             if(RecoveryPublicationAttempted||LedgerStore.RecoveryFingerprint()!=RecoveryLedgerFingerprint)throw new MuStorageException("RECOVERY_REVIEW_CHANGED","Protected registrations changed; reopen recovery");
             lock(Gate)if(Records.ContainsKey(id)||Records.Count>=32)throw new UnauthorizedAccessException("Only unregistered storage may be recovered");
             string dir=Path.Combine(UserRoot,"vms",id);if(!Directory.Exists(dir))throw new UnauthorizedAccessException("Protected allocation storage is missing");CheckRemovalTree(dir);
             string[] images=new[]{Path.Combine(UserRoot,"images",digest+".vhdx"),Path.Combine(UserRoot,"images",digest+".vhd")}.Where(File.Exists).ToArray();
-            if(images.Length!=1)throw new UnauthorizedAccessException("Select one existing verified source image digest");
-            var record=new Dictionary<string,object>{{"id",id},{"ownerSid",OwnerSid},{"image",images[0]},{"imageSha256",digest},{"cpus",1},{"memoryGiB",2},{"diskGiB",16},{"stage","ready"},{"everReady",true}};
+            if(images.Length>1)throw new UnauthorizedAccessException("Source image authority is ambiguous; preserved");
+            var record=new Dictionary<string,object>{{"id",id},{"ownerSid",OwnerSid},{"image",images.Length==1?images[0]:Path.Combine(UserRoot,"images",digest+".vhdx")},{"imageSha256",digest},{"cpus",1},{"memoryGiB",2},{"diskGiB",16},{"stage","ready"},{"everReady",true}};
             var parameters=Parameters(record);parameters["allowPartialAllocation"]=false;
-            var before=Json().Deserialize<Dictionary<string,object>>(Invoke("review-allocation",parameters,30000,cancellation));string expected=Id(new Dictionary<string,object>{{"id",Text(before,"platformId",36)}});parameters["expectedPlatformId"]=expected;
+            var before=Json().Deserialize<Dictionary<string,object>>(Invoke("review-allocation",parameters,30000,cancellation));if(before.Count!=4)throw new UnauthorizedAccessException("Recovery VM facts changed");string expected=Id(new Dictionary<string,object>{{"id",Text(before,"platformId",36)}});parameters["expectedPlatformId"]=expected;
             var vmSid=(SecurityIdentifier)new NTAccount("NT VIRTUAL MACHINE",expected).Translate(typeof(SecurityIdentifier));RecoveryAcl(dir,vmSid,true);
             var directoryHandle=CreateFile(dir,0x80000000,3,IntPtr.Zero,3,0x02000000|0x00200000,IntPtr.Zero);if(directoryHandle==new IntPtr(-1))throw new IOException("Cannot pin recovery allocation");
-            using(var pinned=new HandleOwner(directoryHandle))using(var disk=RecoveryFile(Convert.ToString(parameters["disk"]),vmSid))using(var seed=RecoveryFile(Convert.ToString(parameters["seed"]),vmSid))using(var image=RecoveryFile(images[0])){
-                string diskHash=RecoveryHash(disk,cancellation);if(RecoveryHash(image,cancellation)!=digest)throw new UnauthorizedAccessException("Recovery source image changed");string seedHash=RecoveryHash(seed,cancellation);
+            using(var pinned=new HandleOwner(directoryHandle))using(var disk=RecoveryFile(Convert.ToString(parameters["disk"]),vmSid))using(var seed=RecoveryFile(Convert.ToString(parameters["seed"]),vmSid))using(var image=images.Length==1?RecoveryFile(images[0]):null)using(var origins=HasStorage(Path.Combine(UserRoot,"restore-origins"))?OpenOriginStore():null){
+                string diskHash=RecoveryHash(disk,cancellation);if(image!=null&&RecoveryHash(image,cancellation)!=digest)throw new UnauthorizedAccessException("Recovery source image changed");string seedHash=RecoveryHash(seed,cancellation);
                 var after=Json().Deserialize<Dictionary<string,object>>(Invoke("review-allocation",parameters,30000,cancellation));
                 if(before.Count!=4||after.Count!=4||before.Any(pair=>!after.ContainsKey(pair.Key)||Convert.ToString(pair.Value,System.Globalization.CultureInfo.InvariantCulture)!=Convert.ToString(after[pair.Key],System.Globalization.CultureInfo.InvariantCulture)))throw new IOException("VM changed during recovery review");
                 int cpus=Number(after,"cpus",1,16),memory=Number(after,"memoryGiB",2,32),capacity=Number(after,"diskGiB",16,256);string platform=Id(new Dictionary<string,object>{{"id",Text(after,"platformId",36)}});
                 record["cpus"]=cpus;record["memoryGiB"]=memory;record["diskGiB"]=capacity;record["platformId"]=platform;
+                MuRestoreOriginSnapshot origin=null;
+                if(origins!=null&&origins.Contains(id)){
+                    origin=origins.ReadAcceptedSnapshot(id,platform);var proof=MuRestoreOriginProof.Parse(origin.Text,OwnerSid,id,platform);OriginContext(proof,record);MuRestoreOriginProof.MatchCurrent(proof,OriginFacts(origins,record,disk,seed,cancellation),OwnerSid,id,platform);record["restoreOrigin"]=true;
+                }else if(image==null)throw new UnauthorizedAccessException("A verified source image or accepted protected import origin is required; resources preserved");
+                if(HasStorage(Path.Combine(dir,"snapshots","restore-active")))throw new MuStorageException("SNAPSHOT_PENDING","Pending snapshot must be reconciled before recovery");
                 long registered;lock(Gate)registered=Records.Values.Sum(value=>Convert.ToInt64(value["diskGiB"]));MuResourcePolicy.Quota(registered,capacity);string fingerprint=LedgerStore.RecoveryFingerprint();
-                var reviewed=new {version=1,id=id,name=name,platformId=platform,cpus=cpus,memoryGiB=memory,diskGiB=capacity,imageSha256=digest,diskSha256=diskHash,seedSha256=seedHash,registryFingerprint=fingerprint,registeredDiskGiB=registered};
-                string plan;using(var sha=SHA256.Create())plan=BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(Json().Serialize(reviewed)))).Replace("-","").ToLowerInvariant();
+                var reviewed=new {version=1,id=id,name=name,platformId=platform,cpus=cpus,memoryGiB=memory,diskGiB=capacity,imageSha256=digest,diskSha256=diskHash,seedSha256=seedHash,registryFingerprint=fingerprint,registeredDiskGiB=registered,sourceAuthority=origin==null?"base-image":"import-origin"};
+                Dictionary<string,object> directoryFile;using(var handle=new Microsoft.Win32.SafeHandles.SafeFileHandle(directoryHandle,false))directoryFile=MuRestoreOriginStore.CaptureIdentity(handle);
+                var bound=new{review=reviewed,originToken=origin==null?null:origin.Token,directoryFile=directoryFile,diskFile=MuRestoreOriginStore.CaptureIdentity(disk.SafeFileHandle),seedFile=MuRestoreOriginStore.CaptureIdentity(seed.SafeFileHandle)};
+                if(origin!=null&&origins.ReadAcceptedSnapshot(id,platform).Token!=origin.Token)throw new MuStorageException("RECOVERY_REVIEW_CHANGED","Import origin changed during review");
+                string plan;using(var sha=SHA256.Create())plan=BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(Json().Serialize(bound)))).Replace("-","").ToLowerInvariant();
                 if(action=="recovery-review")return new {review=reviewed,plan=plan,registered=false,state="Off",diskPreserved=true};
                 if(Digest(request,"plan")!=plan||Text(request,"confirmName",64)!=name)throw new MuStorageException("RECOVERY_REVIEW_CHANGED","Recovery review changed or confirmation does not match; review again");
-                cancellation.ThrowIfCancellationRequested();CheckPower();lock(Gate){RecoveryPublicationAttempted=true;Records.Add(id,record);try{LedgerStore.SaveRecovery(Records,fingerprint);}catch{Records.Remove(id);throw;}}
+                cancellation.ThrowIfCancellationRequested();CheckPower();if(origin!=null&&origins.ReadAcceptedSnapshot(id,platform).Token!=origin.Token)throw new MuStorageException("RECOVERY_REVIEW_CHANGED","Import origin changed before registration");lock(Gate){RecoveryPublicationAttempted=true;Records.Add(id,record);try{LedgerStore.SaveRecovery(Records,fingerprint);}catch{Records.Remove(id);throw;}}
                 return new {registered=true,id=id,platformId=platform,state="Off",diskPreserved=true,reopenRequired=true};
             }
         }

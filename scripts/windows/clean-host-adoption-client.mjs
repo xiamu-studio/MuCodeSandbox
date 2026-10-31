@@ -20,6 +20,9 @@ export async function adoptionAcceptance(phase,client,nonce,pass){
   pass('A real protected Linux disk is seeded by dev and stopped with business networking closed');return {config,canary,platformId,stopped:true,removed:false};
  }
  const seed=JSON.parse(await readFile('C:/MuLab/approved/adoption-seed-result.json','utf8')).nested,c=windowsConfigSchema.parse(seed.config);
+ if(phase==='adoption-backup-restore'){
+  const {backupInstalledAcceptance}=await import('file:///C:/MuLab/backup-installed-client.mjs');return backupInstalledAcceptance(client,nonce,pass,runtime,c,seed);
+ }
  if(phase==='adoption-backup'){
   const {backupReadAcceptance}=await import('file:///C:/MuLab/backup-read-client.mjs');return backupReadAcceptance(client,nonce,pass,runtime,c,seed);
  }

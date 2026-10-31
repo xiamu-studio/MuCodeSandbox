@@ -7,6 +7,7 @@ import {WindowsNetworkSession} from '../server/platform/windows/session.ts';impo
 import {DEEPSEEK_TRANSLATE_PYTHON,TRANSLATE_BOOTSTRAP,TRANSLATION_PROMPT} from '../server/deepseek-translation.ts';
 import {TRANSLATION_MODEL,TRANSLATION_INPUT_LIMIT,TRANSLATION_RESPONSE_BYTES,TRANSLATION_TIMEOUT_SECONDS} from '../shared/translation.ts';
 import type {RunOptions} from '../server/process.ts';
+import {AppError} from '../server/errors.ts';
 const key='sk-synthetic-translation-abcdefghijklmnop',secretText='私密合成原文，不得出现在日志中';
 const cleanup=async(root:string)=>{assert.equal(path.dirname(path.resolve(root)),path.resolve(tmpdir()));await rm(root,{recursive:true,force:true});};
 test('Windows translation keys persist under the DPAPI-backed store without plaintext or environment coupling',{skip:process.platform!=='win32'},async()=>{
@@ -27,11 +28,25 @@ test('Windows translation API authenticates explicit guest-only calls, bounds pr
   assert.equal((await fetch(settings)).status,401);assert.equal((await fetch(settings,{headers:{...headers,Origin:'http://foreign.invalid'}})).status,403);assert.equal((await fetch(settings,{headers})).status,200);assert.equal(calls,0);
   const e=await service.manager.create({name:'Synthetic offline translation',cpus:1,memoryGiB:2,diskGiB:16,network:{mode:'http',host:'127.0.0.1',port:12345,strict:true,transparent:true,egressLock:{expectedIp:'203.0.113.10'}}}),url=service.url+'/api/environments/'+e.id+'/translate-text',body=JSON.stringify({text:secretText});
   const send=()=>fetch(url,{method:'POST',headers,body});assert.equal((await send()).status,409);const job=await service.manager.action(e.id,'start');await service.manager.wait(job.id);assert.equal(service.manager.store.jobs().find(value=>value.id===job.id)!.status,'succeeded');assert.equal((await send()).status,409);assert.equal(calls,0);
+  for(const cancellation of ['disconnect','key-clear','stop'] as const){
+   let entered!:()=>void,ended!:()=>void;const began=new Promise<void>(resolve=>entered=resolve),cancelled=new Promise<void>(resolve=>ended=resolve),abort=new AbortController();
+   runtime.inspectGuard=async(_config,options={})=>{assert.ok(options.signal);entered();return new Promise((_resolve,reject)=>options.signal!.addEventListener('abort',()=>{ended();reject(new AppError('Synthetic authorization cancelled',409,'CANCELLED'));},{once:true}));};
+   try{
+    const waiting=fetch(url,{method:'POST',headers,body,signal:abort.signal});const observed=waiting.then(response=>response,error=>error);await began;
+    const duplicate=await send();assert.equal(duplicate.status,409);assert.equal((await duplicate.json()).code,'TRANSLATION_BUSY');
+    if(cancellation==='disconnect')abort.abort();else if(cancellation==='key-clear')assert.equal((await fetch(settings,{method:'DELETE',headers})).status,200);else await service.manager.wait((await service.manager.action(e.id,'stop')).id);
+    await Promise.race([cancelled,delay(3000).then(()=>{throw Error('Authorization was not cancelled');})]);
+    const outcome=await observed;if(cancellation!=='disconnect'){assert.equal(outcome.status,409);assert.equal((await outcome.json()).code,'CANCELLED');}else assert.ok(outcome instanceof Error);
+   }finally{abort.abort();runtime.inspectGuard=inspection;}
+   assert.equal(service.manager.store.get(e.id).state,cancellation==='stop'?'stopped':'running');assert.equal(service.manager.store.protectionEvents(e.id).length,0);assert.equal(calls,0);
+   if(cancellation==='stop')await service.manager.wait((await service.manager.action(e.id,'start')).id);
+   const retry=await send();assert.equal(retry.status,409);assert.equal((await retry.json()).code,'TRANSLATION_KEY_REQUIRED');
+  }
   assert.equal((await fetch(settings,{method:'POST',headers,body:JSON.stringify({apiKey:key,endpoint:'https://foreign.invalid'})})).status,400);const saved=await fetch(settings,{method:'POST',headers,body:JSON.stringify({apiKey:key})});assert.equal(saved.status,200);assert.equal((await saved.text()).includes(key),false);assert.equal(calls,0);
   for(const input of [{text:'x'.repeat(TRANSLATION_INPUT_LIMIT+1)},{text:'\0'},{text:secretText,direction:'invalid'},{text:secretText,endpoint:'https://foreign.invalid'}])assert.equal((await fetch(url,{method:'POST',headers,body:JSON.stringify(input)})).status,400);
   assert.equal((await send()).status,200);assert.equal(calls,1);next=async()=>{throw Error(key+' '+secretText);};const failed=await send();assert.equal(failed.status,502);const failure=await failed.text();assert.equal(failure.includes(key)||failure.includes(secretText),false);assert.equal(calls,2);
   let entered!:()=>void,aborted!:()=>void;const began=new Promise<void>(resolve=>entered=resolve),cancelled=new Promise<void>(resolve=>aborted=resolve);next=options=>new Promise((_resolve,reject)=>{entered();options.signal!.addEventListener('abort',()=>{aborted();reject(Error('synthetic cancelled'));},{once:true});});
-  const pending=send();await began;assert.equal((await send()).status,409);assert.equal(calls,3);assert.equal((await fetch(settings,{method:'DELETE',headers})).status,200);await Promise.race([cancelled,delay(3000).then(()=>{throw Error('Key removal did not cancel guest work');})]);assert.equal((await pending).status,502);assert.equal(calls,3);
+  const pending=send();await began;assert.equal((await send()).status,409);assert.equal(calls,3);assert.equal((await fetch(settings,{method:'DELETE',headers})).status,200);await Promise.race([cancelled,delay(3000).then(()=>{throw Error('Key removal did not cancel guest work');})]);const cancelledResponse=await pending;assert.equal(cancelledResponse.status,409);assert.equal((await cancelledResponse.json()).code,'CANCELLED');assert.equal(calls,3);
   await fetch(settings,{method:'POST',headers,body:JSON.stringify({apiKey:key})});let received!:()=>void,closed!:()=>void;const started=new Promise<void>(resolve=>received=resolve),stopped=new Promise<void>(resolve=>closed=resolve);next=options=>new Promise((_resolve,reject)=>{received();options.signal!.addEventListener('abort',()=>{closed();reject(Error('synthetic disconnected'));},{once:true});});const cancel=new AbortController(),disconnected=fetch(url,{method:'POST',headers,body,signal:cancel.signal});await started;cancel.abort();await assert.rejects(disconnected);await Promise.race([stopped,delay(3000).then(()=>{throw Error('Disconnected request did not cancel guest work');})]);
   const logs=JSON.stringify(service.manager.store.logs(null,0)),snapshot=JSON.stringify(await service.manager.snapshot());for(const value of [key,secretText]){assert.equal(logs.includes(value),false);assert.equal(snapshot.includes(value),false);assert.equal((await readFile(path.join(root,'app','windows-translation-provider.json'),'utf8')).includes(value),false);}
  }finally{await service.close();await cleanup(root);}

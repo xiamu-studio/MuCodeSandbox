@@ -1,0 +1,31 @@
+'use strict';
+const {createHmac,timingSafeEqual,randomUUID}=require('node:crypto');
+function descriptor(value,state,now=Date.now()){
+ if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==6||!['version','runId','appOrigin','url','expiresAt','signature'].every(key=>Object.hasOwn(value,key))||value.version!==1||typeof value.runId!=='string'||!new RegExp('^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$').test(value.runId)||value.appOrigin!==state.origin||typeof value.url!=='string'||value.url.length>300||!Number.isSafeInteger(value.expiresAt)||value.expiresAt<=now||value.expiresAt-now>10000||typeof value.signature!=='string'||!/^[a-f0-9]{64}$/.test(value.signature)||typeof state.key!=='string'||!/^[a-f0-9]{64}$/.test(state.key))throw Error('本机对照窗口回执无效或已过期，请重新打开。');
+ const url=new URL(value.url);if(url.protocol!=='http:'||url.hostname!=='127.0.0.1'||!url.port||url.username||url.password||url.search||url.hash||!/^\/control\/[a-f0-9]{64}\/$/.test(url.pathname)||url.href!==value.url)throw Error('本机对照页面地址无效。');
+ const payload={version:1,runId:value.runId,appOrigin:value.appOrigin,url:value.url,expiresAt:value.expiresAt},expected=createHmac('sha256',Buffer.from(state.key,'hex')).update(JSON.stringify(payload)).digest();if(!timingSafeEqual(expected,Buffer.from(value.signature,'hex')))throw Error('本机对照窗口回执无法核验。');return {...payload,origin:url.origin,prefix:url.pathname};
+}
+function permitted(bound,value){try{const url=new URL(value);return url.origin===bound.origin&&url.pathname.startsWith(bound.prefix)&&!url.username&&!url.password&&!url.hash&&!url.search&&!/%|[\\]/.test(url.pathname)&&!url.pathname.includes('/../')&&!url.pathname.includes('/./');}catch{return false;}}
+function createHostLabWindows({getState,BrowserWindow,session,openTimeoutMs=15000,cleanupTimeoutMs=10000}){
+ if(!Number.isInteger(openTimeoutMs)||openTimeoutMs<1||openTimeoutMs>15000||!Number.isInteger(cleanupTimeoutMs)||cleanupTimeoutMs<1||cleanupTimeoutMs>10000)throw Error('Invalid comparison window deadline');
+ const bounded=async(work,milliseconds,message)=>{let timer;try{return await Promise.race([work,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error(message)),milliseconds);})]);}finally{clearTimeout(timer);}};
+ let current,opening=false,cleanup=Promise.resolve();
+ const caller=(event,initial,requireFocus=true)=>{try{const state=getState(),web=initial.window?.webContents,frame=event.senderFrame;if(!state.normal||state.window!==initial.window||state.origin!==initial.origin||state.epoch!==initial.epoch||state.key!==initial.key||!web||initial.window.isDestroyed()||requireFocus&&!initial.window.isFocused()||web.isDestroyed()||event.sender!==web||frame!==web.mainFrame||!frame||frame.isDestroyed())return false;const url=new URL(frame.url);return url.origin===initial.origin&&url.pathname==='/'&&new URL(web.getURL()).origin===initial.origin;}catch{return false;}};
+ function destroy(){const old=current;current=undefined;if(!old)return cleanup;if(old.window&&!old.window.isDestroyed())old.window.destroy();cleanup=cleanup.catch(()=>{}).then(async()=>{await bounded(old.session.clearStorageData(),cleanupTimeoutMs,'本机对照临时资料清理超时，请重启应用后再试。');await bounded(old.session.clearCache(),cleanupTimeoutMs,'本机对照缓存清理超时，请重启应用后再试。');});return cleanup;}
+ async function open(event,value){
+  const initial={...getState()};if(!caller(event,initial))throw Error('本机对照请求来源无效。');const bound=descriptor(value,initial);if(opening)throw Error('本机对照窗口正在打开。');opening=true;
+  try{
+   const active=await initial.window.webContents.executeJavaScriptInIsolatedWorld(1001,[{code:'Boolean(navigator.userActivation.isActive)'}],false);if(active!==true||!caller(event,initial))throw Error('请在当前 Windows 窗口点击打开本机对照。');
+   await destroy();if(!caller(event,initial))throw Error('本机对照请求已失效。');descriptor(value,initial);
+   const nativeSession=session.fromPartition('mu-windows-host-lab-'+randomUUID(),{cache:false}),owned={window:null,session:nativeSession,bound};current=owned;nativeSession.setPermissionRequestHandler((_contents,_permission,callback)=>callback(false));nativeSession.setPermissionCheckHandler(()=>false);nativeSession.webRequest.onBeforeRequest((details,callback)=>callback({cancel:!permitted(bound,details.url)}));
+   await bounded(nativeSession.setProxy({mode:'direct'}),Math.min(openTimeoutMs,5000),'本机回环访问准备超时。');if(current!==owned||!caller(event,initial))throw Error('本机对照请求已失效。');
+   const nativeWindow=new BrowserWindow({width:1060,height:800,minWidth:500,minHeight:400,title:'MuCodeSandbox · Windows 本机检测对照',show:false,backgroundColor:'#f7f8fa',webPreferences:{session:nativeSession,nodeIntegration:false,nodeIntegrationInSubFrames:false,contextIsolation:true,sandbox:true,webSecurity:true,allowRunningInsecureContent:false,webviewTag:false,spellcheck:false,navigateOnDragDrop:false}});owned.window=nativeWindow;
+   nativeWindow.setMenu(null);nativeWindow.webContents.setWindowOpenHandler(()=>({action:'deny'}));nativeWindow.webContents.on('will-attach-webview',event=>event.preventDefault());for(const name of ['will-navigate','will-redirect'])nativeWindow.webContents.on(name,(event,url)=>{if(!permitted(bound,url))event.preventDefault();});
+   nativeWindow.on('closed',()=>{if(current===owned)void destroy().catch(()=>{});});nativeWindow.webContents.on('render-process-gone',()=>{if(current===owned)void destroy().catch(()=>{});});
+   await bounded(nativeWindow.loadURL(bound.url),openTimeoutMs,'本机对照页面未能在限定时间内打开。');if(current!==owned||nativeWindow.isDestroyed()||!caller(event,initial)){if(current===owned)await destroy();throw Error('本机对照请求已失效。');}nativeWindow.show();return {opened:true,runId:bound.runId};
+  }catch(error){await destroy().catch(()=>{});throw error;}finally{opening=false;}
+ }
+ async function close(event,value){const initial={...getState()};if(!caller(event,initial,false)||!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==1||typeof value.runId!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.runId))throw Error('关闭本机对照的请求无效。');if(current&&current.bound.runId!==value.runId)throw Error('本机检测会话已变化，请刷新后重试。');await destroy();return {closed:true};}
+ return {open,close,reset:destroy};
+}
+module.exports={createHostLabWindows,hostLabWindowDescriptor:descriptor,hostLabRequestAllowed:permitted};

@@ -43,13 +43,13 @@ try {
   await page.getByRole('checkbox',{name:'只看失败'}).uncheck();
   await table.scrollIntoViewIfNeeded();await page.screenshot({path:path.join(results,'desktop.png')});
   for(const width of [800,390]) {await page.setViewportSize({width,height:900});assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));}
-  fixture.enabled=false;fixture.summary.state='stale';
+  fixture.enabled=false;fixture.environmentState='stopped';fixture.summary.state='stale';
   await expect(page.getByText('沙箱已停止，暂停检测',{exact:true})).toBeVisible({timeout:10000});
   await expect(page.getByText('回执已过期',{exact:true})).toHaveCount(0);
   await expect(page.getByRole('button',{name:'立即检测',exact:true})).toBeDisabled();
   await expect(page.locator('.exit-observation-main strong')).toHaveText('203.0.113.10');
   await expect(page.getByText('检测说明',{exact:true})).toBeVisible();
-  fixture.enabled=true;
+  fixture.enabled=true;fixture.environmentState='running';
   await expect(page.getByText('检测结果较旧，等待刷新',{exact:true})).toBeVisible({timeout:10000});
   assert.deepEqual(errors,[]);report.checks=['Website domain and destination server IP are distinct','Exit receipt IP and time are visible','DNS references and ambiguous domains are labelled','Old rows do not receive the current IP','Domain/exit search and failures filter','No page overflow at 1320, 800, 390 pixels'];report.passed=true;
 }catch(error){report.error=error instanceof Error?error.stack:String(error);process.exitCode=1;}

@@ -23,15 +23,26 @@ public static partial class MuHyperVBroker {
     private static readonly SecurityIdentifier AdminSid = new SecurityIdentifier("S-1-5-32-544");
     private static readonly object Gate = new object();
     private static readonly object ImportGate = new object();
+    private static readonly object ChannelDiagnosticGate = new object();
     private static readonly Dictionary<string, Dictionary<string, object>> Records = new Dictionary<string, Dictionary<string, object>>();
     private static readonly Dictionary<string, object> VmGates = new Dictionary<string, object>();
     private static readonly Dictionary<string, Process> Channels = new Dictionary<string, Process>();
     private static readonly Dictionary<string, int> ChannelPorts = new Dictionary<string, int>();
+    private static readonly Dictionary<string, object> ChannelLaunches = new Dictionary<string, object>();
     private static readonly HashSet<string> StartedHere = new HashSet<string>();
+    // Ephemeral authority for the current broker's own maintenance boot. It
+    // is never restored from the durable journal after a process restart.
+    private static readonly HashSet<string> CompactionChannels = new HashSet<string>();
+    private static readonly HashSet<string> CompactionVerifyBoots = new HashSet<string>();
+    private static readonly HashSet<string> CompactionRunPermits = new HashSet<string>();
     private static readonly List<NamedPipeServerStream> Pipes = new List<NamedPipeServerStream>();
     private static readonly List<IDisposable> Held = new List<IDisposable>();
     private static readonly ManualResetEvent RequestsIdle=new ManualResetEvent(true),ShutdownComplete=new ManualResetEvent(false);
     private static readonly CancellationTokenSource Closing = new CancellationTokenSource();
+    private static readonly CancellationTokenSource QuiesceCancellation = new CancellationTokenSource();
+    private static readonly string ShutdownSession=Guid.NewGuid().ToString("N");
+    private static volatile bool Quiescing=false,ShutdownStopsConfirmed=false,RegistryLoaded=false;
+    private static int QuiesceWriters;
     private static int ActiveRequests;
     private static Process Owner;
     private static IntPtr OwnerHandle;
@@ -52,7 +63,10 @@ public static partial class MuHyperVBroker {
     [DllImport("kernel32.dll", CharSet=CharSet.Unicode,SetLastError=true)] private static extern uint GetFinalPathNameByHandle(IntPtr file,StringBuilder path,uint length,uint flags);
     [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] private static extern IntPtr CreateFile(string name,uint access,uint share,IntPtr security,uint creation,uint flags,IntPtr template);
 
-    private static JavaScriptSerializer Json() { return new JavaScriptSerializer{ MaxJsonLength=65536, RecursionLimit=16 }; }
+    private static JavaScriptSerializer Json() { return new JavaScriptSerializer{ MaxJsonLength=1048576, RecursionLimit=16 }; }
+    private static void RequestBounds(Dictionary<string,object> request,int bytes) {
+        if(bytes<1||bytes>1048576||bytes>65536&&!new[]{"snapshot-create","snapshot-prepare"}.Contains(Convert.ToString(request["action"])))throw new ArgumentException("Request exceeds action bounds");
+    }
     private static bool OwnerExited {get{return OwnerHandle==IntPtr.Zero||WaitForSingleObject(OwnerHandle,0)!=258;}}
     private static string ProcessSid(Process process) {
         // Pin only process query/synchronization rights and query the owner's
@@ -75,6 +89,12 @@ public static partial class MuHyperVBroker {
         foreach(FileSystemAccessRule rule in acl.GetAccessRules(true,true,typeof(SecurityIdentifier)))if(rule.AccessControlType==AccessControlType.Allow&&!rule.IdentityReference.Equals(AdminSid)&&!rule.IdentityReference.Equals(SystemSid))throw new UnauthorizedAccessException("Storage ACL rejected");
         var handle=CreateFile(path,0x80000000,3,IntPtr.Zero,3,0x02000000|0x00200000,IntPtr.Zero);
         if(handle==new IntPtr(-1))throw new IOException("Cannot lock protected directory");if(pin){lock(Gate)Held.Add(new HandleOwner(handle));}else CloseHandle(handle);
+    }
+    private static MuRestoreOriginStore OpenOriginStore(bool create=false){if(create)throw new UnauthorizedAccessException("A protected preparation journal is required");return new MuRestoreOriginStore(UserRoot,OwnerSid,true);}
+    private static MuRestoreOriginStore OpenPreparedOriginStore(Dictionary<string,object> plan,Action<Dictionary<string,object>> bind,Action complete){return new MuRestoreOriginStore(UserRoot,OwnerSid,plan,bind,complete);}
+    private static IDisposable PinOriginAllocation(Dictionary<string,object> record){
+        string directory=Convert.ToString(Parameters(record)["directory"]);var vmSid=(SecurityIdentifier)new NTAccount("NT VIRTUAL MACHINE",Convert.ToString(record["platformId"])).Translate(typeof(SecurityIdentifier));RecoveryAcl(directory,vmSid,true);
+        var handle=CreateFile(directory,0x80000081,3,IntPtr.Zero,3,0x02200000,IntPtr.Zero);if(handle==new IntPtr(-1))throw new IOException("Cannot pin restore origin allocation");return new HandleOwner(handle);
     }
     private static void TrustedExecutable(string common){
         string file=System.Reflection.Assembly.GetExecutingAssembly().Location,expected=Path.Combine(common,"bin");
@@ -100,6 +120,17 @@ public static partial class MuHyperVBroker {
         var acl=File.GetAccessControl(file);var owner=(SecurityIdentifier)acl.GetOwner(typeof(SecurityIdentifier));if(!owner.Equals(AdminSid)&&!owner.Equals(SystemSid))throw new UnauthorizedAccessException("Registry owner changed");
         foreach(FileSystemAccessRule rule in acl.GetAccessRules(true,true,typeof(SecurityIdentifier)))if(rule.AccessControlType==AccessControlType.Allow&&!rule.IdentityReference.Equals(AdminSid)&&!rule.IdentityReference.Equals(SystemSid))throw new UnauthorizedAccessException("Registry permissions changed");
     }
+    private static void ValidateStagingPath(string path,bool directory){
+        if(!directory){ValidateLedgerFile(path);return;}
+        var attributes=File.GetAttributes(path);if((attributes&FileAttributes.ReparsePoint)!=0||(attributes&FileAttributes.Directory)==0)throw new UnauthorizedAccessException("Protected staging directory required");
+        var acl=Directory.GetAccessControl(path);var owner=(SecurityIdentifier)acl.GetOwner(typeof(SecurityIdentifier));if(!owner.Equals(AdminSid)&&!owner.Equals(SystemSid))throw new UnauthorizedAccessException("Staging storage owner changed");
+        foreach(FileSystemAccessRule rule in acl.GetAccessRules(true,true,typeof(SecurityIdentifier)))if(rule.AccessControlType==AccessControlType.Allow&&!rule.IdentityReference.Equals(AdminSid)&&!rule.IdentityReference.Equals(SystemSid))throw new UnauthorizedAccessException("Staging storage permissions changed");
+    }
+    private static byte[] StagingCreationSecurity(bool directory){
+        FileSystemSecurity acl=directory?(FileSystemSecurity)new DirectorySecurity():new FileSecurity();acl.SetAccessRuleProtection(true,false);acl.SetOwner(AdminSid);
+        foreach(var sid in new[]{AdminSid,SystemSid})acl.AddAccessRule(new FileSystemAccessRule(sid,FileSystemRights.FullControl,directory?InheritanceFlags.ContainerInherit|InheritanceFlags.ObjectInherit:InheritanceFlags.None,PropagationFlags.None,AccessControlType.Allow));
+        return acl.GetSecurityDescriptorBinaryForm();
+    }
     private static void Save() {lock(Gate)LedgerStore.Save(Records);}
     private static Dictionary<string,object> Owned(string id){lock(Gate){Dictionary<string,object> record;if(!Records.TryGetValue(id,out record)||Convert.ToString(record["ownerSid"])!=OwnerSid)throw new UnauthorizedAccessException("VM is not registered to this user");return record;}}
     private static Dictionary<string,object>[] RecordSnapshot(){lock(Gate)return Records.Values.Select(record=>new Dictionary<string,object>(record)).ToArray();}
@@ -110,7 +141,7 @@ public static partial class MuHyperVBroker {
         int slot=((hash[0]<<8)|hash[1])%16384,third=slot>>6,fourth=(slot&63)*4;string dir=Path.Combine(UserRoot,"vms",id);
         var result=new Dictionary<string,object>{{"name",name},{"directory",dir},{"disk",Path.Combine(dir,"disk.vhdx")},{"seed",Path.Combine(dir,"seed.iso")},{"image",record["image"]},{"cpus",record["cpus"]},{"memoryGiB",record["memoryGiB"]},{"diskGiB",record["diskGiB"]},{"brokerResourceLimit",true},{"host","172.29."+third+"."+(fourth+1)},{"guest","172.29."+third+"."+(fourth+2)},{"mac","00155D"+BitConverter.ToString(hash,2,3).Replace("-","")}};
         if(record.ContainsKey("platformId"))result["expectedPlatformId"]=record["platformId"];
-        result["allowPartialAllocation"]=!record.ContainsKey("everReady")&&Convert.ToString(record["stage"])!="ready";
+        result["allowPartialAllocation"]=(!record.ContainsKey("everReady")||record.ContainsKey("backupRestore"))&&Convert.ToString(record["stage"])!="ready";
         if(Convert.ToString(record["imageSha256"])=="c74a7d3b3476ffb2715bfcaf9c216e9dd1d6c7e01bc6d0380b1744518dfae15c")result["imagePatch"]=new Dictionary<string,object>{{"offset",2495315968L},{"before",Convert.ToBase64String(Encoding.ASCII.GetBytes("# to update this file, run dpkg-reconfigure cloud-init\ndatasource_list: [ Azure ]\n"))},{"after",Convert.ToBase64String(Encoding.ASCII.GetBytes("# to update this file, run dpkg-reconfigure cloud-init\ndatasource_list: [NoCloud]\n"))}};
         return result;
     }
@@ -138,7 +169,8 @@ public static partial class MuHyperVBroker {
             var buffer=new byte[1048576];int count;while((count=input.Read(buffer,0,buffer.Length))>0){cancellation.ThrowIfCancellationRequested();sha.TransformBlock(buffer,0,count,null,0);output.Write(buffer,0,count);}sha.TransformFinalBlock(new byte[0],0,0);output.Flush(true);if(BitConverter.ToString(sha.Hash).Replace("-","").ToLowerInvariant()!=digest)throw new ArgumentException("Input checksum mismatch");
         }
     }
-    private static void CloseChannel(string id){lock(Gate){Process child;ChannelPorts.Remove(id);if(!Channels.TryGetValue(id,out child))return;Channels.Remove(id);try{if(!child.HasExited)child.Kill();}catch{}child.Dispose();}}
+    private static void CloseChannel(string id){lock(Gate){Process child;ChannelLaunches.Remove(id);ChannelPorts.Remove(id);if(!Channels.TryGetValue(id,out child))return;Channels.Remove(id);try{if(!child.HasExited)child.Kill();}catch{}child.Dispose();}}
+    private static void RevokeCompactionChannels(){lock(Gate){CompactionChannels.Clear();CompactionVerifyBoots.Clear();CompactionRunPermits.Clear();}}
     private static bool EverReady(Dictionary<string,object> record){return record.ContainsKey("everReady")&&Convert.ToBoolean(record["everReady"])||Convert.ToString(record["stage"])=="ready";}
     private static Dictionary<string,object> RecoverAllocation(Dictionary<string,object> record){
         var value=Json().Deserialize<Dictionary<string,object>>(Invoke("recover-allocation",Parameters(record),30000,CancellationToken.None));
@@ -171,22 +203,63 @@ public static partial class MuHyperVBroker {
     private static bool HasStorage(string directory){try{File.GetAttributes(directory);return true;}catch(FileNotFoundException){return false;}catch(DirectoryNotFoundException){return false;}}
     private static object Allocation(string id){
         lock(Gate){Dictionary<string,object> record;if(!Records.TryGetValue(id,out record))return new {registered=false};
+            if(SnapshotIsPending(record))return new {registered=true,stage=record["stage"],everReady=EverReady(record),platformId=record.ContainsKey("platformId")?record["platformId"]:null,imageSha256=record["imageSha256"],cpus=record["cpus"],memoryGiB=record["memoryGiB"],diskGiB=record["diskGiB"],snapshotRestorePending=true};
+            if(record.ContainsKey("backupRestore"))return new {registered=true,stage=record["stage"],everReady=EverReady(record),platformId=record.ContainsKey("platformId")?record["platformId"]:null,imageSha256=record["imageSha256"],cpus=record["cpus"],memoryGiB=record["memoryGiB"],diskGiB=record["diskGiB"],backupRestorePending=true};
+            if(record.ContainsKey("diskCompaction"))return new {registered=true,stage=record["stage"],everReady=EverReady(record),platformId=record.ContainsKey("platformId")?record["platformId"]:null,imageSha256=record["imageSha256"],cpus=record["cpus"],memoryGiB=record["memoryGiB"],diskGiB=record["diskGiB"],diskCompactionPending=true};
             return new {registered=true,stage=record["stage"],everReady=EverReady(record),platformId=record.ContainsKey("platformId")?record["platformId"]:null,imageSha256=record["imageSha256"],cpus=record["cpus"],memoryGiB=record["memoryGiB"],diskGiB=record["diskGiB"]};}
+    }
+    private static void ChannelDiagnostic(string line){
+        // Do not persist raw helper output: only fixed, content-free events.
+        if(line!="MU_CHANNEL:capacity"&&line!="MU_CHANNEL:guest-connect-socket"&&line!="MU_CHANNEL:guest-connect-timeout"&&line!="MU_CHANNEL:guest-send-error"&&line!="MU_CHANNEL:guest-recv-error")return;
+        try{lock(ChannelDiagnosticGate){string file=Path.Combine(UserRoot,"channel-diagnostics.log");if(File.Exists(file)&&new FileInfo(file).Length>=65536)return;File.AppendAllText(file,DateTime.UtcNow.ToString("o")+" "+line+Environment.NewLine);}}catch{/* Diagnostics must not affect transport or protection. */}
+    }
+    private static object ChannelDiagnostics(){
+        lock(ChannelDiagnosticGate){
+            string file=Path.Combine(UserRoot,"channel-diagnostics.log");
+            if(!File.Exists(file))return new {events=new object[0],full=false};
+            long length=new FileInfo(file).Length;
+            if(length>65700)throw new IOException("Channel diagnostic file exceeds limit");
+            var valid=new List<object>();
+            foreach(string line in File.ReadAllLines(file)){
+                int space=line.IndexOf(' ');if(space<0)continue;
+                DateTime at;if(!DateTime.TryParseExact(line.Substring(0,space),"o",System.Globalization.CultureInfo.InvariantCulture,System.Globalization.DateTimeStyles.RoundtripKind,out at))continue;
+                string code=line.Substring(space+1);
+                if(!new[]{"MU_CHANNEL:capacity","MU_CHANNEL:guest-connect-socket","MU_CHANNEL:guest-connect-timeout","MU_CHANNEL:guest-send-error","MU_CHANNEL:guest-recv-error"}.Contains(code))continue;
+                valid.Add(new {at=at.ToUniversalTime().ToString("o"),code=code.Substring("MU_CHANNEL:".Length)});
+            }
+            return new {events=valid.Skip(Math.Max(0,valid.Count-32)).ToArray(),full=length>=65536};
+        }
     }
     private static object Channel(string id) {
         lock(VmGate(id)){
-        var record=Owned(id);if(!record.ContainsKey("platformId"))throw new InvalidOperationException("VM is not ready");lock(Gate){Process existing;if(Channels.TryGetValue(id,out existing)&&!existing.HasExited)return new {port=ChannelPorts[id]};}CloseChannel(id);
-        string executable=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,ChannelFile);var info=new ProcessStartInfo(executable,"--listen "+Convert.ToString(record["platformId"])+" "+Owner.Id){UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,WorkingDirectory=AppDomain.CurrentDomain.BaseDirectory};
-        var process=Process.Start(info);process.StandardInput.BaseStream.WriteByte(46);process.StandardInput.BaseStream.Flush();process.ErrorDataReceived+=(s,e)=>{};process.BeginErrorReadLine();var reading=process.StandardOutput.ReadLineAsync();if(!reading.Wait(10000)){process.Kill();throw new IOException("Guest channel did not start");}var value=Json().Deserialize<Dictionary<string,object>>(reading.Result);int port=Number(value,"port",1,65535);lock(Gate){Channels[id]=process;ChannelPorts[id]=port;}StartChannelHeartbeat(id,process);return value;
+        var launch=new object();lock(Gate){if(Quiescing||Stopping||PowerGuard==null||PowerGuard.Fenced)throw new OperationCanceledException("Broker is closing or power authority is unavailable");ChannelLaunches[id]=launch;}
+        Process process=null;bool published=false;
+        try{
+            var record=Owned(id);if(!record.ContainsKey("platformId"))throw new InvalidOperationException("VM is not ready");
+            if(record.ContainsKey("diskCompaction")){var actual=Json().Deserialize<Dictionary<string,object>>(Invoke("status",Parameters(record),15000,CancellationToken.None));if(Convert.ToString(actual["state"])!="Running")throw new InvalidOperationException("Maintenance guest is not running");}
+            lock(Gate){object current;if(Quiescing||Stopping||PowerGuard==null||PowerGuard.Fenced||!ChannelLaunches.TryGetValue(id,out current)||!Object.ReferenceEquals(current,launch))throw new OperationCanceledException("Guest channel startup was retired");Process existing;if(Channels.TryGetValue(id,out existing)){if(!existing.HasExited)return new {port=ChannelPorts[id]};Channels.Remove(id);ChannelPorts.Remove(id);existing.Dispose();}}
+            string executable=Path.Combine(AppDomain.CurrentDomain.BaseDirectory,ChannelFile);var info=new ProcessStartInfo(executable,"--listen "+Convert.ToString(record["platformId"])+" "+Owner.Id){UseShellExecute=false,CreateNoWindow=true,RedirectStandardInput=true,RedirectStandardOutput=true,RedirectStandardError=true,WorkingDirectory=AppDomain.CurrentDomain.BaseDirectory};
+            process=Process.Start(info);process.StandardInput.BaseStream.WriteByte(46);process.StandardInput.BaseStream.Flush();process.ErrorDataReceived+=(s,e)=>ChannelDiagnostic(e.Data);process.BeginErrorReadLine();var reading=process.StandardOutput.ReadLineAsync();if(!reading.Wait(10000))throw new IOException("Guest channel did not start");var value=Json().Deserialize<Dictionary<string,object>>(reading.Result);int port=Number(value,"port",1,65535);
+            lock(Gate){object current;if(Quiescing||Stopping||PowerGuard==null||PowerGuard.Fenced||!ChannelLaunches.TryGetValue(id,out current)||!Object.ReferenceEquals(current,launch)||process.HasExited)throw new OperationCanceledException("Guest channel startup was retired");ChannelLaunches.Remove(id);Channels[id]=process;ChannelPorts[id]=port;published=true;}
+            StartChannelHeartbeat(id,process);return value;
+        }finally{
+            lock(Gate){object current;if(ChannelLaunches.TryGetValue(id,out current)&&Object.ReferenceEquals(current,launch))ChannelLaunches.Remove(id);}
+            if(!published&&process!=null){try{if(!process.HasExited)process.Kill();}catch{}process.Dispose();}
+        }
         }
     }
     private static object Dispatch(NamedPipeServerStream pipe,Dictionary<string,object> request,CancellationToken cancellation) {
         string action=Text(request,"action",32);
         if(action=="hello"){ValidateKeys(request,"action");return new {version=1,ownerPid=Owner.Id,ownerSid=OwnerSid,elevated=true,protectedStorage=true,sourceDigest=SourceDigest};}
+        if(action=="shutdown-status")return ShutdownStatus(request);
+        if(RecoveryOnly&&Quiescing)QuiesceAdmission(action);
         if(RecoveryOnly&&action!="shutdown")return RecoveryAction(action,request,cancellation);
+        QuiesceAdmission(action);
         if(action=="host-status"){ValidateKeys(request,"action");return HostStatus();}
+        if(action=="channel-diagnostics"){ValidateKeys(request,"action");return ChannelDiagnostics();}
         if(action=="power-status"){ValidateKeys(request,"action");return PowerStatus();}
         if(action=="resource-status"){ValidateKeys(request,"action");return ResourceStatus();}
+        if(action=="snapshot-pending"){ValidateKeys(request,"action");return new {ids=RecordSnapshot().Where(SnapshotIsPending).Select(v=>Convert.ToString(v["id"])).ToArray()};}
         if(action=="prepare-host"){ValidateKeys(request,"action");return PrepareHost();}
         if(action=="doctor"&&SetupOnly){ValidateKeys(request,"action");return Json().Serialize(new {available=false,issues=new[]{"请完成 Windows 系统组件准备后重新打开软件"}});}
         if(action=="doctor"||action=="fingerprint"){ValidateKeys(request,"action");return Invoke(action,null,10000,cancellation);}
@@ -201,9 +274,25 @@ public static partial class MuHyperVBroker {
         if(ResourceMutation(action)||action=="channel")CheckPower();if(ResourceIssue!=null&&(ResourceMutation(action)||action=="channel"))throw new MuStorageException("RESOURCE_FENCED","Host resource protection has closed this session; reopen the application");
         if((action=="disk"||action=="begin-base"||action=="create"||action=="start"||action=="grow-disk"||action=="start-disk-growth"||action=="start-disk-review"||action=="finish-disk-growth")&&HostServicingBusy())throw new InvalidOperationException("Windows component servicing is running");
         string id=Id(request);
+        // A persisted maintenance intent must fence all ordinary mutations,
+        // including snapshot/export paths dispatched outside the main VM gate.
+        // Explicit maintenance operations still have their own phase checks.
+        lock(VmGate(id))CompactionPending(id,action);
+        if(new[]{"snapshot-export-begin","snapshot-export-read","snapshot-export-seed","snapshot-export-stream","snapshot-export-close"}.Contains(action))return SnapshotExportAction(action,request,cancellation);
+        SnapshotExportAdmission(id,action);
+        if(action=="snapshot-staging-review"||action=="snapshot-staging-cleanup")return SnapshotStagingAction(action,request,cancellation);
+        if(action=="snapshot-delete"&&request.ContainsKey("allowRunning"))return SnapshotLiveDeletion(request,cancellation);
         lock(VmGate(id)){
+        QuiesceAdmission(action);
+        CompactionPending(id,action);
+        SnapshotLiveAdmission(id,action,request);
         CheckBackupBusy(id,action);
-        if(action=="backup-begin"||action=="backup-read"||action=="backup-stream"||action=="backup-close")return BackupReadAction(action,request,cancellation);
+        RestorePending(id,action);
+        SnapshotPending(id,action);
+        if(new[]{"disk-compact-begin","disk-compact-start","disk-compact-trimmed","disk-compact-run","disk-compact-reconcile","disk-compact-verify-start","disk-compact-review","disk-compact-finish","disk-compact-retry","disk-compact-cancel","disk-compact-status"}.Contains(action))return DiskCompactionAction(action,request,cancellation);
+        if(new[]{"snapshot-list","snapshot-staging","snapshot-deletions","snapshot-delete","snapshot-status","snapshot-outcome","snapshot-create","snapshot-prepare","snapshot-recover","snapshot-commit","snapshot-acknowledge","snapshot-seed"}.Contains(action))return SnapshotAction(action,request,cancellation);
+        if(action=="backup-import")return BackupImport(pipe,request,cancellation);
+        if(action=="backup-begin"||action=="backup-read"||action=="backup-seed"||action=="backup-stream"||action=="backup-close")return BackupReadAction(action,request,cancellation);
         if(action=="seal-base"){ValidateKeys(request,"action","id");return SealBase(id,cancellation);}
         if(action=="discard-base-builder"){ValidateKeys(request,"action","id");lock(VmGate(id)){var builder=Owned(id);if(!builder.ContainsKey("baseBuilder")||!Convert.ToBoolean(builder["baseBuilder"]))throw new UnauthorizedAccessException("Only a marked base builder may be discarded by setup");return Dispatch(pipe,new Dictionary<string,object>{{"action","delete"},{"id",id}},cancellation);}}
         if(action=="absence"){
@@ -219,10 +308,15 @@ public static partial class MuHyperVBroker {
                 if(action=="recover")return recovered;
                 if(action=="prepare"&&Convert.ToBoolean(recovered["ready"]))return recovered;
                 if(action=="prepare"&&EverReady(record))throw new InvalidOperationException("An existing guest cannot be rebuilt");
+                MuRestoreOriginSnapshot origin=action=="delete"?OriginBeforeRemoval(record):null;
                 lock(Gate){record["stage"]=action=="delete"?"deleting":"preparing";Save();}
-                var removed=Json().Deserialize<Dictionary<string,object>>(Invoke("delete-allocation",Parameters(record),30000,CancellationToken.None));
+                // Removing the VM, checking every switch attachment and confirming
+                // absence can exceed 30 seconds on hosts with many allocations.
+                // Keep the delete journal until the entire bounded operation ends.
+                var removed=Json().Deserialize<Dictionary<string,object>>(Invoke("delete-allocation",Parameters(record),120000,CancellationToken.None));
                 if(!Convert.ToBoolean(removed["vmAbsent"])||!Convert.ToBoolean(removed["switchAbsent"]))throw new IOException("Allocation removal was not confirmed");RemoveAllocationFiles(record);
                 if(action=="delete"){
+                    RetireRemovedOrigin(record,origin);
                     lock(Gate){Records.Remove(id);try{Save();}catch{Records.Add(id,record);throw;}}return new {deleted=true,vmAbsent=true,switchAbsent=true,storageAbsent=true};
                 }
                 lock(Gate){record.Remove("platformId");record["stage"]="allocated";Save();}PrivateDirectory(Convert.ToString(Parameters(record)["directory"]),false);
@@ -280,7 +374,7 @@ public static partial class MuHyperVBroker {
                 if(action=="start"&&owned.ContainsKey("baseSealedDigest"))throw new InvalidOperationException("A sealed builder cannot be started again");
                 if(action=="start"&&GrowthJournal(owned)!=null)throw new MuStorageException("DISK_GROWTH_PENDING","Resume pending disk growth before starting the environment");
                 if(action=="start")lock(Gate)StartedHere.Add(id);
-                if(action=="stop")CloseChannel(id);try{
+                if(action=="stop"){lock(Gate)CompactionChannels.Remove(id);CloseChannel(id);}try{
                     if(action=="start"){
                         var state=Json().Deserialize<Dictionary<string,object>>(Invoke("status",Parameters(owned),15000,cancellation));if(Convert.ToString(state["state"])=="Running")return Invoke("inspect",Parameters(owned),15000,cancellation);
                         string started=null;StartWithResources(owned,cancellation,()=>{started=Invoke("start",Parameters(owned),30000,cancellation);});return started;
@@ -292,26 +386,78 @@ public static partial class MuHyperVBroker {
         throw new ArgumentException("Operation is not permitted");
         }
     }
+    private static byte[] ReadRequest(Stream pipe){
+        const int maximum=1048576;var chunk=new byte[4096];
+        using(var bytes=new MemoryStream()){
+            for(;;){
+                int count=pipe.Read(chunk,0,Math.Min(chunk.Length,maximum+1-(int)bytes.Length));if(count<1)throw new ArgumentException("Request ended before its delimiter");
+                int newline=Array.IndexOf(chunk,(byte)10,0,count),length=newline<0?count:newline;
+                if(bytes.Length+length>maximum)throw new ArgumentException("Request exceeds bounds");
+                if(newline>=0&&newline!=count-1)throw new ArgumentException("Trailing request bytes rejected");
+                bytes.Write(chunk,0,length);if(newline>=0)return bytes.ToArray();
+            }
+        }
+    }
     private static void Serve(NamedPipeServerStream pipe) {
-        var cancel=new CancellationTokenSource();var closingRegistration=Closing.Token.Register(()=>cancel.Cancel());var resourceRegistration=default(CancellationTokenRegistration);var powerRegistration=default(CancellationTokenRegistration);bool counted=false,resourceCounted=false;try {
+        var cancel=new CancellationTokenSource();var closingRegistration=Closing.Token.Register(()=>cancel.Cancel());var resourceRegistration=default(CancellationTokenRegistration);var powerRegistration=default(CancellationTokenRegistration);var quiesceRegistration=default(CancellationTokenRegistration);bool counted=false,resourceCounted=false,writeCounted=false;try {
             using(var timeout=new Timer(_=>{try{pipe.Dispose();}catch{}},null,10000,Timeout.Infinite)){
-                var bytes=new List<byte>();int value;while((value=pipe.ReadByte())!=10){if(value<0||bytes.Count>=65536)throw new ArgumentException("Request exceeds bounds");bytes.Add((byte)value);}timeout.Change(Timeout.Infinite,Timeout.Infinite);
+                var bytes=ReadRequest(pipe);timeout.Change(Timeout.Infinite,Timeout.Infinite);
                 uint pid;if(!GetNamedPipeClientProcessId(pipe.SafePipeHandle.DangerousGetHandle(),out pid)||pid!=Owner.Id||OwnerExited)throw new UnauthorizedAccessException("Application process rejected");
                 string sid=null;pipe.RunAsClient(()=>sid=WindowsIdentity.GetCurrent(true).User.Value);if(sid!=OwnerSid)throw new UnauthorizedAccessException("Application user rejected");
                 var watching=new Thread(()=>{try{pipe.ReadByte();}catch{}cancel.Cancel();});watching.IsBackground=true;watching.Start();
                 lock(Gate){if(Stopping)throw new OperationCanceledException("Broker is closing");ActiveRequests++;RequestsIdle.Reset();counted=true;}
-                var request=Json().Deserialize<Dictionary<string,object>>(new UTF8Encoding(false,true).GetString(bytes.ToArray()));if(ResourceMutation(Convert.ToString(request["action"]))){resourceRegistration=ResourceCancellation.Token.Register(()=>cancel.Cancel());powerRegistration=PowerCancellation.Token.Register(()=>cancel.Cancel());lock(Gate){ResourceMutations++;resourceCounted=true;}}
+                var request=Json().Deserialize<Dictionary<string,object>>(new UTF8Encoding(false,true).GetString(bytes));
+                RequestBounds(request,bytes.Length);
+                if(QuiesceWriteAction(Convert.ToString(request["action"]))){lock(Gate){QuiesceWriters++;writeCounted=true;}quiesceRegistration=QuiesceCancellation.Token.Register(()=>cancel.Cancel());}
+                if(ResourceMutation(Convert.ToString(request["action"]))){resourceRegistration=ResourceCancellation.Token.Register(()=>cancel.Cancel());powerRegistration=PowerCancellation.Token.Register(()=>cancel.Cancel());lock(Gate){ResourceMutations++;resourceCounted=true;}}
                 object result=Dispatch(pipe,request,cancel.Token);byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=true,result=result})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();if(Convert.ToString(request["action"])=="shutdown"){try{pipe.WaitForPipeDrain();}catch{}ThreadPool.QueueUserWorkItem(_=>Shutdown());}
             }
         }catch(Exception error){try{byte[] response=Encoding.UTF8.GetBytes(Json().Serialize(new {ok=false,code=error is MuStorageException?((MuStorageException)error).Code:error is UnauthorizedAccessException?"DENIED":error is ArgumentException?"INVALID_REQUEST":error is OperationCanceledException?"CANCELLED":"BROKER_FAILED",error=error is ArgumentException||error is UnauthorizedAccessException||error is MuStorageException?error.Message:"Privileged VM operation failed"})+"\n");pipe.Write(response,0,response.Length);pipe.Flush();}catch{}try{File.AppendAllText(Path.Combine(UserRoot,"broker-errors.log"),DateTime.UtcNow.ToString("o")+" "+error.ToString()+Environment.NewLine);}catch{}}
-        finally{powerRegistration.Dispose();resourceRegistration.Dispose();closingRegistration.Dispose();cancel.Cancel();pipe.Dispose();lock(Gate){Pipes.Remove(pipe);if(resourceCounted)ResourceMutations--;if(counted){ActiveRequests--;if(ActiveRequests==0)RequestsIdle.Set();}}}
+        finally{quiesceRegistration.Dispose();powerRegistration.Dispose();resourceRegistration.Dispose();closingRegistration.Dispose();cancel.Cancel();pipe.Dispose();lock(Gate){Pipes.Remove(pipe);if(writeCounted)QuiesceWriters--;if(resourceCounted)ResourceMutations--;if(counted){ActiveRequests--;if(ActiveRequests==0)RequestsIdle.Set();}}}
     }
     private static void Shutdown(){bool producer=false;NamedPipeServerStream[] closingPipes=null;lock(Gate){if(!Stopping){Stopping=true;producer=true;closingPipes=Pipes.ToArray();}}if(!producer){ShutdownComplete.WaitOne();return;}
         // A synchronous pipe read/dispose must not hold Gate or delay force-off.
         // Cancel privileged work directly, independently of client pipe EOF.
-        Closing.Cancel();foreach(var pipe in closingPipes)ThreadPool.QueueUserWorkItem(_=>{try{pipe.Dispose();}catch{}});
-        foreach(var record in ShutdownSnapshot())CloseChannel(Convert.ToString(record["id"]));
-        try{RequestsIdle.WaitOne(30000);if(!SetupOnly&&!RecoveryOnly)foreach(var record in ShutdownSnapshot()){string id=Convert.ToString(record["id"]);CloseChannel(id);try{Invoke(record.ContainsKey("platformId")?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None);}catch{}}}finally{ShutdownComplete.Set();}
+        try{Closing.Cancel();}catch{}foreach(var pipe in closingPipes)ThreadPool.QueueUserWorkItem(_=>{try{pipe.Dispose();}catch{}});
+        var elapsed=Stopwatch.StartNew();try{BeginQuiescing();ShutdownStopsConfirmed=DrainShutdown(()=>elapsed.ElapsedMilliseconds,ms=>Thread.Sleep(ms),300000);}
+        finally{try{if(UserRoot!=null)File.WriteAllText(Path.Combine(UserRoot,"shutdown-state.json"),Json().Serialize(new {version=1,session=ShutdownSession,confirmed=ShutdownStopsConfirmed,registryLoaded=RegistryLoaded,activeWrites=QuiesceWriters,time=DateTime.UtcNow.ToString("o")}));}catch{}ShutdownComplete.Set();}
+    }
+    private static bool QuiesceWriteAction(string action){return !new[]{"hello","shutdown-status","shutdown","host-status","power-status","resource-status","snapshot-pending","allocation","status","inspect","stop","close-channel","backup-close","snapshot-export-close","snapshot-list","snapshot-staging","snapshot-deletions","snapshot-status","snapshot-outcome","snapshot-seed","recovery-info"}.Contains(action);}
+    private static void QuiesceAdmission(string action){if(Quiescing&&QuiesceWriteAction(action))throw new MuStorageException("BROKER_QUIESCING","The protected session is closing; new writes and guest channels are closed");}
+    private static void BeginQuiescing(){
+        bool first=false;lock(Gate){if(!Quiescing){Quiescing=true;first=true;}}
+        if(first)try{QuiesceCancellation.Cancel();}catch{}
+        RevokeCompactionChannels();
+        foreach(var record in ShutdownSnapshot())try{CloseChannel(Convert.ToString(record["id"]));}catch{}
+    }
+    private static string EmergencyEpoch(){return !Quiescing?"runtime":(Stopping?"shutdown:":"quiesce:")+(QuiesceWriters==0?"drained":"writing");}
+    private static bool ShutdownScopeConfirmed(){
+        lock(Gate){if(!RegistryLoaded)return false;if(RecoveryOnly)return QuiesceWriters==0&&Channels.Count==0;if(SetupOnly)return Records.Count==0&&QuiesceWriters==0&&Channels.Count==0;}
+        return SweepEmergencyStops();
+    }
+    private static object ShutdownStatus(Dictionary<string,object> request){
+        ValidateKeys(request,"action","session");if(request.ContainsKey("session")&&Text(request,"session",32)!=ShutdownSession)throw new UnauthorizedAccessException("Protected shutdown session changed");
+        BeginQuiescing();bool confirmed=ShutdownScopeConfirmed();lock(Gate){if(QuiesceWriters!=0||Channels.Count!=0)confirmed=false;return new {version=1,session=ShutdownSession,mode=RecoveryOnly?"recovery":SetupOnly?"setup":"normal",fenced=true,activeWrites=QuiesceWriters,allocationCount=Records.Count,stopsConfirmed=confirmed};}
+    }
+    private static bool DrainShutdown(Func<long> clock,Action<int> wait,long timeout){
+        if(!RegistryLoaded)return false;long started=clock();if(started<0||timeout<1)throw new ArgumentException("Bounded shutdown clock required");
+        if(SetupOnly&&Records.Count!=0)return false; // This mode cannot review VM state; do not claim or attempt a stop.
+        for(;;){long elapsed=clock()-started;if(elapsed<0||elapsed>=timeout)return false;try{BeginQuiescing();if(ShutdownScopeConfirmed()){long completed=clock()-started;return completed>=0&&completed<timeout;}}catch{/* Preserve unknown state; another allocation can still make progress. */}wait(100);}
+    }
+    private static bool TryShutdownHardwareStop(string id,string authority){
+        Dictionary<string,object> record;lock(Gate){var current=Owned(id);if(EmergencyAuthority(current)!=authority)return false;record=Json().Deserialize<Dictionary<string,object>>(Json().Serialize(current));}
+        // Owner loss already cancelled all admission. This is the original
+        // fixed-identity stop-only fallback, without disk/ledger mutation or a
+        // wait behind an off-line copy's VM gate. Never adopt a returned record.
+        bool known=record.ContainsKey("platformId");var actual=Json().Deserialize<Dictionary<string,object>>(Invoke(known?"stop":"recover-allocation",Parameters(record),30000,CancellationToken.None));
+        if(known)ValidateKeys(actual,"name","platformId","state");else ValidateKeys(actual,"name","state","present","platformId","ready");
+        if(Convert.ToString(actual["state"])!="Off"||Convert.ToString(actual["name"])!=Convert.ToString(Parameters(record)["name"]))throw new IOException("Protected shutdown state was not confirmed");
+        if(known&&Convert.ToString(actual["platformId"])!=Convert.ToString(record["platformId"]))throw new UnauthorizedAccessException("Protected shutdown VM changed");
+        if(!known){
+            if(!(actual["present"] is bool)||!(actual["ready"] is bool))throw new IOException("Partial shutdown allocation was not confirmed");
+            if((bool)actual["present"]){string platform=Text(actual,"platformId",36);Guid parsed;if(!Guid.TryParseExact(platform,"D",out parsed)||parsed==Guid.Empty||parsed.ToString("D")!=platform)throw new IOException("Partial shutdown VM identity is invalid");}
+            else if(actual["platformId"]!=null||(bool)actual["ready"])throw new IOException("Absent shutdown allocation receipt changed");
+        }return true;
     }
     public static int Main(string[] args) {
         if(args.Length>0&&args[0]=="--host-once")return HostJobMain(args);
@@ -323,7 +469,7 @@ public static partial class MuHyperVBroker {
             // The previous owner can exit before its agent finishes VM cleanup.
             // Wait for that sealed store to be released, never bypass its lock.
             var waiting=Stopwatch.StartNew();for(;;){if(OwnerExited)throw new OperationCanceledException("Application exited while waiting for storage");try{ProcessSessionLock=new FileStream(Path.Combine(UserRoot,"session.lock"),FileMode.OpenOrCreate,FileAccess.ReadWrite,FileShare.None);break;}catch(IOException){if(waiting.ElapsedMilliseconds>90000)throw;Thread.Sleep(100);}}
-            LedgerStore=new MuProtectedLedger(UserRoot,OwnerSid,ValidateLedgerFile);foreach(var pair in (RecoveryOnly?LedgerStore.InspectRecovery():LedgerStore.Load()))Records.Add(pair.Key,pair.Value);if(RecoveryOnly)RecoveryLedgerFingerprint=LedgerStore.RecoveryFingerprint();
+            LedgerStore=new MuProtectedLedger(UserRoot,OwnerSid,ValidateLedgerFile);foreach(var pair in (RecoveryOnly?LedgerStore.InspectRecovery():LedgerStore.Load()))Records.Add(pair.Key,pair.Value);RegistryLoaded=true;if(RecoveryOnly)RecoveryLedgerFingerprint=LedgerStore.RecoveryFingerprint();
             byte[] scriptBytes=Convert.FromBase64String(HyperVScript);string scriptHash;using(var sha=SHA256.Create())scriptHash=BitConverter.ToString(sha.ComputeHash(scriptBytes)).Replace("-","").ToLowerInvariant();ScriptFile=Path.Combine(UserRoot,"hyperv-"+scriptHash+".ps1");if(File.Exists(ScriptFile)){if((File.GetAttributes(ScriptFile)&FileAttributes.ReparsePoint)!=0||HashFile(ScriptFile)!=scriptHash)throw new UnauthorizedAccessException("Protected script changed");}else{using(var scriptStream=new FileStream(ScriptFile,FileMode.CreateNew,FileAccess.Write,FileShare.None)){scriptStream.Write(scriptBytes,0,scriptBytes.Length);scriptStream.Flush(true);}}
             if(detectHost){var status=(Dictionary<string,object>)HostStatus();SetupOnly=!Convert.ToBoolean(status["ready"])||HostJobLive(HostJob());}
             StartPowerProtection();if(!SetupOnly&&!RecoveryOnly)foreach(var entry in RecordSnapshot())try{lock(VmGate(Convert.ToString(entry["id"])))RecoverAllocation(Owned(Convert.ToString(entry["id"])));}catch{throw new IOException("Previous VM shutdown was not confirmed");}
@@ -331,7 +477,7 @@ public static partial class MuHyperVBroker {
             if(!RecoveryOnly){StartResourceGuardian();StartBackupCleanup();}
             var security=new PipeSecurity();security.SetAccessRuleProtection(true,false);security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(OwnerSid),PipeAccessRights.ReadWrite,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(SystemSid,PipeAccessRights.FullControl,AccessControlType.Allow));security.AddAccessRule(new PipeAccessRule(AdminSid,PipeAccessRights.FullControl,AccessControlType.Allow));
             while(!Stopping){NamedPipeServerStream pipe=null;try{pipe=new NamedPipeServerStream("MuCodeSandbox-Broker-"+args[3],PipeDirection.InOut,16,PipeTransmissionMode.Byte,PipeOptions.Asynchronous,65536,65536,security);lock(Gate)Pipes.Add(pipe);pipe.WaitForConnection();ThreadPool.QueueUserWorkItem(_=>Serve(pipe));}catch{if(pipe!=null){pipe.Dispose();lock(Gate)Pipes.Remove(pipe);}if(!Stopping)Thread.Sleep(100);}}
-            return 0;
+            Shutdown();return ShutdownStopsConfirmed?0:1;
         }catch(Exception error){Console.Error.WriteLine("Windows broker could not start: "+error.ToString());return 1;}
         finally{Shutdown();for(int i=Held.Count-1;i>=0;i--)Held[i].Dispose();if(OwnerIdentity!=null)OwnerIdentity.Dispose();GC.KeepAlive(ProcessSessionLock);}
     }

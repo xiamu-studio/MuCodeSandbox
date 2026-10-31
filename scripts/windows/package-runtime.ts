@@ -4,9 +4,11 @@ import {randomUUID} from 'node:crypto';
 import {fileHash,powershellPath,powershellArgs} from '../../server/platform/windows/runtime.ts';
 import {run} from '../../server/process.ts';
 import {WINDOWS_SOURCE_VERSION,windowsRelease} from '../../shared/windows-release.ts';
+import {WINDOWS_RUNTIME_SCRIPTS,WINDOWS_RUNTIME_SOURCES} from './runtime-files.ts';
 
-export const WINDOWS_NODE={version:'24.15.0',archive:'node-v24.15.0-win-x64.zip',sha256:'cc5149eabd53779ce1e7bdc5401643622d0c7e6800ade18928a767e940bb0e62',url:'https://nodejs.org/dist/v24.15.0/node-v24.15.0-win-x64.zip'};
+export const WINDOWS_NODE={version:'24.22.1',archive:'node-v24.22.1-win-x64.zip',sha256:'d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5',url:'https://nodejs.org/dist/v24.22.1/node-v24.22.1-win-x64.zip'};
 const root=path.resolve(import.meta.dirname,'../..');
+export async function copyWindowsBrowserHome(app:string){await copyFile(path.join(root,'desktop/browser-home.html'),path.join(app,'desktop/browser-home.html'));}
 export async function prepareWindowsPackage(options:{version?:string}={}){
  if(process.platform!=='win32'||process.arch!=='x64')throw Error('Windows AMD64 packaging is required');
  const archive=path.join(root,'.mu-data/tools',WINDOWS_NODE.archive);await access(archive);if(await fileHash(archive)!==WINDOWS_NODE.sha256)throw Error('Official Node distribution checksum mismatch');
@@ -24,10 +26,11 @@ export async function prepareWindowsPackage(options:{version?:string}={}){
  for(const name of modules){if(copied.some(parent=>name.startsWith(parent+'/')))continue;const source=path.join(root,name);try{await access(source);}catch{continue;}await cp(source,path.join(app,name),{recursive:true,filter:skip});copied.push(name);}
  await cp(path.join(root,'desktop/windows'),path.join(app,'desktop/windows'),{recursive:true});await cp(path.join(root,'dist'),path.join(app,'dist'),{recursive:true});await cp(path.join(root,'dist-server'),path.join(app,'dist-server'),{recursive:true});
  await copyFile(path.join(root,'desktop/clipboard-image.cjs'),path.join(app,'desktop/clipboard-image.cjs'));
+ await copyWindowsBrowserHome(app);
  await writeFile(path.join(app,'dist-server/windows-release.json'),JSON.stringify({format:1,version:release.version,fileVersion:release.fileVersion},null,2));
  await mkdir(path.join(app,'dist-server/scripts/windows'),{recursive:true});await mkdir(path.join(app,'dist-server/native/windows'),{recursive:true});
- for(const file of ['hyperv.ps1','host-components.ps1','seed-iso.ps1','build-channel.ps1','build-broker.ps1','install-broker.ps1','clean-runtime-metadata.ps1'])await copyFile(path.join(root,'scripts/windows',file),path.join(app,'dist-server/scripts/windows',file));
- for(const file of ['HyperVBroker.cs','SealedBases.cs','HostComponents.cs','ProtectedLedger.cs','ImageCache.cs','ResourceMetrics.cs','Resources.cs','DiskGrowth.cs','BackupRead.cs','BackupCursor.cs','Recovery.cs','RecoveryPermissions.cs','PowerWatch.cs','PowerProtection.cs','HyperVChannel.cs','RuntimeMetadataCleanup.cs'])await copyFile(path.join(root,'native/windows',file),path.join(app,'dist-server/native/windows',file));
+ for(const file of WINDOWS_RUNTIME_SCRIPTS)await copyFile(path.join(root,'scripts/windows',file),path.join(app,'dist-server/scripts/windows',file));
+ for(const file of WINDOWS_RUNTIME_SOURCES)await copyFile(path.join(root,'native/windows',file),path.join(app,'dist-server/native/windows',file));
  for(const file of ['THIRD_PARTY_NOTICES.md','build-info.json'])await copyFile(path.join(root,file),path.join(app,file));
  await mkdir(path.join(app,'assets'));await copyFile(path.join(root,'assets/icon.png'),path.join(app,'assets/icon.png'));
  const nodeInfo={version:WINDOWS_NODE.version,sha256:await fileHash(path.join(node,'node.exe')),archiveSha256:WINDOWS_NODE.sha256,source:WINDOWS_NODE.url};

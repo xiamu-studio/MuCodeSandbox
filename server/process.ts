@@ -31,7 +31,7 @@ export const run: Runner = (file, args, options = {}) => new Promise((resolve, r
     else resolve(output);
   };
   const stop = (error: Error) => {
-    if (reason) return;
+    if (settled || reason) return;
     reason = error;
     try { process.kill(-child.pid!, 'SIGTERM'); } catch { child.kill('SIGTERM'); }
     forceTimer = setTimeout(() => {
@@ -45,18 +45,24 @@ export const run: Runner = (file, args, options = {}) => new Promise((resolve, r
   const abort = () => stop(new AppError('操作已取消', 409, 'CANCELLED'));
   options.signal?.addEventListener('abort', abort, { once: true });
   const timer = setTimeout(() => stop(new AppError('操作超时，请检查日志和网络连接', 504, 'TIMEOUT')), options.timeoutMs ?? 30_000);
-  const append = (chunk: Buffer) => {
-    const text = chunk.toString();
+  // Each pipe keeps its own decoder, including incomplete characters at chunk
+  // boundaries. Decoding chunks independently corrupts Chinese paths/JSON.
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  const append = (text: string) => {
     output += text;outputBytes+=Buffer.byteLength(text);
     if (outputBytes > (options.maxBytes ?? 4_000_000)) {output = output.slice(-1_000_000);outputBytes=Buffer.byteLength(output);}
-    options.onOutput?.(text);
+    if (!reason && options.onOutput) {
+      try { options.onOutput(text); }
+      catch { stop(new AppError('处理任务输出失败，请查看任务状态后重试', 500, 'PROCESS_OUTPUT_HANDLER_FAILED')); }
+    }
   };
   child.stdout.on('data', append);
   child.stderr.on('data', append);
   // SSH or the guest guard may exit before a large stdin payload is consumed.
   // Handle the pipe error as a failed operation, not an uncaught service crash.
   child.stdin.on('error', () => stop(new AppError('传入数据时连接已关闭，请检查运行状态后重试', 502, 'PROCESS_INPUT_CLOSED')));
-  child.on('error', error => { reason = error; });
+  child.on('error', error => { if (!settled) reason ??= error; });
   child.on('close', code => {
     finish(reason ?? undefined, code);
   });

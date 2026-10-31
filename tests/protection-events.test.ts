@@ -43,6 +43,10 @@ async function managerFixture(){
  runtime.info=async()=>({available:true,path:'fixture',version:'fixture',error:null});runtime.list=async()=>instance?[{name:instance,status:running?'Running':'Stopped'}]:[];
  runtime.start=async e=>{running=true;instance=e.instanceName;};runtime.stop=async()=>{beforeStop();running=false;stopCalls++;};runtime.networkProtection=async()=>({active:true,integrity:'verified',leaseActive:true} as any);runtime.renewLease=async()=>{};runtime.revokeLease=async()=>{};
  const manager=new Manager(root,browser,runtime);clearInterval(manager.protectionTimer);await manager.networkObserver.close();
+ // This fixture adapts Lima lifecycle and guest I/O; no snapshot transaction
+ // exists here. Keep the Mac/APFS snapshot backend outside this Windows-hosted
+ // protection test instead of weakening production directory durability.
+ manager.snapshots.recover=async()=>{};
  const e=await manager.create({name:'Fault fixture',memoryGiB:1,network:{mode:'socks5',host:'127.0.0.1',port:24898,password:'MU_FAKE_ROUTE_SECRET',strict:true,transparent:true,egressLock:{expectedIp:'8.8.8.8'}}});
  manager.measureExit=async()=>({ip:'8.8.8.8',country:'fixture',city:'fixture',latencyMs:1,source:'guest',verification:{requiredReceivers:2,receipts,timedOutReceivers:[]}});
  const start=async()=>{const job=await manager.lifecycle(e.id,'start');await manager.tasks.get(job.id)?.promise;return manager.store.jobs().find(j=>j.id===job.id)!;};
@@ -110,4 +114,32 @@ test('Human incident summaries distinguish sleep, missing receipts and an unconf
  assert.ok(!protectionExplanation(missing).reason.includes('IP 与批准值不同'));
  const changed={...missing,kind:'exit-changed' as const,expectedIp:'203.0.113.8',observedIps:['203.0.113.9']};
  assert.match(protectionExplanation(changed).reason,/203.0.113.8 → 203.0.113.9/);
+});
+
+test('Ambiguous host monitor incidents do not claim the computer slept',()=>{
+ const event={kind:'host',issue:'宿主网络发生变化、监测中断或电脑从休眠恢复',stopResult:'confirmed',checks:[],observedIps:[]} as unknown as ProtectionEvent;
+ const explanation=protectionExplanation(event);
+ assert.doesNotMatch(explanation.reason,/电脑休眠/);
+ assert.match(explanation.reason,/网络或电源状态/);
+ assert.match(explanation.next,/本机网络/);
+ assert.match(explanation.next,/重新打开/);
+ assert.ok(recoverySteps('host',event).some(step=>step.includes('重新打开')));
+});
+test('Specific Windows monitor failures keep their reason and require reopening',()=>{
+ for(const issue of ['宿主网络监测状态：系统时间向后变化，监测时序无法确认','宿主网络监测状态：监测间隔过长，可能发生休眠或系统繁忙','宿主网络监测状态：本机网络状态检查超时','宿主网络监测状态：本机网络状态快照发生变化','宿主网络监测状态：本机网卡状态发生变化','宿主网络监测状态：本机网络路由发生变化','宿主网络监测状态：本机 DNS 配置发生变化','宿主网络监测状态：本机多个网络配置项发生变化','宿主网络监测状态：本机网络状态检查失败']){
+  assert.equal(protectionKind(issue),'host');const event={kind:'host',issue,stopResult:'confirmed',checks:[],observedIps:[]} as unknown as ProtectionEvent;
+  assert.ok(protectionExplanation(event).reason.includes(issue));assert.match(protectionExplanation(event).next,/重新打开/);assert.ok(recoverySteps('host',event).some(step=>step.includes('重新打开')));
+ }
+});
+
+test('A TLS syscall failure does not claim that a certificate is the cause',()=>{
+ const event={kind:'tls',issue:'curl: (35) OpenSSL SSL_connect: SSL_ERROR_SYSCALL in connection to ipv4.icanhazip.com:443',stopResult:'confirmed',checks:[],observedIps:[]} as unknown as ProtectionEvent;
+ const explanation=protectionExplanation(event);
+ assert.match(explanation.reason,/系统错误.*原因尚未确定/);
+ assert.match(explanation.next,/代理和上游线路/);
+ assert.doesNotMatch(explanation.reason,/证书/);
+ const steps=recoverySteps('tls',event).join('；');assert.match(steps,/不能据此断定是证书问题/);assert.match(steps,/不要关闭 HTTPS 校验或出口锁定/);
+ assert.match(protectionExplanation({...event,issue:'curl: (35) failure\nSSL_ERROR_SYSCALL'}).reason,/原因尚未确定/);
+ assert.match(protectionExplanation({...event,issue:'curl: (60) certificate verify failed'}).next,/证书/);
+ assert.ok(recoverySteps('tls',{...event,issue:'curl: (60) certificate verify failed'}).some(step=>step.includes('证书')));
 });

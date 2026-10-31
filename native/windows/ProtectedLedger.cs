@@ -32,13 +32,19 @@ public sealed class MuProtectedLedger {
     private static bool IsId(string value){Guid id;return Guid.TryParseExact(value,"D",out id)&&id!=Guid.Empty&&id.ToString("D")==value;}
     private void ValidateRecord(string id,Dictionary<string,object> record){
         if(!IsId(id)||StringValue(record,"id")!=id||StringValue(record,"ownerSid")!=sid)throw new UnauthorizedAccessException("Registry ownership changed");
-        var fields=new[]{"id","ownerSid","image","imageSha256","cpus","memoryGiB","diskGiB","stage","platformId","everReady","baseBuilder","sealedSource","baseSealedDigest","diskGrowth"};
+        var fields=new[]{"id","ownerSid","image","imageSha256","cpus","memoryGiB","diskGiB","stage","platformId","everReady","baseBuilder","sealedSource","baseSealedDigest","diskGrowth","diskCompaction","backupRestore","restoreOrigin"};
         if(record.Keys.Any(key=>!fields.Contains(key)))throw new UnauthorizedAccessException("Unknown registry field");
         string digest=StringValue(record,"imageSha256"),image=StringValue(record,"image");
         if(!IsDigest(digest)||!new[]{".vhd",".vhdx"}.Any(extension=>string.Equals(image,Path.Combine(root,"images",digest+extension),StringComparison.OrdinalIgnoreCase)))throw new UnauthorizedAccessException("Registry image boundary changed");
         IntegerValue(record,"cpus",1,16);IntegerValue(record,"memoryGiB",2,32);IntegerValue(record,"diskGiB",16,256);
         string stage=StringValue(record,"stage");if(!new[]{"allocated","disk-ready","creating","ready","create-failed","vm-missing","preparing","deleting"}.Contains(stage))throw new UnauthorizedAccessException("Unknown registry stage");
-        foreach(string key in new[]{"everReady","baseBuilder"})if(record.ContainsKey(key)&&!(record[key] is bool))throw new UnauthorizedAccessException("Invalid registry flag");
+        if(record.ContainsKey("backupRestore")){
+            var restore=record["backupRestore"] as Dictionary<string,object>;if(restore==null||restore.Count!=(restore.ContainsKey("originInitialization")?5:4)||restore.Keys.Any(key=>!new[]{"diskSha256","diskBytes","seedSha256","seedBytes","originInitialization"}.Contains(key))||!IsDigest(StringValue(restore,"diskSha256"))||!IsDigest(StringValue(restore,"seedSha256"))||record.ContainsKey("baseBuilder")||record.ContainsKey("baseSealedDigest")||record.ContainsKey("sealedSource")||record.ContainsKey("diskGrowth")||!record.ContainsKey("everReady")||!(record["everReady"] is bool)||!(bool)record["everReady"])throw new UnauthorizedAccessException("Restore journal authority changed");
+            long virtualBytes=Convert.ToInt64(record["diskGiB"])*1024L*1024*1024;IntegerValue(restore,"diskBytes",1,virtualBytes+Math.Max(64L*1024*1024,virtualBytes/100));IntegerValue(restore,"seedBytes",32774,8L*1024*1024);
+            if(restore.ContainsKey("originInitialization")){if(!record.ContainsKey("restoreOrigin")||!(record["restoreOrigin"] is bool)||!(bool)record["restoreOrigin"])throw new UnauthorizedAccessException("Tracked restore required for origin preparation");MuOriginPreparation.Validate(restore["originInitialization"] as Dictionary<string,object>);}
+        }
+        foreach(string key in new[]{"everReady","baseBuilder","restoreOrigin"})if(record.ContainsKey(key)&&!(record[key] is bool))throw new UnauthorizedAccessException("Invalid registry flag");
+        if(record.ContainsKey("restoreOrigin")&&(bool)record["restoreOrigin"]&&(!record.ContainsKey("everReady")||!(bool)record["everReady"]||record.ContainsKey("baseBuilder")||record.ContainsKey("baseSealedDigest")||record.ContainsKey("sealedSource")))throw new UnauthorizedAccessException("Restore origin registration authority changed");
         if(record.ContainsKey("platformId")&&!IsId(StringValue(record,"platformId")))throw new UnauthorizedAccessException("Invalid registry VM identity");
         if(stage=="ready"&&!record.ContainsKey("platformId"))throw new UnauthorizedAccessException("Ready registry entry has no VM identity");
         if(record.ContainsKey("sealedSource")&&(StringValue(record,"sealedSource")!="mu-base:"+digest||!image.EndsWith(".vhdx",StringComparison.OrdinalIgnoreCase)))throw new UnauthorizedAccessException("Registry sealed source changed");
@@ -50,6 +56,15 @@ public sealed class MuProtectedLedger {
             if(growth==null||growth.Count!=4||growth.Keys.Any(key=>!new[]{"fromGiB","targetGiB","diskIdentifier","fileIdentity"}.Contains(key))||builder||!record.ContainsKey("platformId"))throw new UnauthorizedAccessException("Invalid disk growth authority");
             long from=IntegerValue(growth,"fromGiB",16,255),target=IntegerValue(growth,"targetGiB",from+1,256);if(target!=Convert.ToInt64(record["diskGiB"])||!IsId(StringValue(growth,"diskIdentifier")))throw new UnauthorizedAccessException("Disk growth capacity or disk changed");
             string identity=StringValue(growth,"fileIdentity");if(identity.Length!=24||identity.Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))throw new UnauthorizedAccessException("Disk file identity required");
+        }
+        if(record.ContainsKey("diskCompaction")){
+            var compact=record["diskCompaction"] as Dictionary<string,object>;
+            if(compact==null||compact.Count<5||compact.Count>7||compact.Keys.Any(key=>!new[]{"diskIdentifier","fileIdentity","diskGiB","phase","beforeBytes","jobId","operationId"}.Contains(key))||stage!="ready"||!record.ContainsKey("platformId")||!record.ContainsKey("everReady")||!(bool)record["everReady"]||record.ContainsKey("baseBuilder")||record.ContainsKey("baseSealedDigest")||record.ContainsKey("diskGrowth")||record.ContainsKey("backupRestore"))throw new UnauthorizedAccessException("Invalid disk compaction authority");
+            if(!IsId(StringValue(compact,"diskIdentifier"))||IntegerValue(compact,"diskGiB",16,256)!=Convert.ToInt64(record["diskGiB"])||!new[]{"preparing","trimming","armed","compacting","verifying"}.Contains(StringValue(compact,"phase")))throw new UnauthorizedAccessException("Disk compaction identity or phase changed");
+            IntegerValue(compact,"beforeBytes",0,9007199254740991L);
+            if(compact.ContainsKey("jobId")&&(StringValue(compact,"phase")!="compacting"||!IsId(StringValue(compact,"jobId"))))throw new UnauthorizedAccessException("Invalid compaction job identity");
+            if(compact.ContainsKey("operationId")&&(StringValue(compact,"phase")!="compacting"||!IsId(StringValue(compact,"operationId"))))throw new UnauthorizedAccessException("Invalid compaction operation identity");
+            string identity=StringValue(compact,"fileIdentity");if(identity.Length!=24||identity.Any(c=>!(c>='0'&&c<='9'||c>='a'&&c<='f')))throw new UnauthorizedAccessException("Disk file identity required");
         }
     }
     private Dictionary<string,Dictionary<string,object>> ParseRecords(Dictionary<string,object> values){

@@ -40,7 +40,7 @@ function failureIssue(error:unknown){
   if(/curl: \(22\)/.test(message))return '测试站点返回错误状态';
   return '未取得有效响应；线路或测试站点可能暂时不可用';
 }
-export async function measureAccessLatency(runtime:LimaRuntime,e:Environment,target:LatencyTarget,options:RunOptions={}):Promise<AccessLatency>{
+export async function measureAccessLatency(runtime:Pick<LimaRuntime,'guest'>,e:Environment,target:LatencyTarget,options:RunOptions={}):Promise<AccessLatency>{
   const endpoint=LATENCY_TARGETS.find(value=>value.id===target);
   if(!endpoint)throw new AppError('不支持的延迟检测站点',400);
   const samples:LatencySample[]=[];

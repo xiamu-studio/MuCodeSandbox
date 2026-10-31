@@ -1,14 +1,14 @@
 import { useEffect, useRef,useState } from 'react';
 import { ArrowDownToLine, ChevronDown, History, RefreshCw, Network,Pause,Play } from 'lucide-react';
-import type { NetworkObservations } from '../shared/network-observations.ts';
+import { observationFailureLabels,type NetworkObservations } from '../shared/network-observations.ts';
 import { api } from './api.ts';
 import { Button, Notice, SectionHeading } from './components.tsx';
 
 const labels={waiting:'等待检测结果',unchanged:'检测到的 IP 未变化',changed:'检测到不同出口 IP',failed:'最近一次检测失败',stale:'检测结果较旧，等待刷新'};
 const time=(at:string|null)=>at?new Date(at).toLocaleTimeString('zh-CN',{hour12:false}):'—';
 function duration(first:string|null,last:string|null){if(!first||!last)return '—';const seconds=Math.max(0,Math.round((Date.parse(last)-Date.parse(first))/1000));return seconds<60?`${seconds} 秒`:`${Math.floor(seconds/60)} 分 ${seconds%60} 秒`;}
-export function NetworkActivity({environmentId}:{environmentId:string}) {return <NetworkActivityContent key={environmentId} environmentId={environmentId}/>;}
-function NetworkActivityContent({environmentId}:{environmentId:string}) {
+export function NetworkActivity({environmentId,hostLabel='Mac'}:{environmentId:string;hostLabel?:string}) {return <NetworkActivityContent key={environmentId} environmentId={environmentId} hostLabel={hostLabel}/>;}
+function NetworkActivityContent({environmentId,hostLabel}:{environmentId:string;hostLabel:string}) {
   const [data,setData]=useState<NetworkObservations|null>(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
   const [search,setSearch]=useState(''),[failuresOnly,setFailuresOnly]=useState(false),[history,setHistory]=useState(false);
   const [query,setQuery]=useState(''),[scope,setScope]=useState<'traffic'|'checks'|'all'>('traffic'),[before,setBefore]=useState<number|undefined>(),[pages,setPages]=useState<(number|undefined)[]>([]),[updating,setUpdating]=useState(false);
@@ -16,26 +16,28 @@ function NetworkActivityContent({environmentId}:{environmentId:string}) {
   const currentQuery=JSON.stringify([environmentId,query,scope,failuresOnly,before]),queryRef=useRef(currentQuery);queryRef.current=currentQuery;
   useEffect(()=>{const timer=setTimeout(()=>setQuery(search.trim()),250);return()=>clearTimeout(timer);},[search]);
   useEffect(()=>{
-    let live=true,pending=false;
-    const update=async(manual=false)=>{if(pending||(!manual&&pausedRef.current))return;pending=true;setUpdating(true);try{const next=await api.networkObservations(environmentId,{q:query,scope,failures:failuresOnly,before});if(live&&(manual||!pausedRef.current)){setData(next);setError('');}}catch(e){if(live&&(manual||!pausedRef.current))setError((e as Error).message);}finally{pending=false;if(live)setUpdating(false);}};
-    void update(true);const timer=setInterval(()=>void update(),5000);return()=>{live=false;clearInterval(timer);};
-  },[environmentId,query,scope,failuresOnly,before]);
+    let live=true,pending=false;const closed=new AbortController();
+    const update=async(manual=false)=>{if(pending||(!manual&&pausedRef.current))return;pending=true;setUpdating(true);const timeout=hostLabel==='Windows'?AbortSignal.timeout(10000):undefined;try{const next=await api.networkObservations(environmentId,{q:query,scope,failures:failuresOnly,before},timeout?AbortSignal.any([closed.signal,timeout]):undefined);if(live&&(manual||!pausedRef.current)){setData(next);setError('');}}catch(e){if(live&&(manual||!pausedRef.current))setError(timeout?.aborted?`网络记录读取超时，已有记录可能不是最新；${pausedRef.current?'请恢复自动刷新后重试':'将自动重试'}。`:(e as Error).message);}finally{pending=false;if(live)setUpdating(false);}};
+    void update(true);const timer=setInterval(()=>void update(),5000);return()=>{live=false;closed.abort();clearInterval(timer);};
+  },[environmentId,query,scope,failuresOnly,before,hostLabel]);
   async function sample(){const stamp=currentQuery;setBusy(true);setError('');try{await api.sampleNetwork(environmentId);if(queryRef.current!==stamp)return;const next=await api.networkObservations(environmentId,{q:query,scope,failures:failuresOnly,before});if(queryRef.current===stamp)setData(next);}catch(e){if(queryRef.current===stamp)setError((e as Error).message);}finally{setBusy(false);}}
   function resetPage(){setBefore(undefined);setPages([]);}
   function download(){if(!data)return;const blob=new Blob([JSON.stringify({scope:'当前页的 Linux 透明代理连接与 DNS 元数据，附当时最近的出口核验回执；不是浏览历史或每条连接的真实公网来源证明',...data},null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='MuCodeSandbox-network.json';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
   const summary=data?.summary;
+  const inactiveLabel=data?.environmentState==='stopped'?'沙箱已停止，暂停检测':data?.environmentState==='stopping'?'等待停机确认，暂停检测':data?.environmentState==='error'?'环境状态待核对，暂停检测':data?.environmentState==='starting'||data?.environmentState==='creating'?'启动核验中，暂停检测':data?.environmentState==='not_created'?'环境尚未创建，暂停检测':data?.environmentState==='deleting'?'环境正在删除，暂停检测':'当前暂不可检测';
   const shown=data?.connections.filter(c=>(!failuresOnly||c.status==='failed')&&`${c.target}:${c.port} ${c.domain??''} ${c.domainCandidates?.join(' ')??''} ${c.exitIp??''}`.toLowerCase().includes(search.trim().toLowerCase()))??[];
   return <div className="network-activity">
     <SectionHeading title="出口 IP 检测记录" action={<div className="button-row"><Button icon={<RefreshCw size={16}/>} onClick={()=>void sample()} loading={busy} disabled={!data?.enabled}>立即检测</Button><Button icon={<ArrowDownToLine size={16}/>} onClick={download} disabled={!data}>下载网络记录</Button></div>}/>
     {error&&<Notice kind="error">{error}</Notice>}
+    {data?.storageIssue&&<Notice kind="error">{data.storageIssue}</Notice>}
     <div className={`exit-observation exit-${data?.enabled===false?'stopped':summary?.state??'waiting'}`}>
-      <div className="exit-observation-main"><span className="exit-observation-label">上次检测到的出口 IP</span><strong className="mono">{summary?.lastIp??'尚未检测到 IP'}</strong><span className="exit-observation-state">{data?.enabled===false?'沙箱已停止，暂停检测':labels[summary?.state??'waiting']}</span><small>上次检测 {time(summary?.lastCheckedAt??null)}{data?.enabled?' · 运行时约每 30 秒检测一次':''}</small></div>
-      <div className="exit-observation-metrics"><div><span>记录时间跨度</span><strong>{duration(summary?.firstCheckedAt??null,summary?.lastCheckedAt??null)}</strong></div><div><span>检测成功 / 失败</span><strong>{summary?.successes??0} / {summary?.failures??0}</strong></div><div><span title="1 表示记录中只有一个 IP，不是新增了一个 IP">记录过的 IP 数量</span><strong>{summary?.distinctIps??0}</strong></div><div><span>IP 变化次数</span><strong>{summary?.changes??0}</strong></div></div>
+      <div className="exit-observation-main"><span className="exit-observation-label">上次检测到的出口 IP</span><strong className="mono">{summary?.lastIp??'尚未检测到 IP'}</strong><span className="exit-observation-state">{data?.enabled===false?inactiveLabel:labels[summary?.state??'waiting']}</span><small>上次检测 {time(summary?.lastCheckedAt??null)}{data?.enabled?hostLabel==='Windows'?` · 运行时约每 ${data.sampleIntervalSeconds} 秒安排独立检测`:` · 运行时约每 ${data.sampleIntervalSeconds} 秒记录一次`:''}</small></div>
+      <div className="exit-observation-metrics"><div><span>记录时间跨度</span><strong>{duration(summary?.firstCheckedAt??null,summary?.lastCheckedAt??null)}</strong></div><div><span>{hostLabel==='Windows'?'记录成功 / 失败':'检测成功 / 失败'}</span><strong>{summary?.successes??0} / {summary?.failures??0}</strong></div><div><span title="1 表示记录中只有一个 IP，不是新增了一个 IP">记录过的 IP 数量</span><strong>{summary?.distinctIps??0}</strong></div><div><span>IP 变化次数</span><strong>{summary?.changes??0}</strong></div></div>
     </div>
-    <p className="network-observation-note">{data?.lockIp?`固定出口 IP：${data.lockIp}`:'未锁定出口 IP'}。这里保留过去的检测结果。</p>
+    <p className="network-observation-note">{data?.lockIp?`固定出口 IP：${data.lockIp}`:'未锁定出口 IP'}。这里保留过去的检测结果。{hostLabel==='Windows'?'记录包括防护核验回执和单独检测，可能重复，不等于独立请求次数。时间跨度包含记录间的停机或采集间隔，不代表连续联网时长。':''}</p>
     <details className="network-observation-note"><summary>检测说明</summary><p>“回执”就是检测网站返回的 IP 结果。完整的联网检查请看网络页“出口核验状态”。单个检测网站失败不等于整个出口检查失败；记录也不能证明所有网站都看到同一 IP。时间按本机时区显示。</p></details>
     <Button className="observation-history-toggle" icon={<History size={16}/>} onClick={()=>setHistory(!history)} aria-expanded={history}><span>{history?'收起':'查看'}检测历史</span><span className="observation-history-count">最近 {data?.samples.length??0} 条结果</span><ChevronDown size={15} className="observation-history-chevron" aria-hidden="true"/></Button>
-    {history&&<div className="network-table-wrap"><table className="network-table"><thead><tr><th>检测时间</th><th>接收端</th><th>出口回执</th><th>结果</th><th>耗时</th></tr></thead><tbody>{[...(data?.samples??[])].reverse().map(s=><tr key={s.id}><td>{time(s.at)}</td><td>{s.provider==='ipwho'?'IPwho':'ipify'}</td><td className="mono">{s.ip??'未获得 IP'}</td><td><span className={`connection-result ${s.status==='failed'?'failed':''}`}>{s.status==='success'?'收到回执':'检测失败'}</span></td><td>{s.latencyMs!==undefined?`${s.latencyMs} ms`:'—'}</td></tr>)}</tbody></table></div>}
+    {history&&<div className="network-table-wrap"><table className="network-table"><thead><tr><th>检测时间</th><th>接收端</th><th>出口回执</th><th>结果</th><th>耗时</th></tr></thead><tbody>{[...(data?.samples??[])].reverse().map(s=><tr key={s.id}><td>{time(s.at)}</td><td>{s.provider==='ipwho'?'IPwho':'ipify'}</td><td className="mono">{s.ip??'未获得 IP'}</td><td><span className={`connection-result ${s.status==='failed'?'failed':''}`}>{s.status==='success'?'收到回执':`检测失败${s.failureReason?' · '+(observationFailureLabels[s.failureReason]??'原因未确定'):''}`}</span></td><td>{s.latencyMs!==undefined?`${s.latencyMs} ms`:'—'}</td></tr>)}</tbody></table></div>}
     <div className="network-connections-heading"><SectionHeading title="网络连接与 DNS" action={<div className="button-row"><span className={`capture-state ${data?.capture==='error'?'failed':''}`}><Network size={14}/>{paused?'已暂停自动刷新':data?.enabled===false?'沙箱已停止，暂停采集':data?.capture==='ready'?'连接采集运行中':data?.capture==='error'?'采集出现中断':data?.capture==='unsupported'?'此模式暂无连接明细':'等待采集'}</span><Button aria-pressed={paused} icon={paused?<Play size={14}/>:<Pause size={14}/>} onClick={()=>setPaused(value=>!value)}>{paused?'恢复自动刷新':'暂停自动刷新'}</Button></div>}/></div>
     {data?.captureIssue&&<Notice kind="error">{data.captureIssue}</Notice>}
     {!!data?.captureGaps&&<Notice>保留的观察窗口中有 {data.captureGaps} 次采集缺口，请勿把这份记录视为完整抓包。</Notice>}
@@ -67,6 +69,6 @@ function NetworkActivityContent({environmentId}:{environmentId:string}) {
     })}</tbody></table></div>}
     {!shown.length&&<div className="network-records-empty">{updating?'正在搜索已保留的记录…':data?.capture==='ready'?'没有匹配记录，可切换“全部连接”再查；不能据此判断没有访问。':'连接明细尚不可用，不能据此判断没有访问'}</div>}
     {data?.connectionPage&&<div className="button-row network-connection-pages"><Button disabled={updating||query!==search.trim()||!pages.length} onClick={()=>{setBefore(pages.at(-1));setPages(value=>value.slice(0,-1));}}>上一页</Button><span>第 {pages.length+1} 页</span><Button disabled={updating||query!==search.trim()||!data.connectionPage.nextBefore} onClick={()=>{setPages(value=>[...value,before]);setBefore(data.connectionPage!.nextBefore!);}}>下一页</Button>{before!==undefined&&<Button disabled={updating} onClick={resetPage}>回到最新</Button>}</div>}
-    <details className="network-observation-note"><summary>连接记录说明</summary><p>搜索覆盖当前环境、当前线路配置下仍保留的连接，每页最多300条；可翻页查看。历史有7天期限和总数量上限，超限旧记录会被清理，下载只含当前页。出口检测优先按实际检测入口识别；老记录只将明确指向检测域名的事件归类，不凭共享IP的DNS对照隐藏连接。缓存、连接复用、未识别域名或采集缺口都可能影响显示，无法代替浏览历史。目标只显示域名，服务器IP与沙箱出口IP分开；DNS对照和候选域名不是具体网站访问的确认。出口列保存当时有效的检测回执，不表示目的网站已确认该IP。不解密HTTPS，不保存网址路径、Cookie或正文。管理SSH/DHCP、内核先阻断的请求和Mac其他应用不在明细中。</p></details>
+    <details className="network-observation-note"><summary>连接记录说明</summary><p>搜索覆盖当前环境、当前线路配置下仍保留的连接，每页最多300条；可翻页查看。历史有7天期限和总数量上限，超限旧记录会被清理，下载只含当前页。出口检测优先按实际检测入口识别；老记录只将明确指向检测域名的事件归类，不凭共享IP的DNS对照隐藏连接。缓存、连接复用、未识别域名或采集缺口都可能影响显示，无法代替浏览历史。目标只显示域名，服务器IP与沙箱出口IP分开；DNS对照和候选域名不是具体网站访问的确认。出口列保存当时有效的检测回执，不表示目的网站已确认该IP。不解密HTTPS，不保存网址路径、Cookie或正文。管理SSH/DHCP、内核先阻断的请求和{hostLabel}其他应用不在明细中。</p></details>
   </div>;
 }

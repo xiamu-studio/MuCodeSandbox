@@ -10,24 +10,36 @@ import { z } from 'zod';
 import { run, type Runner, type RunOptions } from '../../process.ts';
 import { shellQuote } from '../../network-guard.ts';
 import { LEASE_HELPER_PATH } from '../../guest-lease.ts';
-import { PROXY_SESSION } from '../../proxy-transport.ts';
+import { WINDOWS_PROXY_SESSION } from './proxy-session.ts';
 import type { VmBackend } from '../contract.ts';
 import { windowsConfigSchema, windowsPaths, vmIdentity, RELAY_PORT, PROBE_PORT, isSealedBase, windowsBaseSchema, type WindowsConfig } from './config.ts';
 import { cloudInit, bootstrapScript, installAmd64TunnelScript, configureWindowsGuard, INSPECT_WINDOWS_GUARD, windowsEnvironment } from './guest.ts';
+import {windowsGuardInspection,attachGuardFailureSource} from './guard-diagnostics.ts';
 import { WindowsNetworkSession } from './session.ts';
+import {PREPARE_WINDOWS_NORMAL_STOP} from './normal-stop.ts';
 import {windowsResourcesSchema,resourceError} from './resources.ts';
+import {WINDOWS_RESOURCE_ERRORS} from '../../../shared/windows-resource-errors.ts';
 import {windowsPowerSchema,powerError} from './power.ts';
-import { measureEgress } from '../../egress.ts';
-import {AppError} from '../../errors.ts';
+import { measureEgress,egressErrorChecks } from '../../egress.ts';
+import {AppError,SshProcessError} from '../../errors.ts';
 import {GUEST_TASK_RUN,GUEST_TASK_CANCEL} from '../../guest-task.ts';
 import type {HyperVBrokerClient,BrokerAction} from './broker.ts';
 import {growWindowsDisk} from './disk-growth.ts';
+import {prepareAndCompactWindowsDisk,inspectCompactedWindowsDisk,windowsCompactionStatus,resumeWindowsDiskCompaction,cancelPreCompaction} from './disk-compaction.ts';
 import {windowsDiskGrowthInfo} from '../../../shared/windows-disk.ts';
 import {runWindowsSsh} from './ssh-process.ts';
+import {WindowsTransportDiagnostics} from './transport-diagnostics.ts';
 
 const scripts=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../../..','scripts/windows');
-const inspection=z.object({digest:z.string().regex(/^[a-f0-9]{64}$/),leaseActive:z.boolean(),remainingMs:z.number().nonnegative().max(45000)}).strict();
-const allocationSchema=z.discriminatedUnion('registered',[z.object({registered:z.literal(false)}).strict(),z.object({registered:z.literal(true),stage:z.string(),everReady:z.boolean(),platformId:z.uuid().nullable(),imageSha256:z.string().regex(/^[a-f0-9]{64}$/),cpus:z.number().int(),memoryGiB:z.number().int(),diskGiB:z.number().int()}).strict()]);
+export function retryClosedEgressReset(error:unknown,expectedIp:string){
+ if(!(error instanceof AppError)||error.code!=='PROCESS_FAILED'||!/curl:\s*\(35\).*SSL_ERROR_SYSCALL/i.test(error.message))return false;
+ if(error instanceof SshProcessError&&error.exitStatus!==35)return false;
+ const checks=egressErrorChecks(error);if(!checks.length||checks.some(check=>check.status==='success'&&check.ip!==expectedIp))return false;
+ const failures=checks.filter(check=>!['pending','success','cancelled'].includes(check.status));
+ return failures.length===1&&failures[0].status==='tls-error'&&failures[0].diagnostics?.curlExitCode===35&&failures[0].diagnostics.tlsHandshakeMs===0&&failures[0].diagnostics.httpStatus===0;
+}
+const allocationSchema=z.discriminatedUnion('registered',[z.object({registered:z.literal(false)}).strict(),z.object({registered:z.literal(true),stage:z.string(),everReady:z.boolean(),platformId:z.uuid().nullable(),imageSha256:z.string().regex(/^[a-f0-9]{64}$/),cpus:z.number().int(),memoryGiB:z.number().int(),diskGiB:z.number().int(),backupRestorePending:z.literal(true).optional(),snapshotRestorePending:z.literal(true).optional(),diskCompactionPending:z.literal(true).optional()}).strict()]);
+function assertNoCompactionPending(value:z.infer<typeof allocationSchema>){if(value.registered&&value.diskCompactionPending)throw new AppError(WINDOWS_RESOURCE_ERRORS.DISK_COMPACTION_PENDING,409,'DISK_COMPACTION_PENDING');}
 const recoverySchema=z.object({name:z.string(),state:z.literal('Off'),present:z.boolean(),platformId:z.uuid().nullable(),ready:z.boolean()}).strict();
 export const AMD64_TUNNEL={version:'1.14.3',sha256:'e2bdf179c15a3652955dc44867e33ca0965c9c9b91b34267dcc5a5d639a5feee',
   url:'https://github.com/SagerNet/sing-box/releases/download/v1.14.3/sing-box-1.14.3-linux-amd64.tar.gz'};
@@ -59,6 +71,7 @@ export function powershellScript(file:string) {return `& ([ScriptBlock]::Create(
 
 export class HyperVRuntime implements VmBackend<WindowsConfig> {
   private transports=new Map<string,ChildProcessWithoutNullStreams>();
+  private transportEvidence=new Map<string,{current?:WindowsTransportDiagnostics}>();
   private intentionalDisconnect=new Set<string>();
   private transportFailures=new Map<string,()=>void>();
   private vmIds=new Map<string,string>();
@@ -94,20 +107,24 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;await writeFile(p.manifest,JSON.stringify(manifest),{flag:'wx'});}
     this.vmIds.set(c.id,platformId);
   }
+  private async assertRestoreFinished(c:WindowsConfig){try{await lstat(path.join(windowsPaths(this.root,c.id).directory,'backup-restore.json'));throw new AppError('请使用原备份继续完成恢复，现有文件已保留',409,'RESTORE_PENDING');}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}}
   async recoverCreation(c:WindowsConfig){
-    if(!this.broker)return false;const allocated=await this.allocation(c);if(!allocated.registered)return false;
+    await this.assertRestoreFinished(c);
+    if(!this.broker)return false;const allocated=await this.allocation(c);if(!allocated.registered)return false;assertNoCompactionPending(allocated);if(allocated.snapshotRestorePending)throw new AppError('请先恢复快照事务与环境配置，现有磁盘已保留',409,'SNAPSHOT_PENDING');if(allocated.backupRestorePending)throw new AppError('请继续完成原备份恢复',409,'RESTORE_PENDING');
     const recovered=recoverySchema.parse(await this.broker.call('recover',{id:c.id},{timeoutMs:45000}));
     if(!recovered.present||!recovered.ready)return false;
     await this.publishManifest({...c,imageSha256:allocated.imageSha256},recovered.platformId!);return true;
   }
   async remove(c:WindowsConfig){
     if(!this.broker)throw new AppError('请在普通用户权限代理入口删除环境',409,'FEATURE_UNAVAILABLE');
+    const allocated=await this.allocation(c);
+    assertNoCompactionPending(allocated);
+    if(allocated.registered&&allocated.snapshotRestorePending)throw new AppError('请先完成快照事务与配置恢复，现有文件已保留',409,'SNAPSHOT_PENDING');
     await this.disconnect(c.id);this.closeChannel(c.id);
     await this.cleanMetadata(c,false,true);
-    const allocated=await this.allocation(c);
     if(allocated.registered){
       const marker=path.join(windowsPaths(this.root,c.id).directory,'allocation.json');try{await writeFile(marker,JSON.stringify({version:1,id:c.id,backend:'hyperv-broker'}),{flag:'wx'});}catch(error){if(!['ENOENT','EEXIST'].includes((error as NodeJS.ErrnoException).code??''))throw error;}
-      const result=z.object({deleted:z.literal(true),vmAbsent:z.literal(true),switchAbsent:z.literal(true),storageAbsent:z.literal(true)}).strict().parse(await this.broker.call('delete',{id:c.id},{timeoutMs:120000}));if(!result.deleted)throw Error('Removal was not confirmed');
+      const result=z.object({deleted:z.literal(true),vmAbsent:z.literal(true),switchAbsent:z.literal(true),storageAbsent:z.literal(true)}).strict().parse(await this.broker.call('delete',{id:c.id},{timeoutMs:180000}));if(!result.deleted)throw Error('Removal was not confirmed');
     }else{
       await this.confirmUnregisteredAbsence(c);
     }
@@ -130,8 +147,14 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     return this.runner(powershellPath(),powershellArgs(this.psScript(action)),{...options,input:value?JSON.stringify(value):undefined,timeoutMs:options.timeoutMs??30000});
   }
   async info() {return z.object({available:z.boolean(),issues:z.array(z.string())}).parse(JSON.parse(await this.powershell('doctor')));}
-  async fingerprint() {return createHash('sha256').update((await this.powershell('fingerprint')).trim()).digest('hex');}
-  async inspectVm(c:WindowsConfig) {const value=JSON.parse(await this.powershell('inspect',c));this.vmIds.set(c.id,z.uuid().parse(value.platformId));return value;}
+  async fingerprint() {
+    const source=(await this.powershell('fingerprint')).trim(),hash=(value:string)=>createHash('sha256').update(value).digest('hex'),total=hash(source);
+    let snapshot:{adapters:unknown[];routes:unknown[];dns:unknown[]};
+    try{snapshot=z.object({adapters:z.array(z.unknown()),routes:z.array(z.unknown()),dns:z.array(z.unknown())}).strict().parse(JSON.parse(source));}
+    catch{throw new AppError('宿主网络状态返回不完整，请检查运行组件后重试',502,'HOST_NETWORK_SNAPSHOT_INVALID');}
+    return JSON.stringify({total,adapters:hash(JSON.stringify(snapshot.adapters)),routes:hash(JSON.stringify(snapshot.routes)),dns:hash(JSON.stringify(snapshot.dns))});
+  }
+  async inspectVm(c:WindowsConfig,options:RunOptions={}) {const value=JSON.parse(await this.powershell('inspect',c,options));options.signal?.throwIfAborted();this.vmIds.set(c.id,z.uuid().parse(value.platformId));return value;}
   async state(c:WindowsConfig){return JSON.parse(await this.powershell('status',c));}
   async channelHelper() {
     const source=path.resolve(scripts,'../../native/windows/HyperVChannel.cs');
@@ -193,24 +216,27 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   private developer(c:WindowsConfig,command:string[]){
     return ['sudo','-n','-H','-u','dev','--','env','-i','HOME=/home/dev','USER=dev','LOGNAME=dev','SHELL=/bin/bash',
       'PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin','TERM=xterm-256color','LANG=C.UTF-8','LC_ALL=C.UTF-8',`TZ=${c.timezone}`,
-      '/usr/local/bin/mu-proxy-run','bash','-c','cd /workspace && exec "$@"','--',...command];
+      '/usr/local/bin/mu-proxy-run','/bin/bash','-c','cd /workspace && exec "$@"','--',...command];
   }
   async guest(c:WindowsConfig,command:string[],options:RunOptions={}){
     options.signal?.throwIfAborted();const token=randomUUID(),timeoutMs=options.timeoutMs??30000;
     if(!Number.isFinite(timeoutMs)||timeoutMs<=0||timeoutMs>86400000)throw new AppError('开发任务超时时间无效',400);
     let cancellation:Promise<string>|undefined;
-    const cancel=()=>{cancellation??=this.management(c,this.developer(c,['python3','-c',GUEST_TASK_CANCEL,token]),{timeoutMs:8000});void cancellation.catch(()=>{});};
+    // Isolate the supervisor/canceller, not the user command they launch.
+    const cancel=()=>{cancellation??=this.management(c,this.developer(c,['/usr/bin/python3','-I','-c',GUEST_TASK_CANCEL,token]),{timeoutMs:8000});void cancellation.catch(()=>{});};
     options.signal?.addEventListener('abort',cancel,{once:true});
-    try{return await this.management(c,this.developer(c,['python3','-c',GUEST_TASK_RUN,token,String(timeoutMs),...command]),options);}
-    catch(error){if(error instanceof AppError&&['TIMEOUT','CANCELLED','PROCESS_INPUT_CLOSED','PROCESS_OUTPUT_TOO_LARGE'].includes(error.code))cancel();throw error;}
+    try{return await this.management(c,this.developer(c,['/usr/bin/python3','-I','-c',GUEST_TASK_RUN,token,String(timeoutMs),...command]),options);}
+    catch(error){if(error instanceof AppError&&['TIMEOUT','CANCELLED','PROCESS_INPUT_CLOSED','PROCESS_OUTPUT_TOO_LARGE','PROCESS_OUTPUT_HANDLER_FAILED'].includes(error.code))cancel();throw error;}
     finally{options.signal?.removeEventListener('abort',cancel);if(cancellation)await cancellation;}
   }
-  async terminalLaunch(c:WindowsConfig){
+  async terminalLaunch(c:WindowsConfig,command:'shell'|'claude'='shell'){
+    if(command!=='shell'&&command!=='claude')throw new AppError('终端命令无效',400,'TERMINAL_COMMAND');
     const args=(await this.ssh(c)).filter(arg=>arg!=='-T');
     // Disable the SSH escape interpreter: input must never open a host shell,
     // change forwarding or start a host command through ~! / ~C escapes.
     args.unshift('-tt','-a','-x','-o','EscapeChar=none','-o','ClearAllForwardings=yes','-o','PermitLocalCommand=no','-o','IdentityAgent=none');
-    args.push(this.developer(c,['bash','-l']).map(shellQuote).join(' '));
+    const {WINDOWS_AGENT_EXECUTABLE,WINDOWS_AGENT_PRIVACY}=await import('./agent-assets.ts');
+    args.push(this.developer(c,command==='claude'?['/usr/bin/env',...WINDOWS_AGENT_PRIVACY,WINDOWS_AGENT_EXECUTABLE]:['bash','-l']).map(shellQuote).join(' '));
     const systemRoot=process.env.SystemRoot??'C:\\Windows';
     const env:Record<string,string>={SystemRoot:systemRoot,PATH:path.join(systemRoot,'System32'),TERM:'xterm-256color'};
     for(const key of ['SystemDrive','TEMP','TMP','USERPROFILE','LOCALAPPDATA','PROGRAMDATA'])if(process.env[key])env[key]=process.env[key]!;
@@ -225,12 +251,14 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     return {file:path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe'),args,env:cleanWindowsEnvironment(),cwd:this.root};
   }
   async create(input:WindowsConfig,options:RunOptions={},purpose:'environment'|'base-builder'='environment') {
-    const c=windowsConfigSchema.parse(input),p=windowsPaths(this.root,c.id),n=vmIdentity(c.id);
+    const c=windowsConfigSchema.parse(input),p=windowsPaths(this.root,c.id),n=vmIdentity(c.id);await this.assertRestoreFinished(c);
     if(purpose==='base-builder'){if(!this.broker||c.imageSha256!==CANONICAL_NOCLOUD_PATCH.sourceSha256||c.cpus!==2||c.memoryGiB!==4||c.diskGiB!==32)throw Error('Only the fixed official source can create a base builder');this.baseBuilders.add(c.id);}
     let retry=false;
     if(this.broker){
       const allocated=await this.allocation(c);
+      assertNoCompactionPending(allocated);
       if(allocated.registered){
+        if(allocated.snapshotRestorePending)throw new AppError('请先恢复快照事务与环境配置，现有磁盘已保留',409,'SNAPSHOT_PENDING');if(allocated.backupRestorePending)throw new AppError('请继续完成原备份恢复，现有磁盘已保留',409,'RESTORE_PENDING');
         if(await this.recoverCreation(c))return;
         if(allocated.everReady)throw new AppError('已有环境的虚拟机或防护状态异常，已保留原磁盘',409,'EXISTING_GUEST_RETAINED');
         if(allocated.imageSha256!==c.imageSha256||allocated.cpus!==c.cpus||allocated.memoryGiB!==c.memoryGiB||allocated.diskGiB!==c.diskGiB)throw new AppError('未完成创建的资源配置已变化，已保留原文件',409,'RECOVERY_CONFIG_CHANGED');
@@ -266,10 +294,16 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   }
   async startDiskMaintenance(c:WindowsConfig,options:RunOptions={}) {if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');return this.startGuest(c,options,'growth');}
   async startDiskReview(c:WindowsConfig,options:RunOptions={}) {if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');return this.startGuest(c,options,'review');}
-  private async startGuest(c:WindowsConfig,options:RunOptions,maintenance:'normal'|'growth'|'review') {
+  async startDiskCompaction(c:WindowsConfig,options:RunOptions={}) {if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');return this.startGuest(c,options,'compact');}
+  async startDiskCompactionVerify(c:WindowsConfig,options:RunOptions={}) {if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');return this.startGuest(c,options,'compact-verify');}
+  private async startGuest(c:WindowsConfig,options:RunOptions,maintenance:'normal'|'growth'|'review'|'compact'|'compact-verify') {
+    await this.assertRestoreFinished(c);
+    if(this.broker){const allocated=await this.allocation(c);if(maintenance!=='compact'&&maintenance!=='compact-verify')assertNoCompactionPending(allocated);if(allocated.registered&&allocated.snapshotRestorePending)throw new AppError('请先完成快照事务与配置恢复，现有文件已保留',409,'SNAPSHOT_PENDING');}
     await access(windowsPaths(this.root,c.id).manifest);
     try {
-      const started=JSON.parse(maintenance!=='normal'?String(await this.broker!.call(maintenance==='review'?'start-disk-review':'start-disk-growth',{id:c.id,targetGiB:c.diskGiB},{...options,timeoutMs:options.timeoutMs??120000})):await this.powershell('start',c,{...options,timeoutMs:options.timeoutMs??120000}));this.vmIds.set(c.id,z.uuid().parse(started.platformId));
+      const action:BrokerAction=maintenance==='review'?'start-disk-review':maintenance==='growth'?'start-disk-growth':maintenance==='compact'?'disk-compact-start':'disk-compact-verify-start';
+      const params=maintenance==='review'||maintenance==='growth'?{id:c.id,targetGiB:c.diskGiB}:{id:c.id};
+      const started=JSON.parse(maintenance!=='normal'?String(await this.broker!.call(action,params,{...options,timeoutMs:options.timeoutMs??120000})):await this.powershell('start',c,{...options,timeoutMs:options.timeoutMs??120000}));this.vmIds.set(c.id,z.uuid().parse(started.platformId));
       // First boot may expand the vendor filesystem. Management readiness has
       // a separate bounded wait; business traffic remains closed throughout.
       const deadline=Date.now()+(options.timeoutMs??600000);
@@ -283,8 +317,21 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   async resources(){return this.broker?windowsResourcesSchema.parse(await this.broker.call('resource-status')):null;}
   get diskGrowthAvailable(){return !!this.broker;}
   async diskGrowthInfo(c:WindowsConfig,options:RunOptions={}){if(!this.broker)throw new AppError('此入口不支持磁盘扩容',409,'FEATURE_UNAVAILABLE');return windowsDiskGrowthInfo.parse(await this.broker.call('disk-growth-status',{id:c.id},{...options,timeoutMs:90000}));}
-  growDisk(c:WindowsConfig,targetGiB:number,options:RunOptions={}){return growWindowsDisk(this,c,targetGiB,options);}
+  async growDisk(c:WindowsConfig,targetGiB:number,options:RunOptions={}){await this.assertRestoreFinished(c);return growWindowsDisk(this,c,targetGiB,options);}
+  // Internal only: no API or UI capability is enabled until interrupted
+  // compaction recovery and real Hyper-V validation are complete.
+  async prepareDiskCompaction(c:WindowsConfig,options:RunOptions={}){if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');await this.assertRestoreFinished(c);return prepareAndCompactWindowsDisk(this as HyperVRuntime & {broker:HyperVBrokerClient},c,options);}
+  async verifyDiskCompaction(c:WindowsConfig,expected:Parameters<typeof inspectCompactedWindowsDisk>[2],options:RunOptions={}){if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');await this.assertRestoreFinished(c);return inspectCompactedWindowsDisk(this as HyperVRuntime & {broker:HyperVBrokerClient},c,expected,options);}
+  diskCompactionStatus(c:WindowsConfig,options:RunOptions={}){if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');return windowsCompactionStatus(this as HyperVRuntime & {broker:HyperVBrokerClient},c,options);}
+  async resumeDiskCompaction(c:WindowsConfig,options:RunOptions={}){if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');await this.assertRestoreFinished(c);return resumeWindowsDiskCompaction(this as HyperVRuntime & {broker:HyperVBrokerClient},c,options);}
+  async cancelDiskCompaction(c:WindowsConfig,options:RunOptions={}){if(!this.broker)throw new AppError('磁盘维护需要受保护权限代理',409,'FEATURE_UNAVAILABLE');await this.assertRestoreFinished(c);return cancelPreCompaction(this as HyperVRuntime & {broker:HyperVBrokerClient},c,options);}
   async power(){return this.broker?windowsPowerSchema.parse(await this.broker.call('power-status')):null;}
+  async prepareNormalStop(c:WindowsConfig,options:RunOptions={}){
+    options.signal?.throwIfAborted();
+    const value=await this.management(c,['sudo','-n','-H','-u','dev','--','env','-i','HOME=/home/dev','PATH=/usr/bin:/bin','DISPLAY=:99','XAUTHORITY=/run/mu-browser/Xauthority','/usr/bin/python3','-I','-c',PREPARE_WINDOWS_NORMAL_STOP],{...options,timeoutMs:4500,maxBytes:1024,onOutput:undefined});
+    options.signal?.throwIfAborted();
+    z.object({version:z.literal(1),browser:z.enum(['closed','already-stopped'])}).strict().parse(JSON.parse(value));
+  }
   async stop(c:WindowsConfig,options:RunOptions={}) {
     // A stuck SSH child must never prevent the independent hypervisor stop.
     try{await this.disconnect(c.id);}catch{/* Hyper-V state is checked below. */}
@@ -316,22 +363,37 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
     this.intentionalDisconnect.delete(c.id);
     const args=await this.ssh(c);const destination=args.pop()!;
     args.push('-o','ExitOnForwardFailure=yes','-R',`127.0.0.1:${RELAY_PORT}:${c.proxy.address}:${c.proxy.port}`,destination,
-      `exec sudo -n /usr/bin/python3 -c ${shellQuote(PROXY_SESSION)}`);
-    const child=spawn(path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe'),args,{stdio:['pipe','pipe','pipe'],windowsHide:true});
+      `exec sudo -n /usr/bin/python3 -I -c ${shellQuote(WINDOWS_PROXY_SESSION)}`);
+    const child=this.forwardingProcess(args);
+    const evidence=this.transportEvidence.get(c.id)??{},diagnostic=new WindowsTransportDiagnostics();evidence.current=diagnostic;this.transportEvidence.set(c.id,evidence);
+    child.stdout.on('data',chunk=>{try{diagnostic.feedGuest(chunk);}catch{/* Evidence cannot control network admission or delay teardown. */}});
+    child.stderr.on('data',chunk=>{try{diagnostic.feed(chunk);}catch{/* Optional evidence must not interrupt the owned forwarding process. */}});
     this.transports.set(c.id,child);
-    child.on('exit',()=>{if(!this.intentionalDisconnect.has(c.id))this.transportFailures.get(c.id)?.();});
+    // A timed-out disconnect can leave this child exiting after a replacement
+    // has started. Its exit belongs only to this child and its original session.
+    const onFailure=this.transportFailures.get(c.id);
+    child.on('error',()=>{if(this.transports.get(c.id)===child&&!this.intentionalDisconnect.has(c.id)){try{diagnostic.processError();}catch{/* Diagnostics must not prevent the protective stop. */}onFailure?.();}});
+    // A broken control pipe makes this forwarding session unreliable even if
+    // the child has not exited yet. Handle the stream error and retire only
+    // its owning session; intentional shutdown and stale children are ignored.
+    child.stdin.on('error',()=>{if(this.transports.get(c.id)===child&&!this.intentionalDisconnect.has(c.id)){try{diagnostic.controlPipeError();}catch{/* Diagnostic failure cannot prevent the protective stop. */}onFailure?.();}});
+    child.on('exit',code=>{diagnostic.ended(false,code);if(this.transports.get(c.id)===child&&!this.intentionalDisconnect.has(c.id))onFailure?.();});
     try {await new Promise<void>((resolve,reject)=>{
       let output='';const timer=setTimeout(()=>reject(Error('SSH egress channel did not become ready')),15000);
       const ready=(block:Buffer)=>{output+=block.toString();if(output.length>8192){clearTimeout(timer);reject(Error('Oversized SSH response'));return;}
-        if(output.includes('MU_PROXY_SESSION_READY\n')){clearTimeout(timer);child.stdout.off('data',ready);resolve();}};
-      child.stdout.on('data',ready);child.stderr.on('data',()=>{});
+        if(output.includes('MU_PROXY_SESSION_READY\n')){diagnostic.ready();clearTimeout(timer);child.stdout.off('data',ready);resolve();}};
+      child.stdout.on('data',ready);
       child.once('error',error=>{clearTimeout(timer);reject(error);});
       child.once('exit',()=>{clearTimeout(timer);reject(Error('SSH egress channel closed'));});
     });}catch(error){await this.disconnect(c.id);throw error;}
   }
+  protected forwardingProcess(args:string[]):ChildProcessWithoutNullStreams {
+    return spawn(path.join(process.env.SystemRoot??'C:\\Windows','System32/OpenSSH/ssh.exe'),args,{stdio:['pipe','pipe','pipe'],windowsHide:true});
+  }
   async disconnect(id?:string) {
     if(!id){await Promise.all([...this.transports.keys()].map(value=>this.disconnect(value)));return;}
     this.intentionalDisconnect.add(id);
+    this.transportEvidence.get(id)?.current?.freeze();this.transportEvidence.delete(id);
     const child=this.transports.get(id);this.transports.delete(id);if(!child)return;
     child.stdin.end();child.kill();
     if(child.exitCode!==null||child.signalCode!==null)return;
@@ -350,7 +412,7 @@ export class HyperVRuntime implements VmBackend<WindowsConfig> {
   }
   async discardBaseBuilder(c:WindowsConfig){
     if(!this.broker||c.imageSha256!==CANONICAL_NOCLOUD_PATCH.sourceSha256)throw Error('Official base builder required');
-    if((await this.allocation(c)).registered){const receipt=z.object({deleted:z.literal(true),vmAbsent:z.literal(true),switchAbsent:z.literal(true),storageAbsent:z.literal(true)}).strict().parse(await this.broker.call('discard-base-builder',{id:c.id},{timeoutMs:45000}));if(!receipt.deleted)throw Error('Builder cleanup not confirmed');}
+    if((await this.allocation(c)).registered){const receipt=z.object({deleted:z.literal(true),vmAbsent:z.literal(true),switchAbsent:z.literal(true),storageAbsent:z.literal(true)}).strict().parse(await this.broker.call('discard-base-builder',{id:c.id},{timeoutMs:180000}));if(!receipt.deleted)throw Error('Builder cleanup not confirmed');}
     await this.confirmUnregisteredAbsence(c);try{await access(windowsPaths(this.root,c.id).directory);await this.cleanMetadata(c,false);}catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}this.baseBuilders.delete(c.id);this.vmIds.delete(c.id);
   }
   async verifySealedBase(base:{image:string;imageSha256:string}){windowsBaseSchema.parse({image:base.image,imageSha256:base.imageSha256});if(!this.broker||!isSealedBase(base.image))throw Error('Sealed base reference required');const value=await this.broker.call('base-status',{imageSha256:base.imageSha256});const receipt=z.object({ready:z.literal(true),image:z.literal(base.image),imageSha256:z.literal(base.imageSha256)}).strict().parse(value);return {image:receipt.image,imageSha256:receipt.imageSha256};}
@@ -398,12 +460,14 @@ sudo sync
     await this.management(c,['bash','-s'],{...options,input:guard.script,timeoutMs:60000});
     return guard.session;
   }
-  async inspectGuard(c:WindowsConfig) {
-    await this.inspectVm(c);
-    return inspection.parse(JSON.parse((await this.management(c,['bash','-s'],{input:INSPECT_WINDOWS_GUARD,timeoutMs:15000})).trim()));
+  async inspectGuard(c:WindowsConfig,options:RunOptions={}) {
+    try{options.signal?.throwIfAborted();await this.inspectVm(c,options);options.signal?.throwIfAborted();}catch(error){throw attachGuardFailureSource(error,'vm-inspection');}
+    let output:string;
+    try{output=await this.management(c,['bash','-s'],{input:INSPECT_WINDOWS_GUARD,signal:options.signal,timeoutMs:15000});options.signal?.throwIfAborted();}catch(error){throw attachGuardFailureSource(error,'guest-inspection');}
+    try{return windowsGuardInspection.parse(JSON.parse(output.trim()));}catch(error){throw attachGuardFailureSource(error,'guard-response');}
   }
-  async lease(c:WindowsConfig,token:string,action:'activate'|'renew'|'revoke') {
-    await this.management(c,['sudo','-n',LEASE_HELPER_PATH,action,token],{timeoutMs:8000});
+  async lease(c:WindowsConfig,token:string,action:'activate'|'renew'|'revoke',options:RunOptions={}) {
+    await this.management(c,['sudo','-n',LEASE_HELPER_PATH,action,token],{signal:options.signal,timeoutMs:8000});
   }
   egressProbeProxy(id:string) {
     const transport=this.transports.get(id);
@@ -412,12 +476,13 @@ sudo sync
   }
   async session(c:WindowsConfig,probe?:()=>Promise<{receiver:string;ip:string}[]>) {
     const token=await this.configure(c);
-    const driver={inspect:()=>this.inspectGuard(c),probe:probe??(async()=>{
-      const result=await measureEgress({management:(_e,command,options)=>this.management(c,command,options),egressProbeProxy:()=>this.egressProbeProxy(c.id)},windowsEnvironment(c));
-      return result.verification!.receipts.map(r=>({receiver:r.receiver,ip:r.ip}));
-    }),activate:()=>this.lease(c,token,'activate'),renew:()=>this.lease(c,token,'renew'),revoke:()=>this.lease(c,token,'revoke'),disconnect:()=>this.disconnect(c.id),stop:()=>this.stop(c)};
-    const session=new WindowsNetworkSession(driver,c.expectedIp);
-    this.transportFailures.set(c.id,()=>{void session.fail().catch(()=>{});});
+    const evidence:{current?:WindowsTransportDiagnostics}={};this.transportEvidence.set(c.id,evidence);
+    const driver={inspect:(signal?:AbortSignal)=>this.inspectGuard(c,{signal}),retryClosedProbe:(error:unknown)=>retryClosedEgressReset(error,c.expectedIp),probe:probe??(async(signal?:AbortSignal)=>{
+      const result=await measureEgress({management:(_e,command,options)=>this.management(c,command,options),egressProbeProxy:()=>this.egressProbeProxy(c.id)},windowsEnvironment(c),{signal});
+      return result.verification!.receipts;
+    }),activate:(signal?:AbortSignal)=>this.lease(c,token,'activate',{signal}),renew:(signal?:AbortSignal)=>this.lease(c,token,'renew',{signal}),revoke:()=>this.lease(c,token,'revoke'),disconnect:()=>this.disconnect(c.id),stop:()=>this.stop(c)};
+    const session=new WindowsNetworkSession({...driver,transportDiagnostics:()=>evidence.current?.snapshot()},c.expectedIp);
+    this.transportFailures.set(c.id,()=>{void session.transportFailed();});
     return session;
   }
 }

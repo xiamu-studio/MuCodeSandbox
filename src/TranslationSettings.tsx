@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Button, Notice } from './components.tsx';
 import { request } from './api.ts';
 import type { TranslationSettingsStatus } from '../shared/translation.ts';
@@ -7,24 +7,26 @@ export default function TranslationSettings({onSaved,hostName='Mac'}:{onSaved?:(
   const [open,setOpen] = useState(false);
   const [status, setStatus] = useState<TranslationSettingsStatus | null>(null);
   const [key, setKey] = useState(''), [busy, setBusy] = useState(false), [error, setError] = useState(''), [message, setMessage] = useState('');
+  const working = useRef(false);
+  const deadline = () => hostName === 'Windows' ? AbortSignal.timeout(10000) : undefined;
   async function load() {
-    if (busy) return;
-    setBusy(true); setError('');
-    try { setStatus(await request<TranslationSettingsStatus>('/translation-settings')); }
-    catch { setError('无法读取翻译设置，请重新展开重试。'); }
-    finally { setBusy(false); }
+    if (working.current) return;
+    working.current=true; setBusy(true); setError('');
+    try { setStatus(await request<TranslationSettingsStatus>('/translation-settings',{signal:deadline()})); }
+    catch { setStatus(null); setError('无法读取翻译设置，请重新展开重试。'); }
+    finally { working.current=false; setBusy(false); }
   }
   async function save(clear = false) {
-    if (busy) return;
+    if (working.current) return;
     if (!clear && !/^[A-Za-z0-9_-]{20,256}$/.test(key.trim())) { setError('请输入有效的 DeepSeek API Key。'); return; }
-    setBusy(true); setError(''); setMessage('');
+    working.current=true; setBusy(true); setError(''); setMessage('');
     try {
-      const next = await request<TranslationSettingsStatus>('/translation-settings', clear ? { method: 'DELETE' } : { method: 'POST', body: JSON.stringify({ apiKey: key.trim() }) });
+      const next = await request<TranslationSettingsStatus>('/translation-settings', clear ? { method: 'DELETE',signal:deadline() } : { method: 'POST', body: JSON.stringify({ apiKey: key.trim() }),signal:deadline() });
       setStatus(next); setKey('');
       if(clear)setMessage('已移除本机翻译 Key。');
       else{setMessage('');setOpen(false);onSaved?.();}
-    } catch { setError('翻译设置未能保存，请重试。'); }
-    finally { setBusy(false); }
+    } catch { setStatus(null); setError('翻译设置结果未确认，请收起后重新展开以核对状态。'); }
+    finally { working.current=false; setBusy(false); }
   }
   return <details className="guest-translation-settings" open={open} onToggle={event => { setOpen(event.currentTarget.open);if (event.currentTarget.open) void load(); else setKey(''); }}>
     <summary>翻译设置{status ? status.configured ? ' · 已配置' : ' · 未配置' : ''}</summary>

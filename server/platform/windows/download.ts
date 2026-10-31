@@ -1,14 +1,30 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 
-export interface VerifiedAsset { url:string; sha256:string }
+export interface VerifiedAsset { url:string; sha256:string; bytes?:number }
 interface DownloadOptions { signal?:AbortSignal; concurrency?:number; chunkBytes?:number; maxBytes?:number; onProgress?:(completed:number,total:number)=>void }
 const length=async(file:string)=>stat(file).then(s=>s.size,error=>{if(error.code==='ENOENT')return 0;throw error;});
 async function digest(file:string){const h=createHash('sha256');for await(const block of createReadStream(file))h.update(block);return h.digest('hex');}
+
+// Only reclaim the exact range set owned by this completed download, while its
+// owner lock is held. Unknown entries and unsafe file types stay untouched.
+async function discardCompletedRanges(directory:string,count:number,total:number,chunk:number){
+  const names=Array.from({length:count},(_,i)=>`${i}.part`);
+  const expected=new Set([...names,'asset.json','owner.json']);
+  const dir=await lstat(directory);if(!dir.isDirectory()||dir.isSymbolicLink())return;
+  const entries=await readdir(directory);if(entries.length!==expected.size||entries.some(name=>!expected.has(name)))return;
+  for(let i=0;i<names.length;i++){
+    const s=await lstat(path.join(directory,names[i]));
+    if(!s.isFile()||s.isSymbolicLink()||s.nlink!==1||s.size!==Math.min(chunk,total-i*chunk))return;
+  }
+  const meta=await lstat(path.join(directory,'asset.json'));if(!meta.isFile()||meta.isSymbolicLink()||meta.nlink!==1)return;
+  for(const name of names)await rm(path.join(directory,name));
+  await rm(path.join(directory,'asset.json'));
+}
 
 // Parallel bounded ranges make large VM images resumable. No partial file is
 // ever published as an installable component; the vendor-pinned full digest is
@@ -33,8 +49,12 @@ export async function downloadVerifiedAsset(asset:VerifiedAsset,target:string,op
   try{
     const head=await fetch(asset.url,{method:'HEAD',headers:{'accept-encoding':'identity'},signal:AbortSignal.any([signal,AbortSignal.timeout(30000)])});
     if(!head.ok)throw Error('Official asset metadata unavailable');
-    const total=Number(head.headers.get('content-length'));
-    if(!Number.isSafeInteger(total)||total<=0||total>(options.maxBytes??1500*1024*1024))throw Error('Invalid asset size');
+    const reported=head.headers.get('content-length');
+    if(reported!==null&&!/^[1-9]\d*$/.test(reported))throw Error('Invalid asset size');
+    if(asset.bytes!==undefined&&(!Number.isSafeInteger(asset.bytes)||asset.bytes<=0))throw Error('Invalid pinned asset size');
+    const total=reported===null?asset.bytes:Number(reported);
+    if(asset.bytes!==undefined&&total!==asset.bytes)throw Error('Asset size differs from pinned size');
+    if(typeof total!=='number'||!Number.isSafeInteger(total)||total<=0||total>(options.maxBytes??1500*1024*1024))throw Error('Invalid asset size');
     const chunk=options.chunkBytes??8*1024*1024;
     if(!Number.isSafeInteger(chunk)||chunk<1)throw Error('Invalid chunk size');
     const metadata={url:asset.url,sha256:asset.sha256,total,chunk};const metadataPath=path.join(directory,'asset.json');
@@ -73,5 +93,7 @@ export async function downloadVerifiedAsset(asset:VerifiedAsset,target:string,op
     await pipeline(Readable.from(blocks()),new Transform({transform(block,_enc,done){hash.update(block);done(null,block);}}),createWriteStream(assembled,{flags:'wx'}),{signal});
     if(hash.digest('hex')!==asset.sha256){await writeFile(invalid,JSON.stringify({sha256:asset.sha256}));await rm(assembled,{force:true});throw Error('Official component SHA-256 mismatch');}
     await rename(assembled,target);
+    // Publication has succeeded; a cleanup failure must not invalidate it.
+    await discardCompletedRanges(directory,count,total,chunk).catch(()=>{});
   }finally{controller.abort();await lock.close();await rm(lockPath,{force:true});}
 }
